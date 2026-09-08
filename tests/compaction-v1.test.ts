@@ -47,6 +47,26 @@ test("v1 compaction keeps only the newest ten structured images without copying 
   expect(retained.at(-1)?.content.at(-1)).toMatchObject({ detail: "high" });
 });
 
+test("v1 compaction drops native user-role context kinds without dropping user.text markup", () => {
+  const nativeContext = {
+    type: "message", role: "user", id: "native-context",
+    content: [{ type: "input_text", text: "<recommended_plugins>Example plugin</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn-current", content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+    },
+  };
+  const humanMarkup = {
+    type: "message", role: "user", id: "human-markup",
+    content: [{ type: "input_text", text: "<recommended_plugins>This is literal user text</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn-human", content_item_kinds: ["user.text"],
+    },
+  };
+  const output = buildCompactV1Output(extractCompactUserMessages([humanMarkup, nativeContext]), "checkpoint");
+  expect(output.some(item => item.id === nativeContext.id)).toBe(false);
+  expect(output.some(item => item.id === humanMarkup.id)).toBe(true);
+});
+
 test("v1 compaction drops persisted one-pixel image sentinels", () => {
   const placeholder = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
   const output = buildCompactV1Output(extractCompactUserMessages([{

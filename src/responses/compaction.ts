@@ -72,6 +72,23 @@ const COMPACT_V1_RETAINED_CHAR_BUDGET = 20_000 * 4;
 
 type CompactMessageItem = Record<string, unknown>;
 
+const CODEX_CONTEXTUAL_USER_CONTENT_ITEM_KINDS = new Set([
+  "environments.environment_context",
+  "goal.internal_context",
+  "plugins.recommendations",
+]);
+
+/** Native Codex runtime context can use role=user without being a human-authored revision. */
+export function hasOnlyCodexContextualUserContentItemKinds(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = (value as { internal_chat_message_metadata_passthrough?: unknown })
+    .internal_chat_message_metadata_passthrough;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const kinds = (metadata as { content_item_kinds?: unknown }).content_item_kinds;
+  return Array.isArray(kinds) && kinds.length > 0
+    && kinds.every(kind => typeof kind === "string" && CODEX_CONTEXTUAL_USER_CONTENT_ITEM_KINDS.has(kind));
+}
+
 interface CompactContentBlock extends Record<string, unknown> {
   type?: string;
   text?: string;
@@ -112,6 +129,9 @@ export function extractCompactUserMessages(input: unknown): CompactMessageItem[]
     const rec = item as CompactMessageItem & { type?: string; role?: string; content?: unknown };
     if (rec.type !== undefined && rec.type !== "message") continue;
     if (rec.role !== "user") continue;
+    // Codex Desktop also represents some runtime preamble as role=user. Native kinds are the
+    // authoritative distinction; do not retain that context as a human message in v1 output.
+    if (hasOnlyCodexContextualUserContentItemKinds(rec)) continue;
     // Codex removes InternalModelContextFragment during process_annotated_compacted_history.
     // In particular, a goal continuation is runtime steering, not a retained human message.
     // Exclude it before computing the v1 checkpoint source, or the next request authenticates

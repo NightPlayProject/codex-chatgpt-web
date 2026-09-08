@@ -275,6 +275,121 @@ for (const format of ["v1", "v2"] as const) test(`${format} completed compaction
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("v1 repeated same-turn desktop compaction drops native user-role context and retains human authority", async () => {
+  const config = defaultConfig("full");
+  const metadata = { thread_id: "thread_desktop_repeat_v1", turn_id: "turn_desktop_repeat_v1" };
+  const human = {
+    type: "message", role: "user", id: "msg_desktop_human_v1",
+    content: [{ type: "input_text", text: "Can you fix that" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn_before_desktop_repeat_v1", content_item_kinds: ["user.text"],
+    },
+  };
+  const nativeContext = {
+    type: "message", role: "user", id: "msg_desktop_native_context_v1",
+    content: [{ type: "input_text", text: "<recommended_plugins>Example plugin</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: metadata.turn_id, content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+    },
+  };
+  const original = {
+    model, stream: false, input: [human],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+  };
+  const store = new ChatGptCompactionContinuationStore();
+  const first = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+    method: "POST", body: JSON.stringify(original),
+  }), config, compactionAdapterFactory(), { compactionContinuationStore: store });
+  expect(first.status).toBe(200);
+  const firstCompacted = await first.json() as { output: unknown[] };
+
+  // During the same native turn Desktop appends runtime context after the retained compacted
+  // history. A later v1 compact must not promote that wrapper into the retained human source.
+  const second = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+    method: "POST", body: JSON.stringify({ ...original, input: [...firstCompacted.output, nativeContext] }),
+  }), config, compactionAdapterFactory(), { compactionContinuationStore: store });
+  expect(second.status).toBe(200);
+  const secondCompacted = await second.json() as { output: Array<{ id?: string }> };
+  expect(secondCompacted.output.some(item => item.id === nativeContext.id)).toBe(false);
+
+  let starts = 0;
+  const resumed = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({ ...original, input: [nativeContext, ...secondCompacted.output] }),
+  }), config, () => ({
+    name: "desktop-repeat-v1-post-compaction",
+    async runTurn(parsed, _incoming, emit) {
+      starts += 1;
+      expect(extractChatGptTurnUserRevision(parsed)).toEqual(human.content);
+      emit({ type: "text_delta", text: "Continued after repeated desktop v1 optimization", phase: "final_answer" });
+      emit({ type: "done", stopReason: "stop", endTurn: true });
+    },
+  }), { compactionContinuationStore: store });
+  expect(resumed.status).toBe(200);
+  expect((await resumed.json() as { status: string }).status).toBe("completed");
+  expect(starts).toBe(1);
+});
+
+test("v2 repeated same-turn desktop compaction binds the retained human source, not native user-role context", async () => {
+  const config = defaultConfig("full");
+  const metadata = { thread_id: "thread_desktop_repeat", turn_id: "turn_desktop_repeat" };
+  const human = {
+    type: "message", role: "user", id: "msg_desktop_human",
+    content: [{ type: "input_text", text: "Can you fix that" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn_before_desktop_repeat", content_item_kinds: ["user.text"],
+    },
+  };
+  const nativeContext = {
+    type: "message", role: "user", id: "msg_desktop_native_context",
+    content: [{ type: "input_text", text: "<recommended_plugins>Example plugin</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: metadata.turn_id, content_item_kinds: ["plugins.recommendations"],
+    },
+  };
+  const original = {
+    model, stream: false, input: [human],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+  };
+  const store = new ChatGptCompactionContinuationStore();
+
+  // The first optimization is the ordinary pre-turn compact and correctly authenticates the
+  // retained human instruction. Codex Desktop can then inject native user-role context while the
+  // same native turn keeps working and trigger a second optimization before the turn completes.
+  const first = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({ ...original, input: [human, { type: "compaction_trigger" }] }),
+  }), config, compactionAdapterFactory(), { compactionContinuationStore: store });
+  expect(first.status).toBe(200);
+  const firstCompacted = await first.json() as { output: unknown[] };
+
+  const second = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({
+      ...original, input: [human, ...firstCompacted.output, nativeContext, { type: "compaction_trigger" }],
+    }),
+  }), config, compactionAdapterFactory(), { compactionContinuationStore: store });
+  expect(second.status).toBe(200);
+  const secondCompacted = await second.json() as { output: unknown[] };
+
+  // process_annotated_compacted_history rebuilds current app context before the retained human
+  // source. The checkpoint must therefore authorize `human`, not the role=user native preamble.
+  let starts = 0;
+  const resumed = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({
+      ...original, input: [nativeContext, human, ...secondCompacted.output],
+    }),
+  }), config, () => ({
+    name: "desktop-repeat-post-compaction",
+    async runTurn(parsed, _incoming, emit) {
+      starts += 1;
+      expect(extractChatGptTurnUserRevision(parsed)).toEqual(human.content);
+      emit({ type: "text_delta", text: "Continued after repeated desktop optimization", phase: "final_answer" });
+      emit({ type: "done", stopReason: "stop", endTurn: true });
+    },
+  }), { compactionContinuationStore: store });
+  expect(resumed.status).toBe(200);
+  expect((await resumed.json() as { status: string }).status).toBe("completed");
+  expect(starts).toBe(1);
+});
+
 test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {
   const config = defaultConfig("full");
   const metadata = { thread_id: "thread_goal_compaction", turn_id: "turn_goal_continuation" };

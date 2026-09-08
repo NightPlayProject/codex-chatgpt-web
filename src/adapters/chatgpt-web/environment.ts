@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
+import { hasOnlyCodexContextualUserContentItemKinds, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
 
@@ -160,6 +160,11 @@ export function unattributedChatGptEnvironmentMessages(
 }
 
 function contextualUserMessage(value: Record<string, unknown>): boolean {
+  // Codex Desktop injects app/runtime context as role=user so it can survive model-history
+  // transforms. Native content_item_kinds distinguish those wrappers from a human revision;
+  // treating them as the active instruction can bind a compaction checkpoint to the preamble
+  // instead of the retained human message after a repeated same-turn compact.
+  if (hasOnlyCodexContextualUserContentItemKinds(value)) return true;
   const text = rawMessageText(value).trim();
   return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text)
     || /^<subagent_notification>[\s\S]*<\/subagent_notification>$/.test(text)

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { chatGptTurnUserRevisionHistory, extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
@@ -76,6 +76,39 @@ function currentWire(
     },
   };
 }
+
+test("native user-role context kinds are not human revisions, while user.text markup remains a revision", () => {
+  const metadata = { thread_id: "thread_native_context_kinds", turn_id: "turn_native_context_kinds" };
+  const human = {
+    type: "message", role: "user", id: "msg_human_revision",
+    content: [{ type: "input_text", text: "Continue the implementation" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn_human_revision", content_item_kinds: ["user.text"],
+    },
+  };
+  const nativeContext = {
+    type: "message", role: "user", id: "msg_native_context",
+    content: [{ type: "input_text", text: "<recommended_plugins>Example plugin</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: metadata.turn_id, content_item_kinds: ["plugins.recommendations"],
+    },
+  };
+  const parsed = {
+    modelId: "gpt-5.6-sol", stream: false, context: { messages: [] }, options: { reasoning: "high" },
+    _rawBody: {
+      input: [human, nativeContext],
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+    },
+  } as CodexParsedRequest;
+  expect(chatGptTurnUserRevisionHistory(parsed)).toEqual([{
+    turnId: "turn_human_revision", itemId: human.id, content: human.content,
+  }]);
+
+  nativeContext.internal_chat_message_metadata_passthrough.content_item_kinds = ["user.text"];
+  expect(chatGptTurnUserRevisionHistory(parsed).at(-1)).toEqual({
+    turnId: metadata.turn_id, itemId: nativeContext.id, content: nativeContext.content,
+  });
+});
 
 describe("trusted current Codex environment envelope", () => {
   test("accepts the v0.146 split envelope when workspace and sandbox metadata agree", () => {

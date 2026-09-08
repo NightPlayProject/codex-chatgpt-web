@@ -72,13 +72,13 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 **macOS 或 Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 然后在应用中完成三项检查：
@@ -98,7 +98,7 @@ Chrome/Chromium、系统级 Node/Bun，也不会由本项目另行下载浏览�
 **从源码运行**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/NightPlayProject/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```

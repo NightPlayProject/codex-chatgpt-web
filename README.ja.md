@@ -77,13 +77,13 @@ Full モードでは、次のコンパクション境界まで、MCP が ChatGPT
 **macOS または Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 アプリ内で次の 3 項目を完了します。
@@ -104,7 +104,7 @@ Free/Go アカウントでは Luna のみが表示され、Pro はサインイ�
 **ソースから実行**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/NightPlayProject/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```

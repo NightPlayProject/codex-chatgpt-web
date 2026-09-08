@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary, encodeCompactionSummary } from "../src/responses/compaction";
@@ -6,6 +9,7 @@ import { compactRequest, responseRequest as respond } from "../src/server";
 import type { CodexProviderConfig } from "../src/types";
 import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
 import { chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptCompactionContinuationStore } from "../src/adapters/chatgpt-web/compaction-continuation";
 
 const model = "chatgpt-web/high";
 const summary = "The repository was inspected. Continue by implementing the bounded Web context contract.";
@@ -225,6 +229,52 @@ for (const format of ["v1", "v2"] as const) test(`${format} pre-turn compaction 
   expect(starts).toBe(2);
 });
 
+for (const format of ["v1", "v2"] as const) test(`${format} completed compaction survives a bridge restart before its native continuation`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-server-compaction-"));
+  const statePath = join(root, "compaction-continuations.json");
+  try {
+    const config = defaultConfig("full");
+    const metadata = { thread_id: `thread_restart_${format}`, turn_id: `turn_restart_${format}` };
+    const source = {
+      type: "message", role: "user", id: "msg_restart_source",
+      content: [{ type: "input_text", text: "Continue this long-running project after optimization" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_before_restart_compaction" },
+    };
+    const original = {
+      model, stream: false, input: [source],
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+    };
+    const firstProcessStore = new ChatGptCompactionContinuationStore(statePath);
+    const compact = format === "v1"
+      ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+        method: "POST", body: JSON.stringify(original),
+      }), config, compactionAdapterFactory(), { compactionContinuationStore: firstProcessStore })
+      : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", body: JSON.stringify({ ...original, input: [source, { type: "compaction_trigger" }] }),
+      }), config, compactionAdapterFactory(), { compactionContinuationStore: firstProcessStore });
+    expect(compact.status).toBe(200);
+    const compacted = await compact.json() as { output: unknown[] };
+    const input = format === "v1" ? compacted.output : [source, ...compacted.output];
+
+    // A fresh store instance simulates the daemon process restarting between the successful
+    // compaction response and Codex's first context-only continuation.
+    const secondProcessStore = new ChatGptCompactionContinuationStore(statePath);
+    const resumed = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input }),
+    }), config, () => ({
+      name: "post-restart-compaction-continuation",
+      async runTurn(parsed, _incoming, emit) {
+        expect(extractChatGptTurnUserRevision(parsed)).toEqual(source.content);
+        emit({ type: "text_delta", text: "Continued after bridge restart", phase: "final_answer" });
+        emit({ type: "done", stopReason: "stop", endTurn: true });
+      },
+    }), { compactionContinuationStore: secondProcessStore });
+    expect(resumed.status).toBe(200);
+    expect((await resumed.json() as { status: string }).status).toBe("completed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {
   const config = defaultConfig("full");
   const metadata = { thread_id: "thread_goal_compaction", turn_id: "turn_goal_continuation" };

@@ -13,7 +13,11 @@ import type {
 } from "../types";
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
-import { compactionItemToText } from "./compaction";
+import {
+  compactionItemToText,
+  isOnePixelPngDataUrl,
+  isReadableCompactionSummaryText,
+} from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 
@@ -27,7 +31,55 @@ type InputBlock =
   | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
   | { type: "input_file"; file_id?: string; filename?: string };
 
-function inputContentParts(blocks: unknown[] | string | undefined): string | CodexContentPart[] {
+const PRE_COMPACTION_IMAGE_NOTE =
+  "[pre-compaction image not reattached; rely on the compaction summary for retained visual context]";
+
+function inputBlocksText(blocks: unknown[] | string | undefined): string {
+  if (typeof blocks === "string") return blocks;
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .filter((block): block is { type: "input_text" | "text"; text: string } => (
+      isObj(block)
+      && (block.type === "input_text" || block.type === "text")
+      && typeof block.text === "string"
+    ))
+    .map(block => block.text)
+    .join("");
+}
+
+function latestCompactionBoundaryIndex(input: readonly unknown[]): number {
+  let boundary = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    const effectiveType = typeof item.type === "string"
+      ? item.type
+      : "role" in item
+        ? "message"
+        : undefined;
+    if (
+      effectiveType === "compaction"
+      || effectiveType === "compaction_summary"
+      || effectiveType === "context_compaction"
+    ) {
+      boundary = index;
+      continue;
+    }
+    if (
+      effectiveType === "message"
+      && item.role === "user"
+      && isReadableCompactionSummaryText(inputBlocksText(item.content as unknown[] | string | undefined))
+    ) {
+      boundary = index;
+    }
+  }
+  return boundary;
+}
+
+function inputContentParts(
+  blocks: unknown[] | string | undefined,
+  omitImages = false,
+): string | CodexContentPart[] {
   if (typeof blocks === "string") return blocks;
   if (!blocks) return [];
   const parts: CodexContentPart[] = [];
@@ -38,6 +90,11 @@ function inputContentParts(blocks: unknown[] | string | undefined): string | Cod
     } else if (block.type === "input_image") {
       const b = block as { image_url?: string; file_id?: string; detail?: string };
       if (b.image_url) {
+        if (omitImages) {
+          if (isOnePixelPngDataUrl(b.image_url)) continue;
+          parts.push({ type: "text", text: PRE_COMPACTION_IMAGE_NOTE });
+          continue;
+        }
         // Preserve the image as a structured part — adapters send it as a native image block.
         // NEVER inline the (often base64 data-URL) image_url as text: that explodes the token count.
         parts.push({ type: "image", imageUrl: b.image_url, ...(b.detail ? { detail: normalizeImageDetail(b.detail) } : {}) });
@@ -232,7 +289,10 @@ function ensureAssistantPlaceholder(messages: CodexMessage[], modelId: string, n
  * `input_image` items): returns content parts when any image is present, else a plain joined string.
  * Never inlines an image_url as text (that would explode the token count).
  */
-function outputToToolResultContent(output: string | unknown[] | undefined): string | CodexContentPart[] {
+function outputToToolResultContent(
+  output: string | unknown[] | undefined,
+  omitImages = false,
+): string | CodexContentPart[] {
   if (typeof output === "string") return output;
   if (!Array.isArray(output)) return "";
   const parts: CodexContentPart[] = [];
@@ -244,8 +304,13 @@ function outputToToolResultContent(output: string | unknown[] | undefined): stri
     } else if (raw.type === "refusal" && typeof raw.refusal === "string") {
       parts.push({ type: "text", text: `[refusal: ${raw.refusal}]` });
     } else if (raw.type === "input_image" && typeof raw.image_url === "string") {
-      parts.push({ type: "image", imageUrl: raw.image_url, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
-      hasImage = true;
+      if (omitImages) {
+        if (isOnePixelPngDataUrl(raw.image_url)) continue;
+        parts.push({ type: "text", text: PRE_COMPACTION_IMAGE_NOTE });
+      } else {
+        parts.push({ type: "image", imageUrl: raw.image_url, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
+        hasImage = true;
+      }
     } else if (raw.type === "encrypted_content") {
       // codex-rs FunctionCallOutputContentItem::EncryptedContent — opaque to routed models.
       parts.push({ type: "text", text: "[encrypted content omitted]" });
@@ -313,7 +378,14 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   if (typeof data.input === "string") {
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
-    for (const item of data.input) {
+    const compactionBoundaryIndex = latestCompactionBoundaryIndex(data.input);
+    for (let itemIndex = 0; itemIndex < data.input.length; itemIndex += 1) {
+      const item = data.input[itemIndex]!;
+      // A completed compaction checkpoint semantically replaces the earlier visual history. Keep
+      // the canonical native items for provenance and textual replay, but do not physically upload
+      // their images into each fresh ChatGPT Temporary Chat. Only images introduced after the most
+      // recent checkpoint are new browser attachments.
+      const omitHistoricalImages = compactionBoundaryIndex >= 0 && itemIndex < compactionBoundaryIndex;
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
@@ -363,6 +435,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
 
         const content = inputContentParts(
           agentMessage.content as unknown[] | string | undefined,
+          omitHistoricalImages,
         );
 
         // An agent_message is external input delivered to the parent agent. Keep its distinct
@@ -385,7 +458,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         switch (msg.role) {
           case "system": {
             pendingReasoning.length = 0;
-            const text = inputContentParts(msg.content as unknown[] | string | undefined);
+            const text = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
             const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
             if (flat.length > 0) systemPrompt.push(flat);
             break;
@@ -393,7 +466,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           case "user":
           case "developer": {
             pendingReasoning.length = 0;
-            const content = inputContentParts(msg.content as unknown[] | string | undefined);
+            const content = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
             messages.push({ role: msg.role, content, timestamp: now });
             break;
           }
@@ -557,7 +630,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
-          content: outputToToolResultContent(output.output), isError: false, timestamp: now,
+          content: outputToToolResultContent(output.output, omitHistoricalImages), isError: false, timestamp: now,
         });
         continue;
       }
@@ -571,7 +644,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
           // Same payload shape as function_call_output (codex-rs FunctionCallOutputPayload):
           // string or content items — normalize arrays instead of leaking raw wire blocks.
-          content: outputToToolResultContent(output.output), isError: false, timestamp: now,
+          content: outputToToolResultContent(output.output, omitHistoricalImages), isError: false, timestamp: now,
         });
       }
     }

@@ -140,6 +140,18 @@ bun run app
    补丁到达本地运行时前将其拦截。外层 Codex harness 仍会执行沙箱和审批规则。
 6. 运行 **验证运行时**，确认 **Codex Native2** 已连接并可用。
 
+桌面控制是可选功能。完整模式会通过同一个 **Codex Native2** 连接器转发 Codex 原生的 MCP/插件工具。
+在 Windows 上，可使用 [`open-computer-use`](https://www.npmjs.com/package/open-computer-use)：
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+注册后请完全退出并重新打开 Codex。新任务可以通过原生 `tool_search` 发现延迟加载的
+`open-computer-use` 工具，不需要额外的桌面控制隧道或连接器。如果没有安装桌面控制 MCP，
+完整模式仍会正常提供当前 Codex harness 的其他功能。
+
 写入/修改操作还需要 ChatGPT 工作区及其管理员政策允许。请参阅
 [开发者模式和 MCP 应用](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)。
 除非显式启用 `--auto-approve-tool-calls`，否则意外的审批提示会直接失败；该选项只会点击

@@ -444,7 +444,8 @@ async function interruptHookCommand(args: string[]): Promise<void> {
   }
   let payload: { hook_event_name?: unknown; session_id?: unknown; turn_id?: unknown };
   try {
-    payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const text = Buffer.concat(chunks).toString("utf8").replace(/^\uFEFF/, "");
+    payload = JSON.parse(text);
   } catch {
     throw new Error("Codex Interrupt hook payload is not valid JSON");
   }

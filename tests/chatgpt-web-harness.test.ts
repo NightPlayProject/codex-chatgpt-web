@@ -2768,6 +2768,79 @@ describe("ChatGPT outer-native harness v4", () => {
         next_offset: null,
       });
 
+      // Fresh Codex tasks can keep optional MCPs deferred behind tool_search. Full mode must be
+      // able to discover tool_search through the native exec gateway, invoke it, then see and use
+      // the newly exposed desktop-control tool on the next tool boundary without another tunnel.
+      const deferredSearchInventory = await inventoryThroughGateway(
+        "tool_search",
+        true,
+        ["exec", "tool_search"],
+      );
+      expect(deferredSearchInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "tool_search",
+          name: "tool_search",
+          namespace: null,
+          kind: "gateway",
+        }],
+      });
+
+      const deferredSearch = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "tool_search",
+        arguments: { query: "open-computer-use desktop control", limit: 8 },
+      });
+      const [deferredSearchRequest] = await broker.nextToolBatch(token);
+      const deferredSearchCalls: GatewayProgramCall[] = [];
+      const deferredSearchContent = await executeGatewayProgram(
+        deferredSearchRequest!.input!,
+        ["tool_search"],
+        deferredSearchCalls,
+      );
+      expect(deferredSearchCalls).toEqual([{
+        name: "tool_search",
+        input: { query: "open-computer-use desktop control", limit: 8 },
+      }]);
+      broker.completeTool(token, deferredSearchRequest!.callId, { content: deferredSearchContent });
+      expect((await deferredSearch).isError).not.toBe(true);
+
+      const desktopInventory = await inventoryThroughGateway(
+        "open_computer_use",
+        true,
+        ["exec", "tool_search", "mcp__open_computer_use__list_apps"],
+      );
+      expect(desktopInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "mcp__open_computer_use__list_apps",
+          name: "mcp__open_computer_use__list_apps",
+          namespace: null,
+          kind: "gateway",
+        }],
+      });
+
+      const desktopCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "mcp__open_computer_use__list_apps",
+        arguments: {},
+      });
+      const [desktopRequest] = await broker.nextToolBatch(token);
+      const desktopCalls: GatewayProgramCall[] = [];
+      const desktopContent = await executeGatewayProgram(
+        desktopRequest!.input!,
+        ["mcp__open_computer_use__list_apps"],
+        desktopCalls,
+      );
+      expect(desktopCalls).toEqual([{
+        name: "mcp__open_computer_use__list_apps",
+        input: {},
+      }]);
+      broker.completeTool(token, desktopRequest!.callId, { content: desktopContent });
+      expect((await desktopCall).isError).not.toBe(true);
+
       const rawGatewayInventory = await inventoryThroughGateway(
         "Run nested Codex tools",
         false,

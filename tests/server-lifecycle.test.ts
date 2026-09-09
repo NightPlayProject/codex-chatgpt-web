@@ -338,6 +338,38 @@ test("native Codex interrupt remains authoritative when it arrives before HTTP i
   await waitForTurnCount(turns, 0);
 });
 
+test("native Codex interrupt does not poison a later steered HTTP request with the same turn id", async () => {
+  const turns = new HttpTurnCounter();
+  const identity = { threadId: "thread_steer_interrupt", turnId: "turn_steer_interrupt" };
+  let bindOriginal!: () => void;
+  const mayBindOriginal = new Promise<void>(resolve => { bindOriginal = resolve; });
+  let originalAborted = false;
+  const original = turns.track(async (signal, bindIdentity) => {
+    await mayBindOriginal;
+    bindIdentity(identity);
+    originalAborted = signal.aborted;
+    return new Response(new ReadableStream<Uint8Array>());
+  });
+  await waitForTurnCount(turns, 1);
+
+  // Steering interrupts the request already in flight, then submits a replacement provider round
+  // under the same native Codex turn_id.
+  expect(await turns.cancelTurn(identity)).toBe(0);
+  let replacementAborted = false;
+  const replacement = await turns.track((signal, bindIdentity) => {
+    bindIdentity(identity);
+    replacementAborted = signal.aborted;
+    return Promise.resolve(new Response(null, { status: 204 }));
+  });
+  expect(replacement.status).toBe(204);
+  expect(replacementAborted).toBeFalse();
+
+  bindOriginal();
+  expect((await original).status).toBe(499);
+  expect(originalAborted).toBeTrue();
+  await waitForTurnCount(turns, 0);
+});
+
 test("native passthrough response and compaction requests expose their exact interrupt identity", async () => {
   const config = defaultConfig("browser-only");
   const responseIdentity = { threadId: "thread_native_response", turnId: "turn_native_response" };

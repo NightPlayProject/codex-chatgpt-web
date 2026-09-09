@@ -148,6 +148,20 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
    外側の Codex ハーネスでは、引き続きサンドボックスと承認が適用されます。
 6. **ランタイムを検証**を実行し、**Codex Native2** が接続済みで利用可能であることを確認します。
 
+デスクトップ操作は任意です。Full モードは、ネイティブ Codex の MCP／プラグインツールを同じ
+**Codex Native2** コネクタ経由で転送できます。Windows では、
+[`open-computer-use`](https://www.npmjs.com/package/open-computer-use) を利用できます。
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+登録後は Codex を完全に終了して再起動してください。新しいタスクでは、ネイティブの `tool_search` を通じて
+遅延読み込みされた `open-computer-use` ツールを検出できます。追加のデスクトップ操作用トンネルやコネクタは
+不要です。デスクトップ操作用 MCP をインストールしていない場合でも、Full モードの他の Codex ハーネス機能は
+通常どおり利用できます。
+
 書き込み／変更操作には、ChatGPT ワークスペースと管理者ポリシー側での許可も必要です。
 [Developer Mode と MCP アプリ](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)を参照してください。
 予期しない承認プロンプトは、`--auto-approve-tool-calls` が明示的に有効でない限り fail-closed になります。

@@ -153,6 +153,20 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
    **Codex Native2**, with **Authentication: None** and **Allow all actions**.
 3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
 
+Desktop control is optional. Full mode forwards native Codex MCP/plugin tools through the same
+**Codex Native2** connector. On Windows, one working option is
+[`open-computer-use`](https://www.npmjs.com/package/open-computer-use):
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+Fully quit and reopen Codex after registering it. A fresh task can discover the deferred
+`open-computer-use` tools through native `tool_search`; no separate desktop-control tunnel or connector is
+required. If no desktop-control MCP is installed, Full mode continues to provide the rest of the
+active Codex harness normally.
+
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
 [developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).

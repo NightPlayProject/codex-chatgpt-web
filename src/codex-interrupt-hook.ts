@@ -38,13 +38,26 @@ function posixShellArgument(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function cmdShellArgument(value: string): string {
-  if (value.includes('"') || /[\r\n]/.test(value)) {
+function powershellLiteral(value: string): string {
+  if (/\0|[\r\n]/.test(value)) {
     throw new Error("Codex interrupt hook command contains an invalid Windows path character");
   }
-  // Codex executes command hooks through cmd.exe /C on Windows. Quoting every argument preserves
-  // spaces and shell metacharacters in the installed runtime path.
-  return `"${value}"`;
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function windowsInterruptHookCommand(args: string[]): string {
+  // Codex runs Windows command hooks through cmd.exe. Current Codex builds corrupt embedded double
+  // quotes in the configured command string, so keep that outer command completely quote-free and
+  // move all path quoting into a PowerShell encoded command.
+  const invocation = args.map(powershellLiteral).join(" ");
+  const script = [
+    "$payload = [Console]::In.ReadToEnd()",
+    `$payload | & ${invocation}`,
+    "if ($null -eq $LASTEXITCODE) { exit 1 }",
+    "exit $LASTEXITCODE",
+  ].join("\n");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
 }
 
 export function codexInterruptHookCommand(
@@ -54,7 +67,9 @@ export function codexInterruptHookCommand(
 ): string {
   const absoluteHome = platform === "win32" ? win32.resolve(home) : posix.resolve(home);
   const args = [...config.runtimeCommand, "--home", absoluteHome, "hook", "interrupt"];
-  return args.map(platform === "win32" ? cmdShellArgument : posixShellArgument).join(" ");
+  return platform === "win32"
+    ? windowsInterruptHookCommand(args)
+    : args.map(posixShellArgument).join(" ");
 }
 
 function lineEnding(text: string): "\n" | "\r\n" | "\r" {

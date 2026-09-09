@@ -126,23 +126,12 @@ export class HttpTurnCounter {
     done: Promise<void>;
     finish: () => void;
     identity?: NativeCodexTurnIdentity;
+    pendingInterrupts: Map<string, unknown>;
   }>();
-  private readonly interrupted = new Map<string, unknown>();
   private nextId = 1;
 
   private identityKey(identity: NativeCodexTurnIdentity): string {
     return `${identity.threadId}\u0000${identity.turnId}`;
-  }
-
-  private rememberInterrupted(identity: NativeCodexTurnIdentity, reason: unknown): void {
-    const key = this.identityKey(identity);
-    this.interrupted.delete(key);
-    this.interrupted.set(key, reason);
-    while (this.interrupted.size > 1_024) {
-      const oldest = this.interrupted.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.interrupted.delete(oldest);
-    }
   }
 
   constructor(private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure) {}
@@ -173,10 +162,17 @@ export class HttpTurnCounter {
     identity: NativeCodexTurnIdentity,
     reason: unknown = new DOMException("Codex turn interrupted", "AbortError"),
   ): { cancelled: number; settlement: Promise<void> } {
-    this.rememberInterrupted(identity, reason);
-    const turns = [...this.active.values()].filter(turn => (
-      turn.identity?.threadId === identity.threadId && turn.identity.turnId === identity.turnId
-    ));
+    const key = this.identityKey(identity);
+    const turns = [...this.active.values()].filter(turn => {
+      if (!turn.identity) {
+        // Interrupts can beat request parsing/identity binding. Remember that race only on HTTP
+        // requests that were already in flight. Native steering reuses the same turn_id, so a
+        // process-wide tombstone would incorrectly abort the replacement request too.
+        turn.pendingInterrupts.set(key, reason);
+        return false;
+      }
+      return turn.identity.threadId === identity.threadId && turn.identity.turnId === identity.turnId;
+    });
     for (const turn of turns) {
       if (!turn.abort.signal.aborted) turn.abort.abort(reason);
     }
@@ -204,7 +200,8 @@ export class HttpTurnCounter {
       done: Promise<void>;
       finish: () => void;
       identity?: NativeCodexTurnIdentity;
-    } = { abort, done, finish };
+      pendingInterrupts: Map<string, unknown>;
+    } = { abort, done, finish, pendingInterrupts: new Map() };
     this.active.set(id, tracked);
     let released = false;
     let clientAbortListener: (() => void) | undefined;
@@ -234,7 +231,8 @@ export class HttpTurnCounter {
           throw new Error("An HTTP request cannot change its native Codex turn identity");
         }
         tracked.identity = identity;
-        const interruptedReason = this.interrupted.get(this.identityKey(identity));
+        const interruptedReason = tracked.pendingInterrupts.get(this.identityKey(identity));
+        tracked.pendingInterrupts.clear();
         if (interruptedReason !== undefined && !abort.signal.aborted) abort.abort(interruptedReason);
       });
       if (!response.body) {

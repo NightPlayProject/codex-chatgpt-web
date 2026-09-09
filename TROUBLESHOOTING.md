@@ -108,6 +108,23 @@ Browser-only mode needs no connector. Full harness mode requires all of the foll
 Do not rename or refresh an old **Codex Native** connector. ChatGPT caches the public MCP contract by
 connector identity, so create **Codex Native2** as a new connector.
 
+### Desktop control is missing
+
+Desktop control is supplied by Codex through an optional native computer-use MCP. The existing
+**Codex Native2** connector can forward it after Codex has loaded it. On Windows, for example:
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+codex mcp get open-computer-use
+open-computer-use list-apps
+```
+
+Then fully quit Codex, reopen it, and start a new task. The first desktop-control request may use
+native `tool_search` to load the deferred MCP tools. You do not need a separate desktop-control
+tunnel or ChatGPT connector. If `list-apps` fails locally, repair the native MCP setup first; the Full harness
+cannot forward a tool that Codex itself has not loaded.
+
 ### ChatGPT shows `Error creating connector`
 
 1. Confirm that the Tunnel ID and the regular API key used by the launcher were created under the

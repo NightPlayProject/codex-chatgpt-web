@@ -26,11 +26,14 @@ const ESTIMATE_TURN_TOKEN = "turn_00000000000000000000000000000000";
 /**
  * ChatGPT's nominal High composer limit is much larger, but live Desktop traces repeatedly showed
  * accepted ~208-209k-character inline submissions fail in the product before any MCP claim while
- * the same canonical context succeeds through two acknowledged parts. Keep a conservative margin
- * below that unstable band and use the existing lossless multipart transport before Send is ever
- * activated. This is a reliability guard, not a larger model-context entitlement.
+ * the same canonical context succeeds through two acknowledged parts. A later real existing-thread
+ * trace reproduced the same terminal ChatGPT generation failure four consecutive times at 159,147
+ * browser-composer characters while a fresh small High turn succeeded through the same bridge.
+ * Keep a conservative margin below the lowest reproduced failure point and use the existing lossless
+ * multipart transport before Send is ever activated. This is a reliability guard, not a larger
+ * model-context entitlement.
  */
-export const CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT = 200_000;
+export const CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT = 158_000;
 
 export interface ChatGptWebRoundEvidence {
   answer?: string;

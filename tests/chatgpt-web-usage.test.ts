@@ -6,8 +6,9 @@ import {
   resolveStandardContextMultipartParts,
 } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
-import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
+import { compiledChatGptWebMaxMessageChars, compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { estimateTokens } from "../src/lib/token-estimate";
 import type { CodexParsedRequest } from "../src/types";
 
@@ -53,8 +54,46 @@ test("Standard Context proactively stages only the empirically unstable large in
   const small = request("ordinary context");
   expect(resolveStandardContextMultipartParts(small, plus)).toBeUndefined();
 
+  const compileEnvelope = (targetChars: number): CodexParsedRequest => {
+    const empty = request("");
+    const fixedChars = compiledChatGptWebMaxMessageChars(compileChatGptWebPrompt(empty, plus));
+    const parsed = request("x".repeat(targetChars - fixedChars));
+    expect(compiledChatGptWebMaxMessageChars(compileChatGptWebPrompt(parsed, plus))).toBe(targetChars);
+    return parsed;
+  };
+
+  expect(
+    resolveStandardContextMultipartParts(
+      compileEnvelope(CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT - 1),
+      plus,
+    ),
+  ).toBeUndefined();
+  expect(
+    resolveStandardContextMultipartParts(
+      compileEnvelope(CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT),
+      plus,
+    ),
+  ).toBe(2);
+
+  // Live 7005 trace 4757df296eba failed four consecutive High submissions at this exact browser
+  // envelope while a fresh small High turn succeeded through the same running bridge.
+  const reproducedFailure = compileEnvelope(159_147);
+  expect(resolveStandardContextMultipartParts(reproducedFailure, plus)).toBe(2);
+
+  // Keep the workaround narrow: ordinary/smaller Standard Context requests remain one message.
+  const belowObservedBand = compileEnvelope(140_000);
+  expect(resolveStandardContextMultipartParts(belowObservedBand, plus)).toBeUndefined();
+
   const large = request("x".repeat(CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT + 20_000));
   expect(resolveStandardContextMultipartParts(large, plus)).toBe(2);
+
+  const luna = structuredClone(large);
+  luna.modelId = "gpt-5.6-luna";
+  expect(resolveStandardContextMultipartParts(luna, plus)).toBeUndefined();
+
+  const zeroRisk = structuredClone(large);
+  zeroRisk.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
+  expect(resolveStandardContextMultipartParts(zeroRisk, plus)).toBeUndefined();
 
   const compaction = structuredClone(large);
   compaction._compactionRequest = true;

@@ -20,6 +20,10 @@ import {
   ChatGptCompactionContinuationStore,
   rememberCompactionContinuation,
 } from "./adapters/chatgpt-web/compaction-continuation";
+import {
+  bindGoalContinuationStore,
+  ChatGptGoalContinuationStore,
+} from "./adapters/chatgpt-web/goal-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { getConfigDir, providerConfig } from "./config";
@@ -360,6 +364,8 @@ export interface ResponseRequestOptions {
   rememberState?: boolean;
   /** Durable authorization for exact post-compaction native continuations. Omitted tests stay in-memory. */
   compactionContinuationStore?: ChatGptCompactionContinuationStore;
+  /** Durable `/goal` lineage bound to an exact human revision and completed compaction checkpoint. */
+  goalContinuationStore?: ChatGptGoalContinuationStore;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
   onAdapterEvent?: (event: AdapterEvent) => void;
   /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
@@ -494,6 +500,9 @@ export async function responseRequest(
     route = routeChatGptWebRequest(parsed, config);
     if (options.compactionContinuationStore) {
       bindCompactionContinuationStore(parsed, options.compactionContinuationStore);
+    }
+    if (options.goalContinuationStore) {
+      bindGoalContinuationStore(parsed, options.goalContinuationStore);
     }
     const identity = extractChatGptTurnIdentity(parsed);
     if (identity.threadId && identity.turnId) {
@@ -662,7 +671,7 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
-  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "compactionContinuationStore"> = {},
+  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "compactionContinuationStore" | "goalContinuationStore"> = {},
 ): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
@@ -785,6 +794,9 @@ export function startServer(
   const startedAt = Date.now();
   const compactionContinuationStore = new ChatGptCompactionContinuationStore(
     join(getConfigDir(), "runtime", "compaction-continuations.json"),
+  );
+  const goalContinuationStore = new ChatGptGoalContinuationStore(
+    join(getConfigDir(), "runtime", "goal-continuations.json"),
   );
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
   if (config.mode === "full") {
@@ -1002,7 +1014,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity, compactionContinuationStore },
+            { onTurnIdentity: bindIdentity, compactionContinuationStore, goalContinuationStore },
           ),
           req.signal,
           process.platform,
@@ -1016,7 +1028,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity, compactionContinuationStore },
+            { onTurnIdentity: bindIdentity, compactionContinuationStore, goalContinuationStore },
           ),
           req.signal,
           process.platform,

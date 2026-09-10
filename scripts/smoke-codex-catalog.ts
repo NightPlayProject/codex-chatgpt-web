@@ -20,10 +20,34 @@ function runCodex(args: string[], env = process.env): { stdout: string; stderr: 
   return { stdout: result.stdout, stderr: result.stderr };
 }
 
+type CatalogModel = {
+  slug?: string;
+  supported_reasoning_levels?: unknown[];
+  multi_agent_version?: string;
+  supported_in_api?: boolean;
+  visibility?: string;
+  priority?: number;
+};
+
 const bundled = runCodex(["debug", "models", "--bundled"]);
-const sourceCatalog = JSON.parse(bundled.stdout) as { models?: unknown[] };
-if (!sourceCatalog.models?.some(model => model && typeof model === "object" && (model as { slug?: string }).slug === "gpt-5.6-sol")) {
-  throw new Error("Bundled Codex catalog has no gpt-5.6-sol template");
+const sourceCatalog = JSON.parse(bundled.stdout) as { models?: CatalogModel[] };
+const sourceModels = sourceCatalog.models ?? [];
+const sourceNativeTemplate = sourceModels.find(model =>
+  typeof model.slug === "string"
+  && !model.slug.startsWith("chatgpt-web/")
+  && model.visibility === "list"
+  && Array.isArray(model.supported_reasoning_levels));
+if (!sourceNativeTemplate?.slug) {
+  throw new Error("Bundled Codex catalog has no compatible native model template");
+}
+const sourceNativeDelegate = sourceModels
+  .filter(model => typeof model.slug === "string"
+    && !model.slug.startsWith("chatgpt-web/")
+    && model.supported_in_api === true
+    && model.visibility === "list")
+  .toSorted((left, right) => (left.priority ?? Number.MAX_SAFE_INTEGER) - (right.priority ?? Number.MAX_SAFE_INTEGER))[0];
+if (!sourceNativeDelegate?.slug) {
+  throw new Error("Bundled Codex catalog has no list-visible native subagent delegate");
 }
 
 const root = join(tmpdir(), `codex-chatgpt-web-codex-smoke-${process.pid}-${Date.now()}`);
@@ -46,16 +70,7 @@ writeFileSync(join(process.env.CODEX_HOME, "config.toml"), [
 try {
   const isolatedEnv = { ...process.env, CODEX_HOME: process.env.CODEX_HOME };
   const result = runCodex(["debug", "models"], isolatedEnv);
-  const catalog = JSON.parse(result.stdout) as {
-    models?: Array<{
-      slug?: string;
-      supported_reasoning_levels?: unknown[];
-      multi_agent_version?: string;
-      supported_in_api?: boolean;
-      visibility?: string;
-      priority?: number;
-    }>;
-  };
+  const catalog = JSON.parse(result.stdout) as { models?: CatalogModel[] };
   const web = catalog.models?.filter(model => model.slug?.startsWith("chatgpt-web/")) ?? [];
   const expected = CHATGPT_WEB_MODEL_ROUTES.map(route => ({ slug: route.slug, effort: route.codexEffort }));
   const actual = web.map(model => ({
@@ -67,11 +82,11 @@ try {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Codex did not preserve the fixed ChatGPT Web model contract: ${JSON.stringify(actual)}`);
   }
-  const nativeSol = catalog.models?.find(model => model.slug === "gpt-5.6-sol");
+  const nativeDelegate = catalog.models?.find(model => model.slug === sourceNativeDelegate.slug);
   const webPro = catalog.models?.find(model => model.slug === "chatgpt-web/pro");
-  if (nativeSol?.multi_agent_version !== "v1" || webPro?.multi_agent_version !== "v1") {
+  if (nativeDelegate?.multi_agent_version !== "v1" || webPro?.multi_agent_version !== "v1") {
     throw new Error(
-      `Codex did not preserve Compatibility V1 catalog metadata: ${JSON.stringify({ nativeSol, webPro })}`,
+      `Codex did not preserve Compatibility V1 catalog metadata: ${JSON.stringify({ nativeDelegate, webPro })}`,
     );
   }
   const features = runCodex(["features", "list"], isolatedEnv).stdout;
@@ -85,7 +100,7 @@ try {
     .slice(0, 5)
     .map(model => model.slug);
   const expectedSpawnOverrides = [
-    "gpt-5.6-sol",
+    sourceNativeDelegate.slug,
     ...CHATGPT_WEB_MODEL_ROUTES.slice(1).map(route => route.slug),
   ];
   if (JSON.stringify(spawnOverrides) !== JSON.stringify(expectedSpawnOverrides)) {

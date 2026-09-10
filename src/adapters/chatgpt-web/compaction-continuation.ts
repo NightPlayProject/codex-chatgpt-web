@@ -21,6 +21,10 @@ interface PersistedCheckpointFile {
   checkpoints: PersistedCheckpoint[];
 }
 
+export interface ChatGptCompactionCheckpointMatch {
+  checkpointId: string;
+}
+
 const MAX_CHECKPOINTS = 256;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -35,6 +39,48 @@ function digest(value: unknown): string {
 
 function sourceDigest(source: ChatGptTurnUserRevision): string {
   return digest([source.turnId, source.content]);
+}
+
+function checkpointId(key: string, checkpoint: CompletedCheckpoint): string {
+  return digest([
+    "chatgpt-compaction-checkpoint-v1",
+    key,
+    checkpoint.summaryHash,
+    [...checkpoint.sourceHashes].sort(),
+  ]);
+}
+
+function parsedScopeKey(value: string): [string, string, string, string | null] | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || parsed.length !== 4
+      || typeof parsed[0] !== "string" || !parsed[0]
+      || typeof parsed[1] !== "string" || !parsed[1]
+      || typeof parsed[2] !== "string" || !parsed[2]
+      || (parsed[3] !== null && typeof parsed[3] !== "string")) return undefined;
+    return parsed as [string, string, string, string | null];
+  } catch {
+    return undefined;
+  }
+}
+
+function latestCompactionSummary(parsed: CodexParsedRequest): string | undefined {
+  const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+  if (!Array.isArray(input)) return undefined;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index] as Record<string, unknown> | null;
+    if (!item || typeof item !== "object") continue;
+    if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) {
+      return typeof item.encrypted_content === "string"
+        ? decodeCompactionSummary(item.encrypted_content) ?? undefined
+        : undefined;
+    }
+    if (item.role !== "user") continue;
+    const text = typeof item.content === "string" ? item.content : Array.isArray(item.content)
+      ? item.content.map(part => part?.text ?? "").join("\n") : "";
+    if (isReadableCompactionSummaryText(text)) return text.slice(SUMMARY_PREFIX.length + 1);
+  }
+  return undefined;
 }
 
 function validateScopeKey(value: unknown): string {
@@ -125,23 +171,48 @@ export class ChatGptCompactionContinuationStore {
     this.load();
     const checkpoint = this.checkpoints.get(key);
     if (!checkpoint || !checkpoint.sourceHashes.has(sourceDigest(source))) return false;
-    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
-    if (!Array.isArray(input)) return false;
-    for (let index = input.length - 1; index >= 0; index -= 1) {
-      const item = input[index] as Record<string, unknown> | null;
-      if (!item || typeof item !== "object") continue;
-      if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) {
-        const summary = typeof item.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null;
-        return summary !== null && this.acceptsSummary(key, checkpoint, summary);
-      }
-      if (item.role !== "user") continue;
-      const text = typeof item.content === "string" ? item.content : Array.isArray(item.content)
-        ? item.content.map(part => part?.text ?? "").join("\n") : "";
-      if (isReadableCompactionSummaryText(text)) {
-        return this.acceptsSummary(key, checkpoint, text.slice(SUMMARY_PREFIX.length + 1));
-      }
+    const summary = latestCompactionSummary(parsed);
+    return summary !== undefined && this.acceptsSummary(key, checkpoint, summary);
+  }
+
+  /**
+   * Resolve a prior completed checkpoint for a native `/goal` turn without broadening ordinary
+   * continuation authority. The current request must carry the exact checkpoint summary and exact
+   * human source representation; thread/model/effort also stay bound. Only the old compaction
+   * `turn_id` is intentionally allowed to differ because native `/goal` starts a new turn.
+   */
+  matchingCheckpoint(
+    parsed: CodexParsedRequest,
+    identity: ChatGptTurnIdentity,
+    source: ChatGptTurnUserRevision,
+    expectedCheckpointId?: string,
+  ): ChatGptCompactionCheckpointMatch | undefined {
+    if (!identity.threadId || !identity.turnId) return undefined;
+    const summary = latestCompactionSummary(parsed);
+    if (summary === undefined) return undefined;
+    const summaryHash = digest(summary);
+    const sourceHash = sourceDigest(source);
+    this.load();
+    const entries = [...this.checkpoints.entries()];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const [key, checkpoint] = entries[index]!;
+      const checkpointScope = parsedScopeKey(key);
+      if (!checkpointScope) continue;
+      const [threadId, _turnId, modelId, reasoning] = checkpointScope;
+      if (threadId !== identity.threadId
+        || modelId !== parsed.modelId
+        || reasoning !== (parsed.options.reasoning ?? null)
+        || checkpoint.summaryHash !== summaryHash
+        || !checkpoint.sourceHashes.has(sourceHash)) continue;
+      const id = checkpointId(key, checkpoint);
+      if (expectedCheckpointId !== undefined && id !== expectedCheckpointId) continue;
+      // Successful goal use is real use of the exact checkpoint, so retain normal MRU semantics.
+      this.checkpoints.delete(key);
+      this.checkpoints.set(key, checkpoint);
+      this.persist();
+      return { checkpointId: id };
     }
-    return false;
+    return undefined;
   }
 
   private acceptsSummary(key: string, checkpoint: CompletedCheckpoint, summary: string): boolean {
@@ -230,4 +301,13 @@ export function isAcceptedCompactionContinuation(
   source: ChatGptTurnUserRevision,
 ): boolean {
   return storeFor(parsed).accepts(parsed, identity, source);
+}
+
+export function matchingCompactionCheckpoint(
+  parsed: CodexParsedRequest,
+  identity: ChatGptTurnIdentity,
+  source: ChatGptTurnUserRevision,
+  expectedCheckpointId?: string,
+): ChatGptCompactionCheckpointMatch | undefined {
+  return storeFor(parsed).matchingCheckpoint(parsed, identity, source, expectedCheckpointId);
 }

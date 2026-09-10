@@ -71,7 +71,7 @@ test("remote outer harness owns a turn through the live broker protocol", async 
     });
     expect(await invocation).toMatchObject({ structuredContent: { simulated: true } });
     await remote.revoke(token);
-    await expect(retirement).resolves.toBeUndefined();
+    await retirement;
     await expect(callTurnBroker(socketPath, { method: "claim", token })).rejects.toThrow("already finished");
   } finally {
     await broker.close();
@@ -249,7 +249,7 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
   const biggerStatus = bigger.status(biggerState);
   expect(biggerStatus).toMatchObject({
     autoCompactTokenLimit: 285_000,
-    contextWindow: 333_579,
+    contextWindow: 360_000,
   });
   expect(biggerStatus.percent).toBe(Math.round((biggerStatus.inputTokens / 285_000) * 1_000) / 10);
   const luna = new DevChatDriver({
@@ -457,7 +457,7 @@ test("synthetic fill crosses the production threshold and triggers the real comp
   const store = new DevChatStore(join(root, "chats"));
   const driver = new DevChatDriver(config, store, factory, root);
   const state = driver.open("auto-compact", "chatgpt-web/light").state;
-  driver.fill(state, 30_000);
+  driver.fill(state, 33_000);
   expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(32_000);
   const events: string[] = [];
   const result = await driver.send(state, "Continue after compacting the synthetic history.", event => events.push(event.type));

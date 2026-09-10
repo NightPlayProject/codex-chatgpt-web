@@ -20,21 +20,24 @@ export type ChatGptWebCodexEffort = "low" | "medium" | "high" | "xhigh" | "ultra
 export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
- * Measured Plus browser transport windows, including the fixed hidden ChatGPT platform reserve.
- * Codex compacts the visible task at the lower explicit threshold before the next browser turn is
- * compiled. The remaining headroom is owned by ChatGPT's product prompt and Codex Native schemas.
+ * Canonical Codex context windows for Sol. A browser submission has its own smaller transport
+ * envelope below, so raising these windows never authorizes a larger one-message payload.
  */
-export const CHATGPT_WEB_INSTANT_CONTEXT_WINDOW = 41_000;
+export const CHATGPT_WEB_INSTANT_CONTEXT_WINDOW = 50_000;
 export const CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT = 32_000;
+/** Preserve the previously validated Plus visible-message envelope independently of context. */
+export const CHATGPT_WEB_INSTANT_MESSAGE_TOKEN_LIMIT = 32_807;
 /**
  * Zero Risk keeps one visible ChatGPT conversation across sequential Codex turns. Its fixed route
  * therefore uses the requested three-turn compaction interval without enabling Bigger Context's
  * automatic multipart transport; the user still pastes exactly one incremental prompt per turn.
  */
-export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = CHATGPT_WEB_INSTANT_CONTEXT_WINDOW * 3;
-export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT * 3;
-export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 90_000;
+export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = 41_000 * 3;
+export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = 32_000 * 3;
+export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 100_000;
 export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 80_000;
+/** Preserve the previously validated Plus reasoning visible-message envelope. */
+export const CHATGPT_WEB_MEDIUM_HIGH_MESSAGE_TOKEN_LIMIT = 81_807;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
 export const CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT = 1_048_572;
 /** Hidden ChatGPT product prompt and Codex Native schema reserve included in usage estimates. */
@@ -43,23 +46,23 @@ export const CHATGPT_WEB_PLATFORM_RESERVE_TOKENS = 8_192;
 export function chatGptWebImageTokenReserve(detail?: string): number {
   return detail === "original" ? 8_192 : 4_096;
 }
-/** Pro-account usable browser windows and separately measured one-message boundaries. */
+/** Legacy per-turn threshold retained by the unchanged manual Zero Risk Pro profile. */
 export const CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT = 95_000;
+/** Canonical Sol windows for Pro accounts. Keep compaction below the measured browser envelope. */
+export const CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW = 120_000;
+export const CHATGPT_WEB_PRO_STANDARD_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT;
+export const CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW = 128_000;
+export const CHATGPT_WEB_PRO_MODEL_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT;
+/** Separately measured one-message browser boundaries. */
 export const CHATGPT_WEB_PRO_STANDARD_MESSAGE_TOKEN_LIMIT = 103_000;
 export const CHATGPT_WEB_PRO_MODEL_MESSAGE_TOKEN_LIMIT = 104_000;
-// Browser message maxima are inclusive, while the context preflight treats its ceiling as an
-// exclusive upper bound. The extra token preserves the last accepted payload exactly.
-export const CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW =
-  CHATGPT_WEB_PRO_STANDARD_MESSAGE_TOKEN_LIMIT + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
-export const CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW =
-  CHATGPT_WEB_PRO_MODEL_MESSAGE_TOKEN_LIMIT + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
 /**
  * Zero Risk Pro keeps the same three-turn manual conversation budget as the default profile, but
  * sizes each turn from the measured ChatGPT Pro boundary. The launcher cannot verify that the user
  * actually selected Pro, so this profile is exposed only through an explicit user setting.
  */
 export const CHATGPT_WEB_ZERO_RISK_PRO_CONTEXT_WINDOW =
-  CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW * 3;
+  (CHATGPT_WEB_PRO_MODEL_MESSAGE_TOKEN_LIMIT + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1) * 3;
 export const CHATGPT_WEB_ZERO_RISK_PRO_AUTO_COMPACT_TOKEN_LIMIT =
   CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT * 3;
 export const CHATGPT_WEB_PRO_INSTANT_COMPOSER_CHAR_LIMIT = 545_000;
@@ -139,7 +142,10 @@ export function resolveChatGptWebContextLimits(
       : effort === "max"
         ? CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW
         : CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW;
-    limits = contextLimits(contextWindow, CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT);
+    const autoCompactTokenLimit = effort === "max"
+      ? CHATGPT_WEB_PRO_MODEL_AUTO_COMPACT_TOKEN_LIMIT
+      : CHATGPT_WEB_PRO_STANDARD_AUTO_COMPACT_TOKEN_LIMIT;
+    limits = contextLimits(contextWindow, autoCompactTokenLimit);
   } else if (effort === "low") {
     limits = contextLimits(
       CHATGPT_WEB_INSTANT_CONTEXT_WINDOW,
@@ -170,10 +176,16 @@ export function resolveChatGptWebTransportLimits(
   if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return {};
   if (!capabilities.proAvailable) {
     if (effort === "low") {
-      return { browserComposerCharLimit: CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT };
+      return {
+        browserMessageTokenLimit: CHATGPT_WEB_INSTANT_MESSAGE_TOKEN_LIMIT,
+        browserComposerCharLimit: CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT,
+      };
     }
     if (effort === "medium" || effort === "high") {
-      return { browserComposerCharLimit: CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT };
+      return {
+        browserMessageTokenLimit: CHATGPT_WEB_MEDIUM_HIGH_MESSAGE_TOKEN_LIMIT,
+        browserComposerCharLimit: CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT,
+      };
     }
     throw new Error(`ChatGPT Plus transport limit is not defined for unavailable effort: ${effort}`);
   }

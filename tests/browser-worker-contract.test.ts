@@ -2842,7 +2842,7 @@ test("browser preflight separates model context from one-message transport limit
   const luna = { localToolsEnabled: false, solAvailable: false, proAvailable: false };
 
   try {
-    assertChatGptWebInputWithinLimits(90_000, 81_808, "gpt-5.6-sol", "medium", plus);
+    assertChatGptWebInputWithinLimits(100_000, 81_807, "gpt-5.6-sol", "medium", plus);
     throw new Error("expected context-window preflight to fail");
   } catch (error) {
     expect(error).toMatchObject({
@@ -2855,14 +2855,34 @@ test("browser preflight separates model context from one-message transport limit
     expect(String(error)).toContain("/compact");
   }
 
-  expect(() => assertChatGptWebInputWithinLimits(40_999, 32_807, "gpt-5.6-sol", "low", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(41_000, 32_808, "gpt-5.6-sol", "low", plus)).toThrow(
-    "41,000-token context window",
+  expect(() => assertChatGptWebInputWithinLimits(49_999, 32_807, "gpt-5.6-sol", "low", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(49_999, 32_808, "gpt-5.6-sol", "low", plus)).toThrow(
+    "32,807-token ChatGPT browser message boundary",
   );
-  expect(() => assertChatGptWebInputWithinLimits(89_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(89_999, 81_807, "gpt-5.6-sol", "high", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(90_000, 81_808, "gpt-5.6-sol", "high", plus)).toThrow(
-    "90,000-token context window",
+  expect(() => assertChatGptWebInputWithinLimits(50_000, 32_807, "gpt-5.6-sol", "low", plus)).toThrow(
+    "50,000-token context window",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(99_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(99_999, 81_807, "gpt-5.6-sol", "high", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(99_999, 81_808, "gpt-5.6-sol", "high", plus)).toThrow(
+    "81,807-token ChatGPT browser message boundary",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(100_000, 81_807, "gpt-5.6-sol", "high", plus)).toThrow(
+    "100,000-token context window",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(119_999, 103_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(119_999, 103_001, "gpt-5.6-sol", "xhigh", pro)).toThrow(
+    "103,000-token ChatGPT browser message boundary",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(120_000, 103_000, "gpt-5.6-sol", "xhigh", pro)).toThrow(
+    "120,000-token context window",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(127_999, 104_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(127_999, 104_001, "gpt-5.6-sol", "max", pro)).toThrow(
+    "104,000-token ChatGPT browser message boundary",
+  );
+  expect(() => assertChatGptWebInputWithinLimits(128_000, 104_000, "gpt-5.6-sol", "max", pro)).toThrow(
+    "128,000-token context window",
   );
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
@@ -3003,7 +3023,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     experimentalBiggerContext: true,
   };
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    333_578,
+    359_999,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3012,7 +3032,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     3,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    333_579,
+    360_000,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3021,7 +3041,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     3,
   )).toThrow("three-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    222_385,
+    239_999,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3030,7 +3050,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     2,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    222_386,
+    240_000,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3039,7 +3059,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     2,
   )).toThrow("two-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    269_999,
+    299_999,
     80_000,
     "gpt-5.6-sol",
     "high",
@@ -3048,23 +3068,32 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     3,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    270_000,
+    300_000,
     80_000,
     "gpt-5.6-sol",
     "high",
     plus,
     900_000,
     3,
-  )).toThrow("270,000-token three-part ceiling");
+  )).toThrow("300,000-token three-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    180_000,
+    199_999,
     80_000,
     "gpt-5.6-sol",
     "high",
     plus,
     900_000,
     2,
-  )).toThrow("180,000-token two-part ceiling");
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    200_000,
+    80_000,
+    "gpt-5.6-sol",
+    "high",
+    plus,
+    900_000,
+    2,
+  )).toThrow("200,000-token two-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     280_000,
     103_001,

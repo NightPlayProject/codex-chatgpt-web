@@ -89,6 +89,16 @@ export function hasOnlyCodexContextualUserContentItemKinds(value: unknown): bool
     && kinds.every(kind => typeof kind === "string" && CODEX_CONTEXTUAL_USER_CONTENT_ITEM_KINDS.has(kind));
 }
 
+/** A native goal continuation is runtime steering, never a human-authored browser message. */
+export function isNativeGoalContextItem(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = (value as { internal_chat_message_metadata_passthrough?: unknown })
+    .internal_chat_message_metadata_passthrough;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const kinds = (metadata as { content_item_kinds?: unknown }).content_item_kinds;
+  return Array.isArray(kinds) && kinds.length === 1 && kinds[0] === "goal.internal_context";
+}
+
 interface CompactContentBlock extends Record<string, unknown> {
   type?: string;
   text?: string;

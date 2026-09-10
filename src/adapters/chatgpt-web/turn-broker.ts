@@ -1254,8 +1254,10 @@ export async function callTurnBroker<T>(
     }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    // The server owns response termination. Waiting for the pipe/socket to close before resolving
-    // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
+    // `end` is the peer's authoritative no-more-bytes boundary. Some Windows named-pipe paths can
+    // remain half-open after a clean peer end, so relying only on `close` can leave an unbounded
+    // caller unresolved forever when the peer terminates without writing a response frame.
+    socket.once("end", finishResponse);
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
@@ -1279,12 +1281,12 @@ export async function callTurnBroker<T>(
         return;
       }
       response = parsed;
-      if (settleOnResponseFrame) {
-        // A long-poll keeps its request half open while the server waits. Its complete response
-        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
-        finishResponse();
-        socket.destroy();
-      }
+      // A response frame is the protocol boundary. Waiting for the TCP/socket close event makes
+      // pending broker errors depend on transport cleanup timing, which can leave an invocation
+      // rejected by the broker but still unresolved in the caller. Long-poll callers use the same
+      // complete frame boundary, then close their local socket.
+      finishResponse();
+      if (settleOnResponseFrame) socket.destroy();
     });
   });
 }

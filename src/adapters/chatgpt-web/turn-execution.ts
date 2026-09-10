@@ -203,6 +203,18 @@ export interface ChatGptInstructionLineage {
   predecessors: ReadonlySet<string>;
 }
 
+interface ChatGptOwnerInstructionState {
+  current: string;
+  generation: number;
+  lastUsedAt: number;
+  nativeTurnId?: string;
+}
+
+interface ChatGptOwnerInstructionClaim {
+  current: string;
+  generation: number;
+}
+
 export function chatGptInstructionLineage(parsed: CodexParsedRequest): ChatGptInstructionLineage {
   const revisions = chatGptTurnUserRevisionHistory(parsed).map(revision => createHash("sha256")
     .update(JSON.stringify([revision.itemId ?? null, revision.content])).digest("hex"));
@@ -499,6 +511,7 @@ export class ChatGptTurnSessions {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
   private readonly conversationRetirements = new Map<string, Promise<void>>();
+  private readonly ownerInstructions = new Map<string, ChatGptOwnerInstructionState>();
 
   constructor(
     private readonly ttlMs = 30 * 60_000,
@@ -545,6 +558,7 @@ export class ChatGptTurnSessions {
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
   ): Promise<ChatGptTurnSession> {
+    let instructionClaim: ChatGptOwnerInstructionClaim | undefined;
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const existing = this.entries.get(key);
@@ -553,8 +567,20 @@ export class ChatGptTurnSessions {
         existing.touch();
         return existing;
       }
+      if (instructionClaim && !this.ownerInstructionClaimCurrent(ownerKey, instructionClaim)) {
+        throw chatGptTurnSupersededError();
+      }
       const pending = this.retirements.get(key) ?? this.ownerRetirements.get(ownerKey);
       if (pending) {
+        const trackedTurnId = this.ownerInstructions.get(ownerKey)?.nativeTurnId;
+        // Same-turn steering must keep its generation claim while the superseded browser owner is
+        // physically retiring. A different native turn can be a normal paginated successor whose
+        // request body does not replay the prior instruction, so wait for ownership release before
+        // opening a new instruction epoch instead of treating the missing predecessor as stale.
+        if (!instructionClaim && instruction
+          && (trackedTurnId === undefined || nativeTurnId === undefined || trackedTurnId === nativeTurnId)) {
+          instructionClaim = this.claimOwnerInstruction(ownerKey, instruction, undefined, nativeTurnId);
+        }
         await awaitWithAbort(pending, signal);
         continue;
       }
@@ -563,23 +589,49 @@ export class ChatGptTurnSessions {
       ));
       if (activeOwner) {
         const [ownedKey, ownedSession] = activeOwner;
-        if (ownedSession.isActive() && instruction && ownedSession.instruction
-          && instruction.current !== ownedSession.instruction) {
-          if (!instruction.predecessors.has(ownedSession.instruction)) throw chatGptTurnSupersededError();
-          // Native steering can return the old tool result and a new instruction in one request.
-          // Waiting for the old browser here deadlocks before that result can be consumed. Retire
-          // its capability and rebuild from the complete canonical history, including that result.
-          // Keep the old entry terminal so a delayed replay cannot restart superseded work.
-          const reason = chatGptTurnSupersededError();
-          ownedSession.supersededError = reason;
-          this.forgetConversationHead(ownedSession);
-          await awaitWithAbort(this.beginRetirement(ownedKey, ownedSession, reason), signal);
-          continue;
+        const sameNativeTurn = nativeTurnId === undefined
+          || ownedSession.nativeTurnId === undefined
+          || nativeTurnId === ownedSession.nativeTurnId;
+        if (sameNativeTurn) {
+          if (instruction && ownedSession.instruction && instruction.current !== ownedSession.instruction
+            && !instruction.predecessors.has(ownedSession.instruction)) {
+            throw chatGptTurnSupersededError();
+          }
+          if (!instructionClaim && instruction) {
+            instructionClaim = this.claimOwnerInstruction(
+              ownerKey,
+              instruction,
+              ownedSession.instruction,
+              nativeTurnId,
+            );
+          }
+          if (instructionClaim && !this.ownerInstructionClaimCurrent(ownerKey, instructionClaim)) {
+            throw chatGptTurnSupersededError();
+          }
+          if (ownedSession.isActive() && instruction && ownedSession.instruction
+            && instruction.current !== ownedSession.instruction) {
+            // Native steering can return the old tool result and a new instruction in one request.
+            // Waiting for the old browser here deadlocks before that result can be consumed. Retire
+            // its capability and rebuild from the complete canonical history, including that result.
+            // Keep the old entry terminal so a delayed replay cannot restart superseded work.
+            const reason = chatGptTurnSupersededError();
+            ownedSession.supersededError = reason;
+            this.forgetConversationHead(ownedSession);
+            await awaitWithAbort(this.beginRetirement(ownedKey, ownedSession, reason), signal);
+            continue;
+          }
         }
         // A completed response may still be releasing its browser surface. Sequential work
-        // waits for that cleanup; preemption requires a proven newer canonical instruction.
+        // waits for that cleanup. A different native turn starts a fresh instruction epoch only
+        // after the old physical owner is gone; same-turn preemption requires proven lineage.
         await awaitWithAbort(ownedSession.physicalSettlement, signal);
         continue;
+      }
+      if (!instructionClaim && instruction) {
+        instructionClaim = this.claimOwnerInstruction(ownerKey, instruction, undefined, nativeTurnId, true);
+      }
+      if (instructionClaim && !this.ownerInstructionClaimCurrent(ownerKey, instructionClaim)) {
+        throw chatGptTurnSupersededError();
       }
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current);
@@ -731,6 +783,7 @@ export class ChatGptTurnSessions {
     for (const [key, session] of this.entries) this.beginRetirement(key, session);
     this.entries.clear();
     this.conversationHeads.clear();
+    this.ownerInstructions.clear();
     return cancelled;
   }
 
@@ -795,6 +848,88 @@ export class ChatGptTurnSessions {
       session.cancel();
       this.entries.delete(key);
       this.forgetConversationHead(session);
+    }
+    this.pruneOwnerInstructions(cutoff);
+  }
+
+  private claimOwnerInstruction(
+    ownerKey: string,
+    instruction: ChatGptInstructionLineage,
+    predecessor?: string,
+    nativeTurnId?: string,
+    allowFreshNativeTurn = false,
+  ): ChatGptOwnerInstructionClaim {
+    const now = Date.now();
+    const tracked = this.ownerInstructions.get(ownerKey);
+    if (tracked) {
+      tracked.lastUsedAt = now;
+      if (allowFreshNativeTurn
+        && nativeTurnId !== undefined
+        && tracked.nativeTurnId !== undefined
+        && nativeTurnId !== tracked.nativeTurnId) {
+        const next = {
+          current: instruction.current,
+          generation: tracked.generation + 1,
+          lastUsedAt: now,
+          nativeTurnId,
+        };
+        this.ownerInstructions.set(ownerKey, next);
+        return { current: next.current, generation: next.generation };
+      }
+      if (tracked.current === instruction.current) {
+        return { current: tracked.current, generation: tracked.generation };
+      }
+      if (!instruction.predecessors.has(tracked.current)) throw chatGptTurnSupersededError();
+      const next = {
+        current: instruction.current,
+        generation: tracked.generation + 1,
+        lastUsedAt: now,
+        ...(nativeTurnId !== undefined ? { nativeTurnId } : tracked.nativeTurnId !== undefined
+          ? { nativeTurnId: tracked.nativeTurnId }
+          : {}),
+      };
+      this.ownerInstructions.set(ownerKey, next);
+      return { current: next.current, generation: next.generation };
+    }
+    if (predecessor && instruction.current !== predecessor && !instruction.predecessors.has(predecessor)) {
+      throw chatGptTurnSupersededError();
+    }
+    const created = {
+      current: instruction.current,
+      generation: 1,
+      lastUsedAt: now,
+      ...(nativeTurnId !== undefined ? { nativeTurnId } : {}),
+    };
+    this.ownerInstructions.set(ownerKey, created);
+    this.pruneOwnerInstructions(now - this.ttlMs);
+    return { current: created.current, generation: created.generation };
+  }
+
+  private ownerInstructionClaimCurrent(ownerKey: string, claim: ChatGptOwnerInstructionClaim): boolean {
+    const tracked = this.ownerInstructions.get(ownerKey);
+    return tracked?.current === claim.current && tracked.generation === claim.generation;
+  }
+
+  private pruneOwnerInstructions(cutoff: number): void {
+    const activeOwners = new Set(
+      [...this.entries.values()]
+        .filter(session => !session.isPhysicallySettled() && session.ownerKey)
+        .map(session => session.ownerKey!),
+    );
+    const evictable = (ownerKey: string, state: ChatGptOwnerInstructionState): boolean => (
+      state.lastUsedAt < cutoff
+      && !activeOwners.has(ownerKey)
+      && !this.ownerRetirements.has(ownerKey)
+    );
+    for (const [ownerKey, state] of this.ownerInstructions) {
+      if (evictable(ownerKey, state)) this.ownerInstructions.delete(ownerKey);
+    }
+    while (this.ownerInstructions.size > this.maxEntries) {
+      const oldest = [...this.ownerInstructions]
+        .filter(([ownerKey]) => !activeOwners.has(ownerKey) && !this.ownerRetirements.has(ownerKey))
+        .toSorted((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+      if (!oldest) break;
+      this.ownerInstructions.delete(oldest[0]);
     }
   }
 

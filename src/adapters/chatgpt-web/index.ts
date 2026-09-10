@@ -29,7 +29,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
-import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
+import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts, resolveStandardContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
@@ -427,13 +427,15 @@ export function createChatGptWebAdapter(
         await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey);
       }
       : undefined;
-    const compileOptionsFor = (input: CodexParsedRequest) => {
+    const compileOptionsFor = (input: CodexParsedRequest, retainedGoalResume = false) => {
       if (manualRequest) return {};
+      const goalOptions = retainedGoalResume ? { retainedGoalResume: true as const } : {};
       const experimentalMultipartParts = experimentalBiggerContext
-        ? resolveBiggerContextMultipartParts(input, turnCapabilities)
-        : undefined;
+        ? resolveBiggerContextMultipartParts(input, turnCapabilities, goalOptions)
+        : resolveStandardContextMultipartParts(input, turnCapabilities, goalOptions);
       return {
         captureLunaCheckpoint,
+        ...goalOptions,
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -527,18 +529,37 @@ export function createChatGptWebAdapter(
         try {
           activeToken = await broker.registerSafe(environment, surfaceNonce, undefined, traceId);
           observeCapabilityRetirement(activeToken, externalProgress);
-          const compiled = compileChatGptWebPrompt(
-            checkpointInput.parsed,
-            turnCapabilities,
-            activeToken,
-            { manualControl: true },
-          );
+          let retainedGoalOnly = false;
+          let compiled;
+          try {
+            compiled = compileChatGptWebPrompt(
+              checkpointInput.parsed,
+              turnCapabilities,
+              activeToken,
+              { manualControl: true },
+            );
+          } catch (error) {
+            if (!(error instanceof ChatGptWebAdapterError)
+              || error.code !== "native_goal_context_missing"
+              || !resumeInput) throw error;
+            // The bridge deliberately does not persist goal plaintext. For an exact retained Zero
+            // Risk surface we can continue the goal already visible in ChatGPT; a fresh surface must
+            // still fail closed. Use the resume prompt as the harmless provisional full prompt, then
+            // require the launcher lease to prove that it actually reused the retained conversation.
+            retainedGoalOnly = true;
+            compiled = compileChatGptWebPrompt(
+              resumeInput,
+              turnCapabilities,
+              activeToken,
+              { manualControl: true, retainedGoalResume: true },
+            );
+          }
           const resumeCompiled = resumeInput
             ? compileChatGptWebPrompt(
               resumeInput,
               turnCapabilities,
               activeToken,
-              { manualControl: true },
+              { manualControl: true, retainedGoalResume: true },
             )
             : undefined;
           for (const candidate of [compiled, resumeCompiled]) {
@@ -560,7 +581,7 @@ export function createChatGptWebAdapter(
               text: "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, send the prompt, then confirm it was sent in the launcher.",
             });
           }
-          await zeroRiskManualControl.start(retainedLauncherDescriptor, {
+          const manualLease = await zeroRiskManualControl.start(retainedLauncherDescriptor, {
             ...owner,
             prompt: compiled.text,
             ...(resumeCompiled ? { resumePrompt: resumeCompiled.text } : {}),
@@ -568,6 +589,22 @@ export function createChatGptWebAdapter(
             ...(parsed._compactionRequest ? { compaction: true as const } : {}),
           });
           launcherStarted = true;
+          if (retainedGoalOnly) {
+            const reused = manualLease && typeof manualLease === "object" && !Array.isArray(manualLease)
+              ? (manualLease as { reused?: unknown }).reused
+              : undefined;
+            if (reused !== true) {
+              throw new ChatGptWebAdapterError(
+                "The native goal objective is available only in the retained Zero Risk conversation, but that conversation was not reused.",
+                {
+                  status: 409,
+                  errorType: "invalid_request_error",
+                  code: "native_goal_context_missing",
+                  retryable: false,
+                },
+              );
+            }
+          }
           await zeroRiskManualControl.waitSent(retainedLauncherDescriptor, owner, {
             abortSignal: browserAbort.signal,
           });
@@ -711,7 +748,7 @@ export function createChatGptWebAdapter(
     const externalProgress = new ChatGptExternalTurnProgress();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const prepareWith = async (input: CodexParsedRequest) => {
+    const prepareWith = async (input: CodexParsedRequest, retainedGoalResume = false) => {
       const turnToken = activeToken ?? await broker.register(
         environment,
         timeoutMs === undefined ? undefined : timeoutMs + 60_000,
@@ -723,7 +760,7 @@ export function createChatGptWebAdapter(
           input,
           turnCapabilities,
           turnToken,
-          compileOptionsFor(input),
+          compileOptionsFor(input, retainedGoalResume),
         );
         // Publish only after preparation succeeds: otherwise its failure revokes the token
         // before the response observer uses it and masks the cause as an expired capability.
@@ -745,7 +782,7 @@ export function createChatGptWebAdapter(
       reasoning: parsed.options.reasoning,
       capabilities: turnCapabilities,
       prepare: () => prepareWith(checkpointInput.parsed),
-      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
+      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput, true) } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
       abortSignal: browserAbort.signal,
       ...(parsed._compactionRequest ? { compaction: true } : {}),

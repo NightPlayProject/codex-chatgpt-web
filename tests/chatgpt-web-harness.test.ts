@@ -10,8 +10,10 @@ import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adap
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
-import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
+import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { bindCompactionContinuationStore, ChatGptCompactionContinuationStore, rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { bindGoalContinuationStore, ChatGptGoalContinuationStore } from "../src/adapters/chatgpt-web/goal-continuation";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
@@ -19,13 +21,13 @@ import {
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
-import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
 import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
-import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
+import { decodeCompactionSummary, encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
 
@@ -853,6 +855,121 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(second.outstanding()).toEqual([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
   });
 
+  test("rejects a native /goal claim that conflicts with a current human revision", () => {
+    const raw = rawWireRequest(environmentXml);
+    const body = raw._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, unknown> };
+    const metadata = JSON.parse(String(body.client_metadata["x-codex-turn-metadata"])) as { thread_id: string; turn_id: string };
+    body.input.push({
+      type: "message",
+      role: "user",
+      id: "msg_goal_exact_replay",
+      content: [{ type: "input_text", text: '<codex_internal_context source="goal">runtime steering</codex_internal_context>' }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: metadata.turn_id,
+        content_item_kinds: ["goal.internal_context"],
+      },
+    });
+    // This fixture still owns a human instruction in the same native turn. A goal wrapper cannot
+    // silently override that second current authority; real `/goal` continuation is covered below
+    // with an older checkpoint-bound human source and exact current native goal evidence.
+    const publicBody = { model: "chatgpt-web/high", stream: false, ...raw._rawBody as Record<string, unknown> };
+    const first = parseRequest(publicBody);
+    first.modelId = raw.modelId;
+    first.options.reasoning = raw.options.reasoning;
+    expect(JSON.stringify(first.context.messages)).not.toContain("runtime steering");
+    expect(() => chatGptTurnExecutionKey(first)).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const literalHumanBody = structuredClone(publicBody) as unknown as { input: Array<Record<string, unknown>> };
+    const literalHumanGoal = literalHumanBody.input.at(-1)!;
+    literalHumanGoal.internal_chat_message_metadata_passthrough = {
+      turn_id: metadata.turn_id,
+      content_item_kinds: ["user.text"],
+    };
+    expect(JSON.stringify(parseRequest(literalHumanBody).context.messages)).toContain("runtime steering");
+    const mixedKindsBody = structuredClone(publicBody) as unknown as { input: Array<Record<string, unknown>> };
+    mixedKindsBody.input.at(-1)!.internal_chat_message_metadata_passthrough = {
+      turn_id: metadata.turn_id,
+      content_item_kinds: ["goal.internal_context", "user.text"],
+    };
+    expect(JSON.stringify(parseRequest(mixedKindsBody).context.messages)).toContain("runtime steering");
+
+  });
+
+  test("native /goal execution follows the trusted objective instead of the retained human source", () => {
+    const threadId = "thread_harness_goal_semantics";
+    const sourceTurnId = "turn_harness_goal_source";
+    const checkpointTurnId = "turn_harness_goal_checkpoint";
+    const goalTurnId = "turn_harness_goal_active";
+    const summary = "Harness goal checkpoint";
+    const source = {
+      type: "message", role: "user", id: "msg_harness_goal_source",
+      content: [{ type: "input_text", text: "Reply with exactly INITIAL_NATIVE_OK" }],
+      internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId, content_item_kinds: ["user.text"] },
+    };
+    const compactionStore = new ChatGptCompactionContinuationStore();
+    const goalStore = new ChatGptGoalContinuationStore();
+    const checkpoint = parseRequest({
+      model: CHATGPT_WEB_MODEL_ID,
+      stream: true,
+      input: [source, { type: "compaction_trigger" }],
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: checkpointTurnId }),
+      },
+    });
+    bindCompactionContinuationStore(checkpoint, compactionStore);
+    rememberCompactionContinuation(
+      checkpoint,
+      extractChatGptTurnIdentity(checkpoint),
+      [extractChatGptCompactionSourceRevision(checkpoint)],
+      summary,
+    );
+    const makeGoal = (objective: string, wrapperId: string, turnId = goalTurnId): CodexParsedRequest => {
+      const request = parseRequest({
+        model: CHATGPT_WEB_MODEL_ID,
+        stream: true,
+        input: [
+          source,
+          { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+          {
+            type: "message", role: "user", id: wrapperId,
+            content: [{ type: "input_text", text: [
+              '<codex_internal_context source="goal">',
+              "Continue working toward the active thread goal.",
+              "<objective>",
+              objective,
+              "</objective>",
+              `Budget wrapper ${wrapperId}`,
+              "</codex_internal_context>",
+            ].join("\n") }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["goal.internal_context"] },
+          },
+        ],
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }) },
+      });
+      bindCompactionContinuationStore(request, compactionStore);
+      bindGoalContinuationStore(request, goalStore);
+      return request;
+    };
+
+    const first = makeGoal("Reply with exactly GOAL_ONLY", "msg_harness_goal_a");
+    expect(extractChatGptTurnUserRevision(first)).toEqual(source.content);
+    const compiled = compileChatGptWebPrompt(first, browserOnlyCapabilities);
+    expect(JSON.stringify(first.context.messages)).not.toContain("GOAL_ONLY");
+    expect(compiled.text).toContain("GOAL_ONLY");
+    expect(compiled.text).toContain("Execute the active native Codex goal now");
+    const firstKey = chatGptTurnExecutionKey(first);
+
+    const replay = makeGoal("Reply with exactly GOAL_ONLY", "msg_harness_goal_regenerated");
+    expect(chatGptTurnExecutionKey(replay)).toBe(firstKey);
+    expect(() => chatGptTurnExecutionKey(
+      makeGoal("Reply with exactly MUTATED_SAME_TURN", "msg_harness_goal_mutated"),
+    )).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const nextTurn = makeGoal("Reply with exactly SECOND_GOAL", "msg_harness_goal_next", "turn_harness_goal_next");
+    expect(chatGptTurnExecutionKey(nextTurn)).not.toBe(firstKey);
+    expect(compileChatGptWebPrompt(nextTurn, browserOnlyCapabilities).text).toContain("SECOND_GOAL");
+  });
+
   test("waits for completed browser cleanup before starting the next canonical instruction", async () => {
     const sessions = new ChatGptTurnSessions();
     let finishBrowser!: (answer: string) => void;
@@ -890,7 +1007,8 @@ describe("ChatGPT outer-native harness v4", () => {
       undefined,
       "new-native-turn",
       "native-thread",
-      { current: "new-instruction", predecessors: new Set(["old-instruction"]) },
+      // A new paginated native turn may not replay the previous turn's instruction in this request.
+      { current: "new-instruction", predecessors: new Set() },
     );
     await Bun.sleep(0);
 
@@ -900,6 +1018,57 @@ describe("ChatGPT outer-native harness v4", () => {
     expect((await replacement).traceId).toBe("new-trace");
     expect(replacements).toBe(1);
     expect(cancellations).toBe(0);
+    sessions.clear();
+  });
+
+  test("a fully settled paginated native turn does not require the prior turn's instruction lineage", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const first = await sessions.getOrCreateAfterOwnerRetirement(
+      "first-paginated-turn",
+      "shared-paginated-thread",
+      () => ({
+        mode: "read-only" as const,
+        browser: Promise.resolve("first"),
+        physicalSettlement: Promise.resolve(),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      }),
+      "first-trace",
+      undefined,
+      "native-turn-a",
+      "native-thread",
+      { current: "instruction-a", predecessors: new Set() },
+    );
+    await first.browserOutcome;
+    await first.physicalSettlement;
+
+    let starts = 0;
+    const second = await sessions.getOrCreateAfterOwnerRetirement(
+      "second-paginated-turn",
+      "shared-paginated-thread",
+      () => {
+        starts += 1;
+        return {
+          mode: "read-only" as const,
+          browser: Promise.resolve("second"),
+          physicalSettlement: Promise.resolve(),
+          trace: new ChatGptTraceFeed(),
+          text: new ChatGptTextFeed(),
+          cancel: () => {},
+        };
+      },
+      "second-trace",
+      undefined,
+      "native-turn-b",
+      "native-thread",
+      // Codex paginated history can start a fresh native turn with only its current delta. The
+      // prior turn remains authoritative in history_base but is absent from this request's input.
+      { current: "instruction-b", predecessors: new Set() },
+    );
+
+    expect(second.nativeTurnId).toBe("native-turn-b");
+    expect(starts).toBe(1);
     sessions.clear();
   });
 
@@ -955,6 +1124,83 @@ describe("ChatGPT outer-native harness v4", () => {
     await current.browserOutcome;
     sessions.clear();
   });
+
+  for (const steerCount of [5, 20]) {
+    test(`coalesces ${steerCount} rapid canonical steers while the previous browser is retiring`, async () => {
+      const sessions = new ChatGptTurnSessions();
+      let rejectOld!: (reason: Error) => void;
+      let settleOld!: () => void;
+      const cancellations: Error[] = [];
+      sessions.getOrCreate("root", () => ({
+        mode: "tools",
+        token: new Promise<string>(() => {}),
+        externalProgress: new ChatGptExternalTurnProgress(),
+        browser: new Promise<string>((_, reject) => { rejectOld = reject; }),
+        physicalSettlement: new Promise<void>(resolve => { settleOld = resolve; }),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: reason => {
+          if (!reason) return;
+          cancellations.push(reason);
+          rejectOld(reason);
+        },
+      }), "root-trace", "shared-owner", "native-turn", "native-thread", "root-instruction");
+
+      const starts: string[] = [];
+      const pending: Array<Promise<ChatGptTurnSession>> = [];
+      const predecessors = ["root-instruction"];
+      for (let index = 1; index <= steerCount; index += 1) {
+        const current = `steer-${index}`;
+        const key = `steer-key-${index}`;
+        pending.push(sessions.getOrCreateAfterOwnerRetirement(
+          key,
+          "shared-owner",
+          () => {
+            starts.push(current);
+            return {
+              mode: "read-only" as const,
+              browser: Promise.resolve(current),
+              physicalSettlement: Promise.resolve(),
+              trace: new ChatGptTraceFeed(),
+              text: new ChatGptTextFeed(),
+              cancel: () => {},
+            };
+          },
+          `trace-${index}`,
+          undefined,
+          "native-turn",
+          "native-thread",
+          { current, predecessors: new Set(predecessors) },
+        ));
+        predecessors.push(current);
+      }
+
+      expect(cancellations).toHaveLength(1);
+      expect(starts).toEqual([]);
+      settleOld();
+      const outcomes = await Promise.allSettled(pending);
+      expect(starts).toEqual([`steer-${steerCount}`]);
+      for (const outcome of outcomes.slice(0, -1)) {
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status === "rejected") {
+          expect(outcome.reason).toMatchObject({ code: "client_cancelled", retryable: false });
+        }
+      }
+      expect(outcomes.at(-1)?.status).toBe("fulfilled");
+
+      await expect(sessions.getOrCreateAfterOwnerRetirement(
+        "late-root",
+        "shared-owner",
+        () => { throw new Error("stale steering must never restart"); },
+        "late-root-trace",
+        undefined,
+        "native-turn",
+        "native-thread",
+        { current: "root-instruction", predecessors: new Set() },
+      )).rejects.toMatchObject({ code: "client_cancelled", retryable: false });
+      sessions.clear();
+    });
+  }
 
   test("retires only the exact active native turn that Codex marked aborted", () => {
     const sessions = new ChatGptTurnSessions();

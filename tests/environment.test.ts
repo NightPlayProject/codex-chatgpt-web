@@ -4,7 +4,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
 import { chatGptTurnUserRevisionHistory, extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
-import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import {
+  bindCompactionContinuationStore,
+  ChatGptCompactionContinuationStore,
+  rememberCompactionContinuation,
+} from "../src/adapters/chatgpt-web/compaction-continuation";
+import {
+  bindGoalContinuationStore,
+  ChatGptGoalContinuationStore,
+} from "../src/adapters/chatgpt-web/goal-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { CodexParsedRequest, CodexTool } from "../src/types";
@@ -915,6 +923,99 @@ describe("trusted Codex task environment continuity", () => {
     ].join("\n") + "\n");
     // A valid cached environment and matching wire claim cannot overrule a different native turn.
     expect(() => store.resolve(request)).toThrow("current turn");
+  });
+
+  test("native /goal continuation accepts its current environment only after exact checkpoint authorization", () => {
+    const { codexHome, request } = resumedRootFixture();
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    const checkpointTurnId = "01a06c66-1111-75c6-a0df-318f890ef6de";
+    const summary = "Goal environment checkpoint";
+    const sourceContent = [{ type: "input_text", text: "Continue the original human task" }];
+    const source = { turnId: oldTurnId, itemId: "msg_goal_environment_source", content: sourceContent };
+    const compactionStore = new ChatGptCompactionContinuationStore();
+    const checkpointRequest: CodexParsedRequest = {
+      ...request,
+      _compactionRequest: true,
+      _rawBody: {
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "compaction",
+            thread_id: rolloutThreadId,
+            turn_id: checkpointTurnId,
+            sandbox_mode: "danger-full-access",
+            workspaces: { [root]: {} },
+          }),
+        },
+        input: [{
+          type: "message", role: "user", id: source.itemId, content: sourceContent,
+          internal_chat_message_metadata_passthrough: { turn_id: oldTurnId, content_item_kinds: ["user.text"] },
+        }],
+      },
+    };
+    bindCompactionContinuationStore(checkpointRequest, compactionStore);
+    rememberCompactionContinuation(
+      checkpointRequest,
+      { threadId: rolloutThreadId, turnId: checkpointTurnId },
+      [source],
+      summary,
+    );
+
+    const body = request._rawBody as {
+      client_metadata: Record<string, string>;
+      input: Array<Record<string, unknown>>;
+    };
+    body.input = [
+      {
+        type: "message", role: "user", id: "msg_goal_current_environment",
+        content: [
+          { type: "input_text", text: "<recommended_plugins>runtime only</recommended_plugins>" },
+          { type: "input_text", text: environmentXml },
+        ],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+        },
+      },
+      {
+        type: "message", role: "user", id: source.itemId, content: sourceContent,
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId, content_item_kinds: ["user.text"] },
+      },
+      { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+      {
+        type: "message", role: "user", id: "msg_goal_runtime_environment",
+        content: [{ type: "input_text", text: [
+          '<codex_internal_context source="goal">',
+          "Continue working toward the active thread goal.",
+          "<objective>",
+          "runtime only",
+          "</objective>",
+          "</codex_internal_context>",
+        ].join("\n") }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["goal.internal_context"],
+        },
+      },
+    ];
+    request.context.messages = [{ role: "user", content: "Continue the original human task", timestamp: 1 }];
+    bindCompactionContinuationStore(request, compactionStore);
+    bindGoalContinuationStore(request, new ChatGptGoalContinuationStore());
+
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+
+    const unproven = structuredClone(request);
+    bindCompactionContinuationStore(unproven, compactionStore);
+    bindGoalContinuationStore(unproven, new ChatGptGoalContinuationStore());
+    const unprovenInput = (unproven._rawBody as { input: Array<Record<string, unknown>> }).input;
+    unprovenInput.pop();
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(unproven))
+      .toThrow("missing cwd");
   });
 
   test("old untagged transcript context cannot block or replace current rollout authority after restart", () => {

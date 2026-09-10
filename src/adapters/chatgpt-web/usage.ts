@@ -7,7 +7,7 @@ import {
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
 import type { CodexParsedRequest, CodexUsage } from "../../types";
-import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
+import { compiledChatGptWebMaxMessageChars, compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
   CHATGPT_BIGGER_CONTEXT_PARTS,
   compileChatGptWebPrompt,
@@ -22,6 +22,15 @@ import type { BrokerToolRequest } from "./turn-broker";
 // The real capability has the same length. Keeping it out of usage accounting would make
 // estimates differ slightly between the prepared browser prompt and later Codex tool rounds.
 const ESTIMATE_TURN_TOKEN = "turn_00000000000000000000000000000000";
+
+/**
+ * ChatGPT's nominal High composer limit is much larger, but live Desktop traces repeatedly showed
+ * accepted ~208-209k-character inline submissions fail in the product before any MCP claim while
+ * the same canonical context succeeds through two acknowledged parts. Keep a conservative margin
+ * below that unstable band and use the existing lossless multipart transport before Send is ever
+ * activated. This is a reliability guard, not a larger model-context entitlement.
+ */
+export const CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT = 200_000;
 
 export interface ChatGptWebRoundEvidence {
   answer?: string;
@@ -48,6 +57,10 @@ export function estimateChatGptWebInputTokens(
     capabilities,
     mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
     {
+      // Usage accounting may run after a retained native-goal tool round whose fresh wrapper is no
+      // longer replayed. It must estimate the already-established retained prompt without turning
+      // the old human source back into the active task.
+      retainedGoalResume: true,
       ...options,
       ...(manual ? { manualControl: true as const } : {}),
       captureLunaCheckpoint: parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
@@ -66,6 +79,7 @@ export function estimateChatGptWebInputTokens(
 export function resolveBiggerContextMultipartParts(
   parsed: CodexParsedRequest,
   capabilities: ChatGptWebCapabilities,
+  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume"> = {},
 ): ChatGptWebMultipartPartCount | undefined {
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
     throw new Error("Bigger Context is unavailable for ChatGPT Zero Risk");
@@ -82,7 +96,7 @@ export function resolveBiggerContextMultipartParts(
   );
   const compile = (parts?: ChatGptWebMultipartPartCount): CompiledChatGptWebPrompt => compileChatGptWebPrompt(
     parsed, capabilities, mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
-    { experimentalMultipartParts: parts },
+    { ...options, experimentalMultipartParts: parts },
   );
   const inline = compile();
   const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
@@ -108,6 +122,32 @@ export function resolveBiggerContextMultipartParts(
   };
   if (initialParts === undefined && fits(inline)) return undefined;
   return fits(compile(2)) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;
+}
+
+/**
+ * Standard Context normally remains one browser message. For empirically unstable very-large Sol
+ * inline envelopes, stage the same ordered semantic records in two messages proactively. The
+ * multipart compiler binds execution to the provenance-validated active request and stages carry
+ * no connector/tool capability, so this never replays a task after an ambiguous Send.
+ */
+export function resolveStandardContextMultipartParts(
+  parsed: CodexParsedRequest,
+  capabilities: ChatGptWebCapabilities,
+  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume"> = {},
+): ChatGptWebMultipartPartCount | undefined {
+  if (parsed._compactionRequest
+    || isChatGptWebZeroRiskBackendModel(parsed.modelId)
+    || parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) return undefined;
+  const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
+  const inline = compileChatGptWebPrompt(
+    parsed,
+    capabilities,
+    mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
+    options,
+  );
+  return compiledChatGptWebMaxMessageChars(inline) >= CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT
+    ? 2
+    : undefined;
 }
 
 export function biggerContextPartCount(

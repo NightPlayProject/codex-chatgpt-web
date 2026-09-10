@@ -91,7 +91,7 @@ describe("native /models augmentation", () => {
     config.experimentalBiggerContext = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
-    expect(pro.context_window).toBe(336_579);
+    expect(pro.context_window).toBe(384_000);
     expect(pro.auto_compact_token_limit).toBe(285_000);
   });
 
@@ -174,9 +174,9 @@ describe("native /models augmentation", () => {
       effectiveContextWindowPercent: model.effective_context_window_percent,
       autoCompactTokenLimit: model.auto_compact_token_limit,
     }))).toEqual([
-      { contextWindow: 41_000, effectiveContextWindowPercent: 78, autoCompactTokenLimit: 32_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
+      { contextWindow: 50_000, effectiveContextWindowPercent: 64, autoCompactTokenLimit: 32_000 },
+      { contextWindow: 100_000, effectiveContextWindowPercent: 80, autoCompactTokenLimit: 80_000 },
+      { contextWindow: 100_000, effectiveContextWindowPercent: 80, autoCompactTokenLimit: 80_000 },
     ]);
   });
 

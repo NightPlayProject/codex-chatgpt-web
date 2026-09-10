@@ -3,6 +3,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { hasOnlyCodexContextualUserContentItemKinds, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
+import { authorizeGoalContinuation, hasCurrentNativeGoalClaim, resolveGoalContinuation } from "./goal-continuation";
 
 export type ChatGptSandboxPolicy =
   | { type: "dangerFullAccess" }
@@ -44,6 +45,17 @@ export interface ChatGptTurnUserRevision {
   content: unknown;
   turnId?: string;
   itemId?: string;
+}
+
+export interface ChatGptTurnUserRevisionRecord extends ChatGptTurnUserRevision {
+  inputIndex: number;
+}
+
+export interface ChatGptNativeGoalExecution {
+  goalId: string;
+  goalRevision: string;
+  /** Present when this request carries the exact current-turn native goal wrapper. */
+  objective?: string;
 }
 
 export const CHATGPT_TURN_REVISION_CONFLICT_MESSAGE =
@@ -221,30 +233,58 @@ export function priorChatGptAbortedTurnIds(parsed: CodexParsedRequest): string[]
  * installs the replacement history, the immediate continuation starts a fresh browser response
  * under the same logical task revision.
  */
-export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unknown {
+export function extractChatGptTurnUserRevisionRecord(parsed: CodexParsedRequest): ChatGptTurnUserRevisionRecord {
   const identity = extractChatGptTurnIdentity(parsed);
   const turnId = identity.turnId;
   if (!turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
-  const revision = latestChatGptTurnUserRevision(parsed, turnId);
+  const revision = latestChatGptTurnUserRevisionRecord(parsed, turnId);
   if (!revision) throw new Error("ChatGPT web requires a current-turn user message for browser-session replay");
+  // Native Codex must expose exactly one current task authority. A human/direct-parent revision and
+  // a native goal claim in the same current turn are ambiguous even if either one looks valid by
+  // itself, so fail closed instead of silently choosing one execution channel.
+  if (revision.turnId === turnId && hasCurrentNativeGoalClaim(parsed, identity)) {
+    throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+  }
   // A pre-turn compact may summarize an earlier user message before native Codex continues
   // under its new turn id without adding a new human message. Accept only our exact completed
   // checkpoint; an arbitrary older prompt is still not a new instruction or a valid handoff.
-  if (revision.turnId !== undefined && revision.turnId !== turnId
-    && (priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)
-      || !isAcceptedCompactionContinuation(parsed, identity, revision))) {
-    throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+  if (revision.turnId !== undefined && revision.turnId !== turnId) {
+    // Aborted source instructions can never be revived by any continuation mechanism.
+    if (priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)) {
+      throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+    }
+    // Ordinary compaction remains exact-turn authority. Native `/goal` is the only cross-turn
+    // bridge: it must prove its own current-turn runtime identity plus the exact prior completed
+    // checkpoint and human revision before it can establish durable continuation authority.
+    if (!isAcceptedCompactionContinuation(parsed, identity, revision)
+      && !authorizeGoalContinuation(parsed, identity, revision)) {
+      throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+    }
   }
-  return revision.content;
+  return revision;
+}
+
+export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unknown {
+  return extractChatGptTurnUserRevisionRecord(parsed).content;
 }
 
 function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
+  const record = latestChatGptTurnUserRevisionRecord(parsed, expectedTurnId);
+  if (!record) return undefined;
+  const { inputIndex: _inputIndex, ...revision } = record;
+  return revision;
+}
+
+function latestChatGptTurnUserRevisionRecord(
+  parsed: CodexParsedRequest,
+  expectedTurnId?: string,
+): ChatGptTurnUserRevisionRecord | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const revision = userRevision(input[index], expectedTurnId, metadata);
-    if (revision) return revision;
+    if (revision) return { ...revision, inputIndex: index };
   }
   return undefined;
 }
@@ -289,6 +329,36 @@ export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boo
     && revision.turnId !== identity.turnId
     && !priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)
     && isAcceptedCompactionContinuation(parsed, identity, revision);
+}
+
+/** A native `/goal` turn may continue the exact older human instruction bound to its checkpoint. */
+export function isChatGptGoalContinuation(parsed: CodexParsedRequest): boolean {
+  const identity = extractChatGptTurnIdentity(parsed);
+  const revision = latestChatGptTurnUserRevision(parsed, identity.turnId);
+  return revision?.turnId !== undefined && identity.turnId !== undefined
+    && revision.turnId !== identity.turnId
+    && !priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)
+    && authorizeGoalContinuation(parsed, identity, revision);
+}
+
+/**
+ * Resolve the bridge-authorized native goal execution channel without turning its objective into a
+ * human-authored message. The retained human revision remains checkpoint/source authority only.
+ */
+export function extractChatGptNativeGoalExecution(parsed: CodexParsedRequest): ChatGptNativeGoalExecution | undefined {
+  if (parsed._compactionRequest) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const revision = latestChatGptTurnUserRevision(parsed, identity.turnId);
+  if (revision?.turnId === undefined || identity.turnId === undefined
+    || revision.turnId === identity.turnId
+    || priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)) return undefined;
+  const authorized = resolveGoalContinuation(parsed, identity, revision);
+  if (!authorized) return undefined;
+  return {
+    goalId: authorized.continuation.goalId,
+    goalRevision: authorized.continuation.goalRevision,
+    ...(authorized.currentContext ? { objective: authorized.currentContext.objective } : {}),
+  };
 }
 
 /** Parse a claim only: the caller must compare it with this turn's native rollout authority. */

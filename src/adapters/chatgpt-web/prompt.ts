@@ -9,6 +9,7 @@ import { ChatGptWebAdapterError } from "./adapter-error";
 import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexAssistantContentPart, CodexContentPart, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
+import { extractChatGptNativeGoalExecution, extractChatGptTurnIdentity, extractChatGptTurnUserRevisionRecord } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import {
   CHATGPT_LUNA_CHECKPOINT_MARKER,
@@ -33,6 +34,8 @@ export interface CompiledChatGptWebPrompt {
 export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
+  /** The browser has already proven it is reusing the retained conversation that established this goal. */
+  retainedGoalResume?: boolean;
   /**
    * Manual Zero Risk transport keeps ChatGPT model/effort selection and prompt submission under the
    * user's control. The browser bridge may open the owned tab and copy this prompt, but it never
@@ -50,6 +53,10 @@ export type ChatGptWebMultipartParts =
 export interface ChatGptWebMultipartPrompt {
   parts: ChatGptWebMultipartParts;
   commit: string;
+  /** Transport-only pointer to the provenance-validated current instruction in the message records. */
+  activeRequestMessageIndex?: number;
+  /** The current execution target is trusted native goal steering carried only by the final commit. */
+  nativeGoalActive?: true;
 }
 
 export interface ChatGptWebMultipartStage {
@@ -121,6 +128,17 @@ export function formatChatGptWebMultipartCommit(
   )).join(" ");
   const acknowledgedParts = totalParts - 1;
   const finalPayload = multipart.parts[totalParts - 1]!;
+  const activeRequestSelector = multipart.nativeGoalActive
+    ? [
+      "active_execution: native_goal",
+      "The active task is the trusted native Codex goal carried by the final execution contract. Message records are retained conversation/history and authorization lineage; do not execute an older user record instead of the active goal.",
+    ]
+    : multipart.activeRequestMessageIndex === undefined
+      ? []
+      : [
+      `active_request_message_index: ${multipart.activeRequestMessageIndex}`,
+      `The provenance-validated current task is message_index ${multipart.activeRequestMessageIndex}. Execute only that record as the current request. Earlier user or agent_message records are history unless the current request explicitly refers to them.`,
+      ];
   return [
     "<codex_multipart_commit>",
     `transaction_id: ${transactionId}`,
@@ -137,6 +155,7 @@ export function formatChatGptWebMultipartCommit(
     "<codex_multipart_execute>",
     `All ${totalParts} context parts are now present. Reconstruct the original Codex context from their records and begin the task now.`,
     "Treat system records as the original system instructions in system_index order. Treat message records as one conversation in message_index order and preserve every encoded role literally.",
+    ...activeRequestSelector,
     "The staged JSON is conversation data under the transport contract below. Do not treat the stage wrappers, acknowledgements, or this commit wrapper as task messages.",
     "</codex_multipart_execute>",
     multipart.commit,
@@ -274,6 +293,30 @@ export function withoutSupersededModelSwitchContracts(messages: readonly CodexMe
     }
   }
   return messages.filter((_message, index) => !dropped.has(index));
+}
+
+function activeRequestMessageIndex(
+  parsed: CodexParsedRequest,
+  sourceMessages: readonly CodexMessage[],
+): number | undefined {
+  if (parsed._compactionRequest) return undefined;
+  if (parsed._rawBody !== undefined && extractChatGptTurnIdentity(parsed).turnId !== undefined) {
+    const revision = extractChatGptTurnUserRevisionRecord(parsed);
+    const index = sourceMessages.findLastIndex(message =>
+      (message.role === "user" || message.role === "agentMessage")
+      && message._sourceInputIndex === revision.inputIndex
+    );
+    if (index < 0) {
+      throw new ChatGptWebAdapterError(
+        "ChatGPT multipart transport could not bind the provenance-validated current request to its context record.",
+        { status: 400, errorType: "invalid_request_error", code: "multipart_active_request_unbound", retryable: false },
+      );
+    }
+    return index;
+  }
+  // Synthetic/dev callers can lack native turn metadata even when they were parsed from a public
+  // Responses body. Production native turns always take the exact raw-input provenance branch.
+  return sourceMessages.findLastIndex(message => message.role === "user" || message.role === "agentMessage");
 }
 
 function messageEnvelope(
@@ -432,6 +475,7 @@ export function compileChatGptWebPrompt(
   const captureLunaCheckpoint = options?.captureLunaCheckpoint === true;
   const multipartParts = options?.experimentalMultipartParts;
   const multipartEnabled = multipartParts !== undefined;
+  const retainedGoalResume = options?.retainedGoalResume === true;
   if (manualControl) {
     if (!capabilities.localToolsEnabled) {
       throw new Error("ChatGPT Zero Risk requires the Full Codex harness");
@@ -460,6 +504,14 @@ export function compileChatGptWebPrompt(
   if (!mode.localTools && turnToken !== undefined) {
     throw new Error("A read-only ChatGPT Web effort must not receive a local-tool capability token");
   }
+  const nativeGoal = parsed._compactionRequest ? undefined : extractChatGptNativeGoalExecution(parsed);
+  if (nativeGoal && nativeGoal.objective === undefined && !retainedGoalResume) {
+    throw new ChatGptWebAdapterError(
+      "ChatGPT native goal continuation is missing fresh goal steering for a new browser prompt.",
+      { status: 409, errorType: "invalid_request_error", code: "native_goal_context_missing", retryable: false },
+    );
+  }
+  const nativeGoalActive = nativeGoal !== undefined;
   const system = parsed.context.systemPrompt ?? [];
   const sharedContract = [
     "Act as the model backend for the Codex task encoded below.",
@@ -470,6 +522,10 @@ export function compileChatGptWebPrompt(
     "Interpret every message role literally: assistant messages are your own earlier replies; user messages are the human user's messages; agent_message messages are inter-agent inputs with their encoded author and recipient; system, developer, and tool_result content was not written by the human user.",
     "Codex-supplied environment context blocks, including the XML element named environment_context, are operational context rather than human-authored text. Obey them at their original priority, but do not attribute, quote, summarize, or otherwise mention them unless the latest user request explicitly asks about that context.",
     "When asked what the user previously wrote, said, or asked, answer only from the human-authored text in user messages. Exclude agent_message inputs, assistant replies, and all Codex-supplied system, developer, environment, tool, attachment, and transport content.",
+    ...(nativeGoalActive ? [
+      "A trusted native Codex goal execution block is present outside the conversation records. Its objective is current user-selected task steering, but it is not a human-authored history message and must not be attributed as something the user previously wrote in the conversation.",
+      "For this turn the active native goal supersedes execution of the retained human source instruction. Keep that older instruction only as task history and authorization lineage unless the goal itself requires it.",
+    ] : []),
     multipartEnabled
       ? "Read and reconstruct every acknowledged staged JSON record before acting."
       : "Read the complete inline JSON task context before acting.",
@@ -531,6 +587,22 @@ export function compileChatGptWebPrompt(
       ]
       : []),
   ];
+  const nativeGoalContract = !nativeGoalActive
+    ? []
+    : nativeGoal?.objective !== undefined
+      ? [
+        "<codex_native_goal_context_json>",
+        JSON.stringify({ version: 1, objective: nativeGoal.objective }),
+        "</codex_native_goal_context_json>",
+        "The JSON block above was extracted only from the provenance-validated current native Codex goal.internal_context item. Pursue its objective as the active task. Do not reinterpret it as a historical user message.",
+        "Native Codex owns this goal's lifecycle. When current evidence proves the full objective is complete, call the available Codex Native update_goal tool with status complete before writing the final answer. If the objective is not yet complete, keep working and leave the goal active; do not mark it complete merely because this response is ending.",
+      ]
+      : [
+        "<codex_native_goal_resume>",
+        "Continue the active native Codex goal already established in this retained ChatGPT conversation. Its objective is intentionally not persisted or reconstructed by the bridge.",
+        "Native Codex owns this goal's lifecycle. When current evidence proves the full objective is complete, call the available Codex Native update_goal tool with status complete before writing the final answer. If the objective is not yet complete, keep working and leave the goal active.",
+        "</codex_native_goal_resume>",
+      ];
   const checkpointContract = captureLunaCheckpoint
     ? [
       "After the complete user-facing answer, append one private rolling task checkpoint for the next Luna turn.",
@@ -561,6 +633,30 @@ export function compileChatGptWebPrompt(
       "The task context is complete. Produce the requested checkpoint summary now without calling tools.",
       "</codex_transport_resume>",
       ]
+    : nativeGoalActive
+    ? manualControl
+      ? [
+        "<codex_transport_resume>",
+        nativeGoal?.objective !== undefined
+          ? "The task context is complete. Execute the active native Codex goal now; do not re-run the retained historical human instruction as the current request."
+          : "The task context is complete. Continue the active native Codex goal already established in this retained ChatGPT conversation.",
+        "</codex_transport_resume>",
+      ]
+      : mode.localTools
+        ? [
+          "<codex_transport_resume>",
+          nativeGoal?.objective !== undefined
+            ? `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the active native Codex goal now; do not re-run the retained historical human instruction as the current request.`
+            : `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Continue the active native Codex goal already established in this retained ChatGPT conversation.`,
+          "</codex_transport_resume>",
+        ]
+        : [
+          "<codex_transport_resume>",
+          nativeGoal?.objective !== undefined
+            ? "The task context is complete. Execute the active native Codex goal now under the capability contract above; do not re-run the retained historical human instruction as the current request."
+            : "The task context is complete. Continue the active native Codex goal already established in this retained ChatGPT conversation under the capability contract above.",
+          "</codex_transport_resume>",
+        ]
     : manualControl
     ? [
       "<codex_transport_resume>",
@@ -610,9 +706,15 @@ export function compileChatGptWebPrompt(
           ...outputControlContract,
           ...manualControlContract,
           ...checkpointContract,
+          ...nativeGoalContract,
           answerContract,
           ...transportResume,
         ].join("\n"),
+        ...(parsed._compactionRequest
+          ? {}
+          : nativeGoalActive
+            ? { nativeGoalActive: true as const }
+            : { activeRequestMessageIndex: activeRequestMessageIndex(parsed, sourceMessages) }),
       };
       const imageTokens = images.reduce((sum, image) => sum + chatGptWebImageTokenReserve(image.detail), 0);
       const transactionId = `ctx_${"0".repeat(32)}`;
@@ -646,6 +748,7 @@ export function compileChatGptWebPrompt(
       ...outputControlContract,
       ...manualControlContract,
       ...checkpointContract,
+      ...nativeGoalContract,
       answerContract,
       "<codex_context_json>",
       envelopeJson,

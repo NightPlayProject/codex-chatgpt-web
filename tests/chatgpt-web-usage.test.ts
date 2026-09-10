@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { estimateChatGptWebInputTokens, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
+import {
+  CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT,
+  estimateChatGptWebInputTokens,
+  resolveBiggerContextMultipartParts,
+  resolveStandardContextMultipartParts,
+} from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
@@ -42,6 +47,19 @@ test("multipart selection accounts for whole-record and composer fit before subm
     }
   }
 }, 60_000);
+
+test("Standard Context proactively stages only the empirically unstable large inline band", () => {
+  const plus = { ...capabilities, proAvailable: false };
+  const small = request("ordinary context");
+  expect(resolveStandardContextMultipartParts(small, plus)).toBeUndefined();
+
+  const large = request("x".repeat(CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT + 20_000));
+  expect(resolveStandardContextMultipartParts(large, plus)).toBe(2);
+
+  const compaction = structuredClone(large);
+  compaction._compactionRequest = true;
+  expect(resolveStandardContextMultipartParts(compaction, plus)).toBeUndefined();
+});
 
 test("Bigger Context compaction selects three parts before the legacy inline byte budget", () => {
   const parsed = request("x".repeat(160_000));

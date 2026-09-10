@@ -39,6 +39,12 @@ export interface CodexUserMessage {
   role: "user";
   content: string | CodexContentPart[];
   timestamp: number;
+  /** Exact raw Responses input position for transport-only provenance binding. */
+  _sourceInputIndex?: number;
+  /** Native source provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceItemId?: string;
+  /** Native turn provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceTurnId?: string;
 }
 
 /** A readable MultiAgent message delivered between native Codex agents. */
@@ -48,6 +54,12 @@ export interface CodexAgentMessage {
   recipient?: string;
   content: string | CodexContentPart[];
   timestamp: number;
+  /** Exact raw Responses input position for transport-only provenance binding. */
+  _sourceInputIndex?: number;
+  /** Native source provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceItemId?: string;
+  /** Native turn provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceTurnId?: string;
 }
 
 export interface CodexAssistantMessage {

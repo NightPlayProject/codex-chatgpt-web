@@ -245,7 +245,7 @@ describe("Zero Risk turn broker lifecycle", () => {
         token: requestId,
         finalAnswer: "remote final",
       });
-      await expect(completed).resolves.toBe("remote final");
+      expect(await completed).toBe("remote final");
       await remote.revoke(requestId);
     } finally {
       await broker.close();

@@ -10,11 +10,13 @@ import type {
   CodexThinkingContent,
   CodexTool,
   CodexToolCall,
+  CodexUserMessage,
 } from "../types";
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import {
   compactionItemToText,
+  isNativeGoalContextItem,
   isOnePixelPngDataUrl,
   isReadableCompactionSummaryText,
 } from "./compaction";
@@ -341,8 +343,46 @@ function findToolById(messages: CodexMessage[], callId: string): { name: string;
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
+function nativeMessageSource(
+  value: unknown,
+  inputIndex: number,
+): { _sourceInputIndex: number; _sourceItemId?: string; _sourceTurnId?: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { _sourceInputIndex: inputIndex };
+  const item = value as Record<string, unknown>;
+  const metadata = item.internal_chat_message_metadata_passthrough;
+  const turnId = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as { turn_id?: unknown }).turn_id
+    : undefined;
+  return {
+    _sourceInputIndex: inputIndex,
+    ...(typeof item.id === "string" && item.id.length > 0 ? { _sourceItemId: item.id } : {}),
+    ...(typeof turnId === "string" && turnId.length > 0 ? { _sourceTurnId: turnId } : {}),
+  };
+}
+
+function attachNativeMessageSource<T extends CodexUserMessage | CodexAgentMessage>(
+  message: T,
+  value: unknown,
+  inputIndex: number,
+): T {
+  const source = nativeMessageSource(value, inputIndex);
+  for (const [key, fieldValue] of Object.entries(source)) {
+    Object.defineProperty(message, key, {
+      value: fieldValue,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return message;
+}
+
 export function parseRequest(body: unknown): CodexParsedRequest {
   const replayedInputPrefixLength = previousResponseReplayPrefixLength(body);
+  // Zod deliberately normalizes public Responses items and strips unknown passthrough fields from
+  // ordinary user messages. Native provenance metadata lives on the untouched wire item, so keep a
+  // positional view of the raw input for authoritative classifications such as goal.internal_context.
+  const rawInput = isObj(body) && Array.isArray(body.input) ? body.input : undefined;
   const parsed = responsesRequestSchema.safeParse(body);
   if (!parsed.success) {
     throw new Error(`responses parse error: ${parsed.error.message}`);
@@ -441,13 +481,13 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // An agent_message is external input delivered to the parent agent. Keep its distinct
         // role and routing metadata so Web history remains semantically equivalent to Responses.
         pendingReasoning.length = 0;
-        const message: CodexAgentMessage = {
+        const message = attachNativeMessageSource<CodexAgentMessage>({
           role: "agentMessage",
           ...(typeof agentMessage.author === "string" ? { author: agentMessage.author } : {}),
           ...(typeof agentMessage.recipient === "string" ? { recipient: agentMessage.recipient } : {}),
           content,
           timestamp: now,
-        };
+        }, rawInput?.[itemIndex] ?? item, itemIndex);
         messages.push(message);
 
         continue;
@@ -463,11 +503,28 @@ export function parseRequest(body: unknown): CodexParsedRequest {
             if (flat.length > 0) systemPrompt.push(flat);
             break;
           }
-          case "user":
+          case "user": {
+            // `/goal` is emitted by native Codex as a user-role runtime item. Keep its exact wire
+            // metadata in `_rawBody` for lineage validation, but never serialize its body into the
+            // ChatGPT task envelope as if a human had written it. Mixed/unknown native kinds remain
+            // ordinary user input and therefore fail closed instead of being dropped by text shape.
+            if (isNativeGoalContextItem(rawInput?.[itemIndex] ?? item)) {
+              pendingReasoning.length = 0;
+              break;
+            }
+            pendingReasoning.length = 0;
+            const content = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
+            messages.push(attachNativeMessageSource<CodexUserMessage>({
+              role: "user",
+              content,
+              timestamp: now,
+            }, rawInput?.[itemIndex] ?? item, itemIndex));
+            break;
+          }
           case "developer": {
             pendingReasoning.length = 0;
             const content = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
-            messages.push({ role: msg.role, content, timestamp: now });
+            messages.push({ role: "developer", content, timestamp: now });
             break;
           }
           case "assistant": {

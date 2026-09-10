@@ -427,7 +427,10 @@ test("launcher page acquisition proves a nonzero operational viewport before DOM
 
 test("an already-submitted launcher turn gets extra viewport recovery time without weakening fresh acquisition", () => {
   expect(CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS).toBe(30_000);
-  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const workerSource = readFileSync(
+    new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
   const fresh = workerSource.indexOf("await waitForOperationalChatGptViewport(connection.page, abortSignal);");
   const rebind = workerSource.indexOf("await waitForOperationalChatGptViewport(\n                  rebound.page,");
   const recoveryBudget = workerSource.indexOf("CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS", rebind);

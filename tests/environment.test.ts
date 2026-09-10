@@ -3,7 +3,12 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { chatGptTurnUserRevisionHistory, extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import {
+  chatGptEnvironmentContextCarriesFilesystemAuthority,
+  chatGptTurnUserRevisionHistory,
+  extractChatGptTurnEnvironment,
+  extractChatGptTurnIdentity,
+} from "../src/adapters/chatgpt-web/environment";
 import {
   bindCompactionContinuationStore,
   ChatGptCompactionContinuationStore,
@@ -605,6 +610,41 @@ describe("permission_profile sandbox detection (Codex CLI 0.146+)", () => {
 });
 
 describe("trusted Codex task environment continuity", () => {
+  test("operational-only environment deltas reuse same-thread authority without weakening filesystem checks", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    const first = currentWire();
+    expect(store.resolve(first).cwd).toBe(root);
+
+    const operationalOnly = currentWire({
+      environmentXml: "<environment_context><local_time>2026-09-10T12:49-05:00</local_time><timezone>America/Chicago</timezone></environment_context>",
+    });
+    const metadata = JSON.parse(
+      (operationalOnly._rawBody as { client_metadata: Record<string, string> })
+        .client_metadata["x-codex-turn-metadata"]!,
+    );
+    metadata.turn_id = "turn_operational_delta";
+    (operationalOnly._rawBody as { client_metadata: Record<string, string> })
+      .client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+
+    expect(chatGptEnvironmentContextCarriesFilesystemAuthority(
+      (operationalOnly._rawBody as { input: Array<{ content: Array<{ text: string }> }> }).input[0]!.content[1]!.text,
+    )).toBeFalse();
+    expect(store.resolve(operationalOnly).cwd).toBe(root);
+
+    const firstTurnOperationalOnly = structuredClone(operationalOnly);
+    (firstTurnOperationalOnly._rawBody as { client_metadata: Record<string, string> })
+      .client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, thread_id: "thread_without_authority" });
+    expect(() => new ChatGptThreadEnvironmentStore().resolve(firstTurnOperationalOnly)).toThrow("missing cwd");
+
+    const malformedFilesystemUpdate = currentWire({
+      environmentXml: "<environment_context><cwd/></environment_context>",
+    });
+    expect(chatGptEnvironmentContextCarriesFilesystemAuthority(
+      (malformedFilesystemUpdate._rawBody as { input: Array<{ content: Array<{ text: string }> }> }).input[0]!.content[1]!.text,
+    )).toBeTrue();
+    expect(() => store.resolve(malformedFilesystemUpdate)).toThrow("missing cwd");
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);
@@ -1001,13 +1041,25 @@ describe("trusted Codex task environment continuity", () => {
     bindCompactionContinuationStore(request, compactionStore);
     bindGoalContinuationStore(request, new ChatGptGoalContinuationStore());
 
-    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+    const goalEnvironmentStore = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(goalEnvironmentStore.resolve(request)).toEqual({
       cwd: root,
       roots: [root],
       writableRoots: [root],
       sandboxPolicy: { type: "dangerFullAccess" },
       tools: [],
     });
+
+    const currentEnvironmentPart = body.input[0]!.content as Array<{ type: string; text: string }>;
+    currentEnvironmentPart[1]!.text = "<environment_context><local_time>2026-09-10T12:49-05:00</local_time></environment_context>";
+    expect(goalEnvironmentStore.resolve(request)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+    currentEnvironmentPart[1]!.text = environmentXml;
 
     const unproven = structuredClone(request);
     bindCompactionContinuationStore(unproven, compactionStore);

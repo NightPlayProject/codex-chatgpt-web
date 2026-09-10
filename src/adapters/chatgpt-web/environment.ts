@@ -123,6 +123,37 @@ export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boo
   });
 }
 
+/**
+ * Some native Codex turns send an operational environment delta (for example time/locale state)
+ * without repeating filesystem authority. Only syntax that could change local execution authority
+ * should block reuse of an already-authenticated same-thread environment. Malformed filesystem
+ * tags still count as authority-bearing so they continue to fail closed instead of falling back.
+ */
+export function chatGptEnvironmentContextCarriesFilesystemAuthority(text: string): boolean {
+  if (!/<\/?environment_context\b/i.test(text)) return false;
+  const openings = [...text.matchAll(/<environment_context>/gi)];
+  const closings = [...text.matchAll(/<\/environment_context>/gi)];
+  const blocks = [...text.matchAll(/<environment_context>([\s\S]*?)<\/environment_context>/gi)];
+  // Any malformed/ambiguous environment envelope remains authority-bearing so cached state can
+  // never hide it. Grouped native user messages may contain unrelated app/plugin preamble outside
+  // the environment block, so classify only the exact balanced environment payload itself.
+  if (openings.length === 0 || openings.length !== closings.length || blocks.length !== openings.length) return true;
+  return blocks.some(match => match[1]!
+    .replace(/<(current_date|current_time|local_time|timezone|locale)>[^<]*<\/\1>/gi, "")
+    .trim().length > 0);
+}
+
+/** True when any raw environment envelope attempts to carry filesystem/sandbox authority. */
+export function hasRawChatGptFilesystemEnvironmentContext(parsed: CodexParsedRequest): boolean {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  return input.some(value => {
+    const item = record(value);
+    return item?.type === "message"
+      && chatGptEnvironmentContextCarriesFilesystemAuthority(rawMessageText(item));
+  });
+}
+
 /** Historical XML is not a current environment update, including in old untagged rollouts. */
 export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
@@ -138,6 +169,31 @@ export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest):
       laterAssistantOutput = true;
     }
     if (item.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+    const owner = itemTurnId(item);
+    if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
+  }
+  return false;
+}
+
+/**
+ * Current-turn counterpart to hasRawChatGptFilesystemEnvironmentContext. Operational-only native
+ * deltas are intentionally not filesystem updates and therefore may reuse established authority.
+ */
+export function hasCurrentChatGptFilesystemEnvironmentContext(parsed: CodexParsedRequest): boolean {
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!turnId) return hasRawChatGptFilesystemEnvironmentContext(parsed);
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  let laterAssistantOutput = false;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = record(input[index]);
+    if (!item) continue;
+    if ((item.type === "message" && item.role === "assistant")
+      || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
+      laterAssistantOutput = true;
+    }
+    if (item.type !== "message"
+      || !chatGptEnvironmentContextCarriesFilesystemAuthority(rawMessageText(item))) continue;
     const owner = itemTurnId(item);
     if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
   }

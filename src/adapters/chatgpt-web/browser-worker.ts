@@ -1097,13 +1097,24 @@ export async function connectAfterClosingBrowserConnection<T>(
 }
 
 export const CHATGPT_MIN_OPERATIONAL_VIEWPORT = Object.freeze({ width: 320, height: 240 });
+/**
+ * A live launcher turn can briefly expose a 0x0 renderer while Electron reapplies hidden-view
+ * emulation after a CDP observation stall. Fresh turn acquisition should stay strict, but rebinding
+ * an already-submitted turn gets longer to recover because resending is forbidden and MCP activity
+ * can continue while the renderer viewport is being restored.
+ */
+export const CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS = 30_000;
 
-async function waitForOperationalChatGptViewport(page: Page, signal?: AbortSignal): Promise<void> {
+async function waitForOperationalChatGptViewport(
+  page: Page,
+  signal?: AbortSignal,
+  timeoutMs = 10_000,
+): Promise<void> {
   try {
     await withBrowserTurnAbort(page.waitForFunction(
       ({ width, height }) => innerWidth >= width && innerHeight >= height,
       CHATGPT_MIN_OPERATIONAL_VIEWPORT,
-      { polling: 50, timeout: 10_000 },
+      { polling: 50, timeout: timeoutMs },
     ), signal);
   } catch (error) {
     if (signal?.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
@@ -3423,6 +3434,7 @@ export class ChatGptBrowserWorker {
         throw new Error("ChatGPT Bigger Context transaction timed out while awaiting a stage acknowledgement");
       }
       await throwIfChatGptSessionFailureAlert(page);
+      await throwIfChatGptRateLimitDialog(page);
       await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
       let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
       if (!snapshot.responsePresent && await responseTurn.locator.count() !== 1) {
@@ -4435,7 +4447,11 @@ export class ChatGptBrowserWorker {
                 // the outer diagnostic capture and finally block to release this exact transport.
                 turnConnection = rebound.browser;
                 diagnosticPage = rebound.page;
-                await waitForOperationalChatGptViewport(rebound.page, signal);
+                await waitForOperationalChatGptViewport(
+                  rebound.page,
+                  signal,
+                  CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS,
+                );
                 return rebound;
               },
             );
@@ -4792,6 +4808,7 @@ export class ChatGptBrowserWorker {
           throw new Error("ChatGPT web turn timed out");
         }
         await throwIfChatGptSessionFailureAlert(page);
+        await throwIfChatGptRateLimitDialog(page);
         await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
 
         if (mode.localTools && await resolveChatGptToolConfirmation(

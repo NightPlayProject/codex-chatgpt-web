@@ -10,8 +10,8 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
-  hasCurrentChatGptEnvironmentContext,
-  hasRawChatGptEnvironmentContext,
+  hasCurrentChatGptFilesystemEnvironmentContext,
+  hasRawChatGptFilesystemEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
   isChatGptGoalContinuation,
@@ -155,14 +155,14 @@ export class ChatGptThreadEnvironmentStore {
       return environment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
-      const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
+      const hasCurrentFilesystemContext = hasCurrentChatGptFilesystemEnvironmentContext(parsed);
       const lineage = extractChatGptThreadSpawnLineage(parsed);
-      const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
-      const currentGoal = hasCurrentContext && isChatGptGoalContinuation(parsed);
+      const currentCompaction = hasCurrentFilesystemContext && isChatGptCompactionContinuation(parsed);
+      const currentGoal = hasCurrentFilesystemContext && isChatGptGoalContinuation(parsed);
       const currentContinuation = currentCompaction || currentGoal;
-      const historicalMessages = hasCurrentContext && !currentContinuation && lineage
+      const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentContext && !currentContinuation && !historicalMessages) throw error;
+      if (hasCurrentFilesystemContext && !currentContinuation && !historicalMessages) throw error;
       const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -189,7 +189,7 @@ export class ChatGptThreadEnvironmentStore {
       }
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
+      if (hasRawChatGptFilesystemEnvironmentContext(parsed)) throw error;
       const sameThread = this.get(identity.threadId);
       if (sameThread) return {
         cwd: sameThread.cwd,

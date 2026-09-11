@@ -2877,12 +2877,15 @@ test("browser preflight separates model context from one-message transport limit
     "50,000-token context window",
   );
   expect(() => assertChatGptWebInputWithinLimits(99_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(99_999, 81_807, "gpt-5.6-sol", "high", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(71_999, 71_999, "gpt-5.6-sol", "high", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(72_000, 72_000, "gpt-5.6-sol", "high", plus)).toThrow(
+    "measured unreliable ChatGPT generation band",
+  );
   expect(() => assertChatGptWebInputWithinLimits(99_999, 81_808, "gpt-5.6-sol", "high", plus)).toThrow(
     "81,807-token ChatGPT browser message boundary",
   );
   expect(() => assertChatGptWebInputWithinLimits(100_000, 81_807, "gpt-5.6-sol", "high", plus)).toThrow(
-    "100,000-token context window",
+    "measured unreliable ChatGPT generation band",
   );
   expect(() => assertChatGptWebInputWithinLimits(119_999, 103_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(119_999, 103_001, "gpt-5.6-sol", "xhigh", pro)).toThrow(
@@ -3019,9 +3022,30 @@ test("Bigger Context fits mixed-density whole records within both token and comp
       CHATGPT_WEB_MODEL_ID, "high", capabilities,
       Math.max(maxStageChars, final.length), 3,
       { stagingEffort: stagingMode.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens, finalMessageChars: final.length },
+      true,
     )).not.toThrow();
   }
 }, 40_000);
+
+test("Standard Context Plus High preflights the observed terminal-error band without limiting Bigger Context", () => {
+  const standard = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    proAvailable: false,
+    experimentalBiggerContext: false,
+  };
+  const bigger = { ...standard, experimentalBiggerContext: true };
+
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    71_999, 30_000, CHATGPT_WEB_MODEL_ID, "high", standard, 120_000, 2,
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    72_000, 30_000, CHATGPT_WEB_MODEL_ID, "high", standard, 120_000, 2,
+  )).toThrow("measured unreliable ChatGPT generation band");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    72_000, 30_000, CHATGPT_WEB_MODEL_ID, "high", bigger, 120_000, 2, undefined, true,
+  )).not.toThrow();
+});
 
 test("Bigger Context preflight expands only the total context ceiling and keeps each message boundary", () => {
   const plus = {
@@ -3044,6 +3068,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     pro,
     900_000,
     3,
+    undefined,
+    true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     360_000,
@@ -3053,6 +3079,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     pro,
     900_000,
     3,
+    undefined,
+    true,
   )).toThrow("three-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     239_999,
@@ -3062,6 +3090,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     pro,
     900_000,
     2,
+    undefined,
+    true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     240_000,
@@ -3071,6 +3101,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     pro,
     900_000,
     2,
+    undefined,
+    true,
   )).toThrow("two-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     299_999,
@@ -3080,6 +3112,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     plus,
     900_000,
     3,
+    undefined,
+    true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     300_000,
@@ -3089,6 +3123,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     plus,
     900_000,
     3,
+    undefined,
+    true,
   )).toThrow("300,000-token three-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     199_999,
@@ -3098,6 +3134,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     plus,
     900_000,
     2,
+    undefined,
+    true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     200_000,
@@ -3107,6 +3145,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     plus,
     900_000,
     2,
+    undefined,
+    true,
   )).toThrow("200,000-token two-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     280_000,
@@ -3116,6 +3156,8 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     pro,
     900_000,
     3,
+    undefined,
+    true,
   )).toThrow("ChatGPT message boundary");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     20_000,
@@ -3129,8 +3171,18 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
 });
 
 test("Bigger Context stages use the lowest account mode that can carry the stage", () => {
-  const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
-  const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+  const plus = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    proAvailable: false,
+    experimentalBiggerContext: true,
+  };
+  const pro = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    proAvailable: true,
+    experimentalBiggerContext: true,
+  };
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 200_000).effort).toBe("low");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 300_000).effort).toBe("medium");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 80_000, 300_000).effort).toBe("medium");
@@ -3138,11 +3190,14 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
   // 80k is the early compaction trigger; the remaining input budget includes an 8192-token reserve.
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 80_169, 276_680).effort).toBe("medium");
   for (const tokens of [81_807, 81_808]) {
-    const inline = () => assertChatGptWebInputWithinLimits(tokens + 8_192, tokens, "gpt-5.6-sol", "high", plus, 300_000);
+    const inline = () => assertChatGptWebInputWithinLimits(
+      tokens + 8_192, tokens, "gpt-5.6-sol", "high", plus, 300_000, true,
+    );
     const stage = () => resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, tokens, 300_000);
     const final = () => assertChatGptWebMultipartInputWithinLimits(
       tokens + 10_000, tokens, "gpt-5.6-sol", "high", plus, 300_000, 3,
       { stagingEffort: "medium", maxStageMessageTokens: 500, maxStageChars: 2_000, finalMessageTokens: tokens, finalMessageChars: 300_000 },
+      true,
     );
     for (const preflight of [inline, stage, final]) {
       if (tokens === 81_807) expect(preflight).not.toThrow();

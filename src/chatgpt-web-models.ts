@@ -36,6 +36,21 @@ export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = 41_000 * 3;
 export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = 32_000 * 3;
 export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 100_000;
 export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 80_000;
+/**
+ * Live Plus High goal continuations remained healthy through ~70.7k estimated browser input, then
+ * ChatGPT reproducibly accepted the final multipart commit and returned its terminal response-error
+ * UI at ~74.6k. Compact High before that unstable band while leaving Medium's previously published
+ * 80k trigger and the 100k canonical window unchanged. This is an execution-reliability threshold,
+ * not a smaller model context window.
+ */
+export const CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT = 70_000;
+/**
+ * Last-resort browser preflight for an already-open/stale Plus High session. Native Codex should
+ * normally compact at the lower 70k threshold above; this ceiling keeps an old session from
+ * repeatedly submitting the observed ~74.6k terminal-error payload before refreshed catalog
+ * metadata can take effect. The last observed successful multipart continuation was ~70.7k.
+ */
+export const CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT = 72_000;
 /** Preserve the previously validated Plus reasoning visible-message envelope. */
 export const CHATGPT_WEB_MEDIUM_HIGH_MESSAGE_TOKEN_LIMIT = 81_807;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
@@ -154,7 +169,9 @@ export function resolveChatGptWebContextLimits(
   } else if (effort === "medium" || effort === "high") {
     limits = contextLimits(
       CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW,
-      CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT,
+      effort === "high"
+        ? CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT
+        : CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT,
     );
   } else {
     throw new Error(`ChatGPT Plus context limit is not defined for unavailable effort: ${effort}`);

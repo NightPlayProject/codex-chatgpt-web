@@ -145,6 +145,7 @@ test("multipart planning leaves room for final attachments and execution instruc
       estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId), Math.max(...tokens),
       parsed.modelId, "high", caps, Math.max(...chars), 3,
       { stagingEffort: stage.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens: tokens[2]!, finalMessageChars: chars[2]!, finalImageTokens: estimateChatGptWebImageTokens(compiled) },
+      true,
     )).not.toThrow();
   }
 }, 30_000);

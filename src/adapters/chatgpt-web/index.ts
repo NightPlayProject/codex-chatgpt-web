@@ -711,6 +711,7 @@ export function createChatGptWebAdapter(
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         capabilities: turnCapabilities,
+        ...(experimentalBiggerContext ? { experimentalBiggerContext: true } : {}),
         prepare: async () => ({
           ...compileChatGptWebPrompt(
             checkpointInput.parsed,
@@ -781,6 +782,7 @@ export function createChatGptWebAdapter(
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
       capabilities: turnCapabilities,
+      ...(experimentalBiggerContext ? { experimentalBiggerContext: true } : {}),
       prepare: () => prepareWith(checkpointInput.parsed),
       ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput, true) } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),

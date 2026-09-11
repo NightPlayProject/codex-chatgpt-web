@@ -176,7 +176,7 @@ describe("native /models augmentation", () => {
     }))).toEqual([
       { contextWindow: 50_000, effectiveContextWindowPercent: 64, autoCompactTokenLimit: 32_000 },
       { contextWindow: 100_000, effectiveContextWindowPercent: 80, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 100_000, effectiveContextWindowPercent: 80, autoCompactTokenLimit: 80_000 },
+      { contextWindow: 100_000, effectiveContextWindowPercent: 70, autoCompactTokenLimit: 70_000 },
     ]);
   });
 

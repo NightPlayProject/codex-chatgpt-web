@@ -69,6 +69,7 @@ import {
   notifyLauncherTurn,
 } from "../../launcher-browser-host";
 import {
+  CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
   resolveChatGptWebTransportLimits,
@@ -829,6 +830,7 @@ export function assertChatGptWebInputWithinLimits(
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
   promptChars?: number,
+  experimentalBiggerContext = false,
 ): void {
   if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error(`ChatGPT web context limit is not defined for model: ${modelId}`);
@@ -864,6 +866,12 @@ export function assertChatGptWebInputWithinLimits(
       { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
     );
   }
+  assertChatGptWebPlusHighReliableInput(
+    estimatedInputTokens,
+    effort,
+    capabilities,
+    experimentalBiggerContext,
+  );
   if (estimatedInputTokens < contextWindow) return;
   throw new ChatGptWebAdapterError(
     `This task is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds the ${contextWindow.toLocaleString("en-US")}-token context window for this ChatGPT Web model. Switch to a model with a larger context window, run /compact, then retry this Web model.`,
@@ -887,6 +895,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
     finalMessageChars: number;
     finalImageTokens?: number;
   },
+  experimentalBiggerContext = false,
 ): void {
   if (modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new ChatGptWebAdapterError(
@@ -951,11 +960,35 @@ export function assertChatGptWebMultipartInputWithinLimits(
   } else {
     assertMessageBoundary("stage", estimatedMessageTokens, maxMessageChars, effort);
   }
+  assertChatGptWebPlusHighReliableInput(
+    estimatedInputTokens,
+    effort,
+    capabilities,
+    experimentalBiggerContext,
+  );
   const experimentalContextWindow = baseContextWindow * partCount;
   if (estimatedInputTokens < experimentalContextWindow) return;
   const partLabel = partCount === 2 ? "two-part" : "three-part";
   throw new ChatGptWebAdapterError(
     `This Bigger Context transaction is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds its experimental ${experimentalContextWindow.toLocaleString("en-US")}-token ${partLabel} ceiling. Run /compact, then retry.`,
+    { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
+  );
+}
+
+function assertChatGptWebPlusHighReliableInput(
+  estimatedInputTokens: number,
+  effort: ChatGptWebModelMode["effort"],
+  capabilities: ChatGptWebCapabilities,
+  experimentalBiggerContext: boolean,
+): void {
+  if (
+    capabilities.proAvailable
+    || experimentalBiggerContext
+    || effort !== "high"
+    || estimatedInputTokens < CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT
+  ) return;
+  throw new ChatGptWebAdapterError(
+    `This Standard Context Plus High turn is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which has entered the measured unreliable ChatGPT generation band. Native Codex should compact High before this point; run /compact once if this is an already-open session, then retry the goal.`,
     { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
   );
 }
@@ -1152,6 +1185,8 @@ export interface BrowserTurn {
   modelId: string;
   reasoning?: string;
   capabilities: ChatGptWebCapabilities;
+  /** Explicit user opt-in to the larger multipart transaction budget. */
+  experimentalBiggerContext?: boolean;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   /** Select the Codex Native connector without advertising the ordinary turn tool environment. */
@@ -4362,6 +4397,7 @@ export class ChatGptBrowserWorker {
             finalMessageChars: multipartFinalPrompt.length,
             finalImageTokens: estimateChatGptWebImageTokens(prepared),
           } : undefined,
+          turn.experimentalBiggerContext === true,
         );
       } else {
         assertChatGptWebInputWithinLimits(
@@ -4371,6 +4407,7 @@ export class ChatGptBrowserWorker {
           requestedMode.effort,
           browserCapabilities,
           maxMessageChars,
+          turn.experimentalBiggerContext === true,
         );
       }
       const deadline = this.config.turnTimeoutMs === undefined

@@ -21,6 +21,24 @@ export interface DoctorCheck {
   status: CheckStatus;
   message: string;
   detail?: string;
+  nextStep?: string;
+}
+
+/** Advice only: an unreachable process is not evidence that it is safe to replace. */
+export function withRecoveryGuidance(check: DoctorCheck): DoctorCheck {
+  if (check.status === "ok" || check.nextStep) return check;
+  const guidance: Record<string, string> = {
+    config: "Review the configuration error, then rerun setup using your existing profile.",
+    proxy: "Check runtime activity and ownership in the launcher. If a task is active, let it finish or cancel it before restarting through the launcher; rerun doctor afterward.",
+    "browser-host": "Open the launcher for this profile and inspect its browser status. Finish or cancel active tasks before restarting it.",
+    codex: "Rerun setup for this profile, then restart Codex to reload its model route.",
+    "tunnel-binary": "Rerun MCP setup for this profile to restore the pinned tunnel runtime.",
+    "tunnel-key": "Rerun MCP setup for this profile to restore private tunnel credentials.",
+    "tunnel-runtime": "Inspect tunnel activity in the launcher. Let active tasks finish or cancel them before recovery, then rerun doctor to verify readiness.",
+    connector: "Once the tunnel is ready, verify the named connector in ChatGPT settings and perform a tool call to confirm the complete connection.",
+  };
+  const nextStep = guidance[check.id];
+  return nextStep ? { ...check, nextStep } : check;
 }
 
 export interface DoctorReport {
@@ -105,7 +123,7 @@ export async function runDoctor(): Promise<DoctorReport> {
     checks.push({ id: "config", status: "ok", message: `Configuration is valid (${getConfigPath()})` });
   } catch (error) {
     checks.push({ id: "config", status: "error", message: "Configuration is invalid", detail: error instanceof Error ? error.message : String(error) });
-    return { ok: false, checks };
+    return { ok: false, checks: checks.map(withRecoveryGuidance) };
   }
 
   if (config.browserHost === "launcher") {
@@ -222,7 +240,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   return {
     ok: !checks.some(check => check.status === "error"),
     mode: config.mode,
-    checks,
+    checks: checks.map(withRecoveryGuidance),
   };
 }
 
@@ -231,6 +249,7 @@ export function formatDoctorReport(report: DoctorReport): string {
   const lines = report.checks.flatMap(check => [
     `${icon[check.status]} ${check.message}`,
     ...(check.detail ? [`  ${check.detail}`] : []),
+    ...(check.nextStep ? [`  Next: ${check.nextStep}`] : []),
   ]);
   lines.push(report.ok ? "Doctor result: ready" : "Doctor result: not ready");
   return `${lines.join("\n")}\n`;

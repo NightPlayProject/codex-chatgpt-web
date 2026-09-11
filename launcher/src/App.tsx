@@ -1692,6 +1692,21 @@ function SettingsSurface({
               .catch((cause) => setError(messageOf(cause)))}
           />
         </SettingRow>
+        <SettingRow body={copy.saveChatsBody} label={copy.saveChats}>
+          <Switch checked={snapshot.state.saveChats}
+            onChange={checked => void api!.setPreference("saveChats", checked)
+              .then(updateState).catch(cause => setError(messageOf(cause)))} />
+        </SettingRow>
+        {snapshot.state.savedChats?.length > 0 && (
+          <SettingRow body={copy.savedChatsBody} label={copy.savedChats}>
+            <div>{snapshot.state.savedChats.slice(0, 10).map(chat => (
+              <p key={chat.url}><a href={chat.url} onClick={event => {
+                event.preventDefault();
+                void api!.openExternal(chat.url).catch(cause => setError(messageOf(cause)));
+              }}>{chat.title || "ChatGPT"}</a></p>
+            ))}</div>
+          </SettingRow>
+        )}
         <SettingRow body={copy.showDuringTurnsBody} label={copy.showDuringTurns}>
           <Switch
             checked={snapshot.state.showBrowserDuringTurns}
@@ -2147,7 +2162,7 @@ function DoctorSummary({ copy, language, report }: { copy: Copy; language: Langu
             <StateDot state={check.status === "ok" ? "ready" : check.status === "warning" ? "busy" : "error"} />
             <span>{check.status === "ok"
               ? localizeRuntimeMessage(copy, check.message, check.id, language)
-              : check.message}</span>
+              : check.message}{check.nextStep && <><br /><small>{check.nextStep}</small></>}</span>
           </p>
         ))}
       </div>

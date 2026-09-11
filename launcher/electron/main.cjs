@@ -820,7 +820,7 @@ function registerIpc({ logger, stateStore }) {
     return { state, credentialsRequired: false, targetMode: mode };
   });
   handle("launcher:set-preference", (_event, key, value) => {
-    const ordinary = key === "keepRunningOnClose" || key === "showBrowserDuringTurns";
+    const ordinary = key === "keepRunningOnClose" || key === "showBrowserDuringTurns" || key === "saveChats";
     if (!ordinary) throw new Error("Unknown preference");
     return stateStore.update({ [key]: value === true });
   });
@@ -1017,6 +1017,15 @@ async function start() {
     profile: LAUNCHER_PROFILE.kind,
     publishState: (state) => send("launcher:browser-state", state),
     showWindow: showMainWindow,
+    getSaveChats: () => stateStore.read().saveChats === true,
+    getSavedChats: () => stateStore.read().savedChats,
+    rememberChat: tab => {
+      const current = stateStore.read();
+      const savedChats = require("./saved-chats.cjs").rememberSavedChat(current.savedChats, tab);
+      if (savedChats !== current.savedChats) {
+        send("launcher:state-changed", stateStore.update({ savedChats }));
+      }
+    },
     getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
   });
   await browserHost.ready();

@@ -54,6 +54,8 @@ export interface ChatGptTurnUserRevisionRecord extends ChatGptTurnUserRevision {
 export interface ChatGptNativeGoalExecution {
   goalId: string;
   goalRevision: string;
+  /** Hash-only lineage checkpoint. This is continuation proof, never task text. */
+  checkpointId: string;
   /** Present when this request carries the exact current-turn native goal wrapper. */
   objective?: string;
 }
@@ -413,6 +415,7 @@ export function extractChatGptNativeGoalExecution(parsed: CodexParsedRequest): C
   return {
     goalId: authorized.continuation.goalId,
     goalRevision: authorized.continuation.goalRevision,
+    checkpointId: authorized.continuation.checkpointId,
     ...(authorized.currentContext ? { objective: authorized.currentContext.objective } : {}),
   };
 }

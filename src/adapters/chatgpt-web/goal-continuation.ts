@@ -418,6 +418,11 @@ function storeFor(parsed: CodexParsedRequest): ChatGptGoalContinuationStore {
   return requestStores.get(parsed) ?? defaultStore;
 }
 
+/** Derived transport requests must keep the same server-owned continuation authority. */
+export function inheritGoalContinuationStore(source: CodexParsedRequest, target: CodexParsedRequest): void {
+  bindGoalContinuationStore(target, storeFor(source));
+}
+
 export function authorizeGoalContinuation(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,

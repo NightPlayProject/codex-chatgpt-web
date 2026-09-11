@@ -363,6 +363,7 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      resumeAnswerDigest?: string;
     }
   | {
       phase: "heartbeat";
@@ -378,10 +379,11 @@ export type LauncherTurnActivity =
       status: "completed" | "failed" | "aborted";
       message?: string;
       retain?: boolean;
+      answerDigest?: string;
       connectorBound?: boolean;
     };
 
-export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;
+export const LAUNCHER_TURN_START_TIMEOUT_MS = 60_000;
 export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
@@ -621,6 +623,7 @@ export async function notifyLauncherTurn(
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
+  saveChat?: boolean;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
@@ -665,6 +668,7 @@ export async function notifyLauncherTurn(
         surfaceId: body.surfaceId,
         reused: body.reused,
         connectorBound: body.connectorBound,
+        saveChat: body.saveChat === true,
       };
     }
     if (activity.phase === "end") {

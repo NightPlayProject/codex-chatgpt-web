@@ -287,6 +287,7 @@ class BrowserControlServer {
           body.conversationKey,
           body.connectorIdentity,
           body.requireRetainedConversation === true,
+          body.resumeAnswerDigest,
         );
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
@@ -306,6 +307,7 @@ class BrowserControlServer {
           body.message,
           body.retain === true,
           body.connectorBound === true,
+          body.answerDigest,
         );
         this.logger.info("browser.turn_ended", { traceId: body.traceId, status: body.status });
         writeJson(response, 200, { ok: true, ...release });

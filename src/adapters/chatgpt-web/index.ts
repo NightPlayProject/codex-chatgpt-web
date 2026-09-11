@@ -802,7 +802,11 @@ export function createChatGptWebAdapter(
       capabilities: turnCapabilities,
       ...(experimentalBiggerContext ? { experimentalBiggerContext: true } : {}),
       prepare: () => prepareWith(checkpointInput.parsed),
-      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput, true) } : {}),
+      ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput, true), retainedGoalResume: true } : {}),
+      ...(resumeInput ? { resumeAnswerDigest: createHash("sha256").update(
+        parsed.context.messages.findLast(message => message.role === "assistant")?.content
+          .filter(part => part.type === "text").map(part => part.text).join("") ?? "",
+      ).digest("hex") } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
       abortSignal: browserAbort.signal,
       ...(parsed._compactionRequest ? { compaction: true } : {}),

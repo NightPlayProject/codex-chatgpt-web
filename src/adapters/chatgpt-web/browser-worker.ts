@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
@@ -1189,9 +1189,12 @@ export interface BrowserTurn {
   experimentalBiggerContext?: boolean;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
+  /** Retained native goal resumes need a stricter preflight before browser submission. */
+  retainedGoalResume?: boolean;
   /** Select the Codex Native connector without advertising the ordinary turn tool environment. */
   nativeConnector?: boolean;
   retainConversation?: boolean;
+  resumeAnswerDigest?: string;
   requireRetainedConversation?: boolean;
   conversationKey?: string;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
@@ -1525,7 +1528,7 @@ export class ChatGptTurnDomHealthTracker {
       this.missingCompletionAction = undefined;
       return undefined;
     }
-    if (state.responsePresent) {
+    if (state.responsePresent || (this.sawResponse && state.running)) {
       this.missingResponseSince = undefined;
     } else {
       this.missingResponseSince ??= now;
@@ -2524,13 +2527,15 @@ export class ChatGptBrowserWorker {
   private async prepareTemporaryChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    saveChat = false,
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
-    if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
-      await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
+    const targetUrl = saveChat ? "https://chatgpt.com/" : CHATGPT_TEMPORARY_CHAT_URL;
+    if (page.url() !== targetUrl) {
+      await page.goto(targetUrl, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
@@ -2548,7 +2553,13 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("composer-ready");
     await throwIfChatGptSessionFailureAlert(page);
     await assertAuthenticatedChatGptPage(page);
-    await assertTemporaryChatPage(page);
+    if (!saveChat) await assertTemporaryChatPage(page);
+    else {
+      const actual = new URL(page.url());
+      if (actual.origin !== "https://chatgpt.com" || actual.pathname !== "/" || actual.search) {
+        throw new Error("Saved chat must start on a fresh ChatGPT conversation");
+      }
+    }
     await captureDiagnostic?.("session-verified");
     return composer;
   }
@@ -2888,6 +2899,13 @@ export class ChatGptBrowserWorker {
         locator: observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
         acceptedTurnIdentities: state.turnIdentities,
       };
+      // A newly accepted user turn plus a visible Stop control proves ongoing generation even
+      // before ChatGPT mounts its assistant wrapper. Long reasoning must not consume the idle grace.
+      if (state.visibleStopButtonCount > 0 && chatGptNewTurnIdentity(
+        observationBaseline.initialTurnIdentities, state.userIdentities,
+      )) {
+        responseDeadline = Math.min(deadline ?? Number.POSITIVE_INFINITY, Date.now() + graceMs);
+      }
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
@@ -4224,6 +4242,7 @@ export class ChatGptBrowserWorker {
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
       traceId: turn.traceId,
+      resumeAnswerDigest: turn.resumeAnswerDigest,
       helperPid: process.pid,
       ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
       ...((turn.conversationKey
@@ -4243,6 +4262,7 @@ export class ChatGptBrowserWorker {
     let terminal: "completed" | "failed" | "aborted" = "completed";
     let terminalMessage: string | undefined;
     let originalError: unknown;
+    let completedAnswerDigest: string | undefined;
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
     let heartbeatInFlight = false;
     let lastHeartbeatFailureAt = 0;
@@ -4275,7 +4295,9 @@ export class ChatGptBrowserWorker {
       await turn.onPreparedSelected?.(reused);
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
-      return await this.runBrowserTurn(turn, surfaceId, undefined, reused);
+      const answer = await this.runBrowserTurn(turn, surfaceId, undefined, reused, lease.saveChat === true);
+      completedAnswerDigest = createHash("sha256").update(answer).digest("hex");
+      return answer;
     } catch (error) {
       originalError = error;
       terminal = error instanceof ChatGptCompactionHandoffAccepted
@@ -4291,6 +4313,7 @@ export class ChatGptBrowserWorker {
       try {
         const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
           phase: "end",
+          answerDigest: completedAnswerDigest,
           traceId: turn.traceId,
           helperPid: process.pid,
           status: terminal,
@@ -4318,6 +4341,7 @@ export class ChatGptBrowserWorker {
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
+    saveChat = false,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
@@ -4564,6 +4588,7 @@ export class ChatGptBrowserWorker {
           () => this.prepareTemporaryChatSurface(
             page,
             checkpoint => diagnostics.capture(page, checkpoint),
+            saveChat,
           ),
         );
       }
@@ -4727,6 +4752,7 @@ export class ChatGptBrowserWorker {
               await this.prepareTemporaryChatSurface(
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
+                saveChat,
               );
               mode = await this.selectModelAndEffort(
                 page,
@@ -5113,3 +5139,4 @@ export class ChatGptBrowserWorker {
     }
   }
 }
+

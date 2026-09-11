@@ -3,6 +3,15 @@ const path = require("node:path");
 const { createHash, randomBytes } = require("node:crypto");
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
+
+async function boundedSavedChatOperation(operation, timeoutMs = 5_000) {
+  let timer;
+  try {
+    return await Promise.race([operation, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Saved chat verification timed out")), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const {
   runBrowserHelperOperation,
   verifyConnectorWithBrowserHelper,
@@ -317,6 +326,9 @@ class BrowserHost {
     showWindow = () => {},
     clipboardApi = clipboard,
     getBrowserInteractionMode = () => "automatic",
+    getSaveChats = () => false,
+    rememberChat = () => {},
+    getSavedChats = () => [],
   }) {
     if (typeof getConnectorName !== "function") {
       throw new Error("Browser host connector-name resolver is unavailable");
@@ -325,6 +337,9 @@ class BrowserHost {
       throw new Error("Browser host passkey login operation is unavailable");
     }
     this.window = window;
+    this.getSaveChats = getSaveChats;
+    this.rememberChat = rememberChat;
+    this.getSavedChats = getSavedChats;
     this.descriptorPath = descriptorPath;
     this.cdpPort = cdpPort;
     this.control = control;
@@ -556,6 +571,7 @@ class BrowserHost {
       label: `ChatGPT ${ordinal}`,
       pageTitle: "ChatGPT",
       url: IDLE_BROWSER_URL,
+      saveChat: this.getSaveChats?.() === true,
       loading: true,
       message: "ChatGPT is working",
       interactionMode: "automatic",
@@ -625,7 +641,8 @@ class BrowserHost {
       ordinal,
       label: `ChatGPT ${ordinal}`,
       pageTitle: "ChatGPT",
-      url: TEMPORARY_CHAT_URL,
+      url: this.getSaveChats?.() === true ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL,
+      saveChat: this.getSaveChats?.() === true,
       loading: true,
       message: "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent",
       interactionMode: "manual",
@@ -671,7 +688,7 @@ class BrowserHost {
     }
     if (this.turnTabs.get(tab.id) !== tab || contents.isDestroyed()) return;
     try {
-      await contents.loadURL(TEMPORARY_CHAT_URL);
+      await contents.loadURL(tab.saveChat ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL);
     } catch (error) {
       if (this.turnTabs.get(tab.id) !== tab || contents.isDestroyed()) return;
       if (isAbortedNavigationError(error)) {
@@ -814,10 +831,12 @@ class BrowserHost {
     contents.on("page-title-updated", (_event, title) => {
       if (browserInteractionModeFor(this) !== "automatic") return;
       if (typeof title === "string" && title.trim()) tab.pageTitle = title.trim();
+      this.rememberChat?.(tab);
       this.publishState?.(this.snapshot());
     });
     contents.on("did-navigate-in-page", (_event, url, mainFrame) => {
       if (mainFrame) tab.url = url;
+      this.rememberChat?.(tab);
       this.publishState?.(this.snapshot());
     });
     contents.on("did-fail-load", (_event, errorCode, errorDescription, url, mainFrame) => {
@@ -928,6 +947,7 @@ class BrowserHost {
       if (mainFrame) {
         invalidateConversation(url, true);
         tab.url = url;
+        this.rememberChat?.(tab);
       }
       this.publishState?.(this.snapshot());
     });
@@ -2208,6 +2228,7 @@ class BrowserHost {
     conversationKey,
     connectorIdentity,
     requireRetainedConversation = false,
+    resumeAnswerDigest,
   ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
@@ -2262,6 +2283,8 @@ class BrowserHost {
         existing.bootstrapDeadlineAt = Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS;
       }
       existing.lastHeartbeatAt = Date.now();
+      existing.savedResume = null;
+      this.rememberChat?.(existing);
       if (!existing.view.webContents.isDestroyed()) {
         existing.view.webContents.setBackgroundThrottling(false);
       }
@@ -2276,7 +2299,46 @@ class BrowserHost {
         tabId: existing.id,
         reused,
         connectorBound: existing.connectorBound === true,
+        saveChat: existing.saveChat === true,
       };
+    }
+    const saved = this.getSaveChats?.() === true
+      ? require("./saved-chats.cjs").resumableSavedChat(this.getSavedChats?.() ?? [], conversationKey, connectorIdentity, resumeAnswerDigest)
+      : null;
+    if (saved) {
+      const restored = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
+      try {
+        await boundedSavedChatOperation(restored.view.webContents.loadURL(saved.url), 25_000);
+        const deadline = Date.now() + 20_000;
+        let valid = false;
+        while (Date.now() < deadline) {
+          const observed = await boundedSavedChatOperation(restored.view.webContents.executeJavaScript(`(() => {
+            const turns = [...document.querySelectorAll('[data-turn-id]')];
+            const last = turns.at(-1);
+            return location.origin + location.pathname === ${JSON.stringify(saved.url)}
+              && last?.getAttribute('data-turn-id') === ${JSON.stringify(saved.resume.turnId)}
+              && !!last.querySelector('[data-testid="copy-turn-action-button"]')
+              && !document.querySelector('[data-testid="stop-button"]') ? last.innerText : null;
+          })()`));
+          valid = typeof observed === "string" && createHash("sha256").update(observed).digest("hex") === saved.resume.domDigest;
+          if (valid) break;
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        if (!valid) throw new Error("Saved conversation completion boundary no longer matches");
+        restored.url = saved.url;
+        restored.saveChat = true;
+        restored.savedResume = null;
+        this.rememberChat?.(restored);
+        this.selectedTabId = restored.id;
+        if (reveal) this.show();
+        else this.syncViewVisibility?.();
+        this.publishState?.(this.snapshot());
+        this.writeDescriptor();
+        return { surfaceId: restored.surfaceId, tabId: restored.id, reused: true, connectorBound: false, saveChat: true };
+      } catch (error) {
+        this.removeTurnTab(restored, false);
+        throw new Error(`Saved chat could not be safely resumed: ${error.message}`);
+      }
     }
     if (requireRetainedConversation) {
       const error = new Error("The retained ChatGPT conversation is no longer available");
@@ -2290,7 +2352,7 @@ class BrowserHost {
     this.publishState?.(this.snapshot());
     this.logger.info("browser.tab_created", { tabId: tab.id, traceId, tabCount: this.turnTabs.size });
     this.writeDescriptor();
-    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false };
+    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false, saveChat: tab.saveChat === true };
   }
 
   async endTurn(
@@ -2301,6 +2363,7 @@ class BrowserHost {
     message,
     retain = false,
     connectorBound = false,
+    answerDigest,
   ) {
     const tab = [...this.turnTabs.values()].find((candidate) => candidate.traceId === traceId);
     if (!tab) {
@@ -2325,6 +2388,19 @@ class BrowserHost {
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
+      if (tab.saveChat && /^[a-f0-9]{64}$/.test(answerDigest ?? "")) {
+        try {
+          const checkpoint = await boundedSavedChatOperation(tab.view.webContents.executeJavaScript(`(() => {
+            const last = [...document.querySelectorAll('[data-turn-id]')].at(-1);
+            return last?.querySelector('[data-testid="copy-turn-action-button"]')
+              && !document.querySelector('[data-testid="stop-button"]') ? { turnId: last.getAttribute('data-turn-id'), text: last.innerText } : null;
+          })()`));
+          tab.url = tab.view.webContents.getURL();
+          tab.savedResume = checkpoint && typeof checkpoint.text === "string"
+            ? { turnId: checkpoint.turnId, answerDigest, domDigest: createHash("sha256").update(checkpoint.text).digest("hex") } : null;
+          this.rememberChat?.(tab);
+        } catch { this.logger.warn("browser.saved_resume_checkpoint_unavailable", { tabId: tab.id }); }
+      }
     }
     if (status === "completed"
       && retain

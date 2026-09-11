@@ -286,6 +286,11 @@ function storeFor(parsed: CodexParsedRequest): ChatGptCompactionContinuationStor
   return requestStores.get(parsed) ?? defaultStore;
 }
 
+/** Derived transport requests must keep the same server-owned checkpoint authority. */
+export function inheritCompactionContinuationStore(source: CodexParsedRequest, target: CodexParsedRequest): void {
+  bindCompactionContinuationStore(target, storeFor(source));
+}
+
 export function rememberCompactionContinuation(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,

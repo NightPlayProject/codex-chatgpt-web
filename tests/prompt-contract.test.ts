@@ -20,6 +20,7 @@ import {
 } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { bindGoalContinuationStore, ChatGptGoalContinuationStore } from "../src/adapters/chatgpt-web/goal-continuation";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { retainedConversationResumeRequest } from "../src/adapters/chatgpt-web/conversation-key";
 
 function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexParsedRequest {
   return {
@@ -383,6 +384,64 @@ test("native /goal uses a trusted execution block without becoming a human histo
   expect(compiled.text).toContain(JSON.stringify({ version: 1, objective }));
   expect(compiled.text).toContain("Execute the active native Codex goal now");
   expect(compiled.text).toContain("call the available Codex Native update_goal tool with status complete");
+  expect(compiled.text).not.toContain("Execute the latest active user request now");
+});
+
+test("retained ordinary conversations preserve the latest request instead of inventing a goal", () => {
+  for (const experimentalMultipartParts of [undefined, 2, 3] as const) {
+    const compiled = compileChatGptWebPrompt(
+      request("high"),
+      { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      undefined,
+      { retainedGoalResume: true, experimentalMultipartParts },
+    );
+    expect(compiled.text).not.toContain("<codex_native_goal_resume>");
+    expect(compiled.text).not.toContain("verified_checkpoint_lineage");
+    if (compiled.multipart) {
+      expect(compiled.multipart.nativeGoalActive).toBeUndefined();
+      const commit = formatChatGptWebMultipartCommit(compiled.multipart, `ctx_${"f".repeat(32)}`);
+      expect(commit).not.toContain("active_execution: native_goal");
+      expect(commit).toContain("active_request_message_index:");
+    } else {
+      expect(compiled.text).toContain("Execute the latest active user request now");
+    }
+  }
+});
+
+test("fresh post-compaction goal rounds carry no-progress guidance even with a regenerated objective", () => {
+  const parsed = authorizedNativeGoalRequest("Implement the already approved plan");
+  for (const experimentalMultipartParts of [undefined, 2, 3] as const) {
+    const compiled = compileChatGptWebPrompt(parsed,
+      { localToolsEnabled: true, solAvailable: true, proAvailable: false },
+      "turn_12345678901234567890123456789012", { experimentalMultipartParts });
+    const execution = compiled.multipart
+      ? formatChatGptWebMultipartCommit(compiled.multipart, `ctx_${"c".repeat(32)}`)
+      : compiled.text;
+    expect(execution).toContain("A freshly supplied objective does not restart the task");
+    expect(execution).toContain("unexecuted plans are no progress");
+    expect(execution).toContain("carry it out instead of repeating the plan");
+    expect(execution).not.toContain("Execute the latest active user request now");
+  }
+});
+
+test("retained transport copies preserve server-owned goal and checkpoint bindings", () => {
+  const parsed = authorizedNativeGoalRequest("Continue implementation from the verified checkpoint");
+  const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
+  compileChatGptWebPrompt(parsed, capabilities);
+  // Simulate the next provider round: only a tool result follows the last assistant response,
+  // and native Codex no longer sends the fresh goal wrapper. Authority is in the bound stores.
+  const raw = parsed._rawBody as { input: Array<{ id?: string }> };
+  raw.input = raw.input.filter(item => item.id !== "msg_prompt_goal_runtime");
+  parsed.context.messages.push(
+    { role: "assistant", content: [{ type: "text", text: "Inspecting the next unfinished action" }], timestamp: 3 },
+    { role: "developer", content: "Tool result: checkpoint inspection complete", timestamp: 4 },
+  );
+  const resumed = retainedConversationResumeRequest(parsed)!;
+  expect(resumed.context.messages).toHaveLength(1);
+  expect(() => compileChatGptWebPrompt(resumed, capabilities)).toThrow("missing fresh goal steering");
+  const compiled = compileChatGptWebPrompt(resumed, capabilities, undefined, { retainedGoalResume: true });
+  expect(compiled.text).toContain("<codex_native_goal_resume>");
+  expect(compiled.text).toContain("unexecuted plans are no progress");
   expect(compiled.text).not.toContain("Execute the latest active user request now");
 });
 

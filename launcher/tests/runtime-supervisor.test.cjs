@@ -1852,6 +1852,20 @@ process.once("SIGTERM", () => server.close(() => process.exit(0)));
     assert.equal(Number.isInteger(state.daemonPid), true);
     assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).ok, true);
 
+    // Kill only the fixture-owned child and exercise the real automatic restart path.
+    supervisor.daemon.kill("SIGKILL");
+    const recoveryDeadline = Date.now() + 10_000;
+    let recovered = null;
+    while (Date.now() < recoveryDeadline) {
+      try {
+        const health = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
+        if (health.pid !== state.daemonPid && health.accepting_turns === true) { recovered = health; break; }
+      } catch {}
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(recovered, "a killed fixture daemon must restart and accept requests");
+    assert.equal(supervisor.daemon.pid, recovered.pid);
+
     const stopped = await supervisor.stopForSetup();
     assert.equal(stopped.status, "stopped");
     assert.equal(fs.existsSync(path.join(root, "runtime", "launcher-supervisor.json")), false);
@@ -1960,3 +1974,26 @@ server.listen(config.port, config.host);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const scenario of [
+  { name: "a browser turn remains after HTTP completion", health: { accepting_turns: false, active_http_turns: 0, active_browser_turns: 1 } },
+  { name: "browser activity evidence is missing", health: { accepting_turns: false, active_http_turns: 0 } },
+  { name: "drain acknowledgement is lost", health: null },
+]) {
+  test(`recovery preserves runtime when ${scenario.name}`, async () => {
+    const actions = [];
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => "0.2.0", isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: os.tmpdir(), coreHome: os.tmpdir(),
+      browserDescriptorPath: path.join(os.tmpdir(), "launcher.json"),
+    });
+    supervisor.control = async (_config, action) => {
+      actions.push(action);
+      if (action === "drain" && !scenario.health) throw new Error("connection reset");
+      return scenario.health;
+    };
+    await assert.rejects(supervisor.acquireDrain({}, 0), /atomic idleness could not be proven/);
+    assert.deepEqual(actions, ["drain", "resume"]);
+  });
+}

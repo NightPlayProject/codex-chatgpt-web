@@ -1,6 +1,10 @@
 import type { Language } from "./types";
 
 const en = {
+  saveChats: "Save chats in ChatGPT",
+  saveChatsBody: "Use regular chats for new tasks so conversations stay in your ChatGPT history. Turn off for temporary chats. Existing task chats keep their current mode. Saved chats may use your ChatGPT memory and personalization settings.",
+  savedChats: "Recent saved chats",
+  savedChatsBody: "Review saved conversations in your browser. Automatic mode can resume a completed chat after restart when its task, last answer and page checkpoint still match. Interrupted chats start fresh from Codex context.",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "Set up the isolated DEV profile",
@@ -193,6 +197,10 @@ const en = {
 } as const;
 
 const zh: Record<keyof typeof en, string> = {
+  saveChats: "在 ChatGPT 中保存聊天",
+  saveChatsBody: "新任务使用普通聊天并保留在 ChatGPT 历史中。关闭后使用临时聊天。现有任务不变。普通聊天可能使用 ChatGPT 的记忆和个性化设置。",
+  savedChats: "最近保存的聊天",
+  savedChatsBody: "在浏览器中查看保存的对话。自动模式重启后仅在任务、最后答案和页面检查点匹配时恢复已完成的聊天。中断的聊天使用 Codex 上下文重新开始。",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "设置隔离的 DEV 配置",
@@ -385,6 +393,10 @@ const zh: Record<keyof typeof en, string> = {
 };
 
 const ja: Record<keyof typeof en, string> = {
+  saveChats: "ChatGPT にチャットを保存",
+  saveChatsBody: "新しいタスクを通常のチャットで開始し、ChatGPT の履歴に保存します。オフにすると一時チャットを使用します。既存のタスクには適用されません。通常のチャットではメモリやパーソナライズ設定が適用される場合があります。",
+  savedChats: "最近保存したチャット",
+  savedChatsBody: "保存した会話をブラウザで確認できます。自動モードではタスク、最後の回答、ページのチェックポイントが一致する場合に完了済みチャットを再開します。中断したチャットは Codex のコンテキストで開始します。",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "隔離された DEV プロファイルをセットアップ",

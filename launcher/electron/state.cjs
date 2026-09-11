@@ -13,6 +13,8 @@ const DEFAULT_STATE = Object.freeze({
   autoStart: true,
   keepRunningOnClose: true,
   showBrowserDuringTurns: true,
+  saveChats: false,
+  savedChats: [],
   browserInteractionMode: "automatic",
   experimentalBiggerContext: false,
   zeroRiskProEnabled: false,
@@ -55,6 +57,10 @@ function readState(filePath) {
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
     }
+    state.saveChats = state.saveChats === true;
+    state.savedChats = Array.isArray(state.savedChats) ? state.savedChats.filter(row =>
+      row && typeof row.title === "string" && require("./saved-chats.cjs").savedChatUrl(row.url)
+    ).slice(0, 100) : [];
     if (state.coreSetupComplete !== true) {
       if (state.onboardingComplete !== true) state.browserInteractionMode = "automatic";
       state.zeroRiskProEnabled = false;

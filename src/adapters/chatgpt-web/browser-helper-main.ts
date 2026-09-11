@@ -28,6 +28,7 @@ interface RunMessage {
     nativeConnector?: boolean;
     resumeAvailable?: boolean;
     retainConversation?: boolean;
+    resumeAnswerDigest?: string;
     requireRetainedConversation?: boolean;
     conversationKey?: string;
     compaction?: boolean;
@@ -215,6 +216,7 @@ async function run(message: RunMessage): Promise<void> {
     prepare: prepareSelected,
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
+    ...(message.turn.resumeAnswerDigest ? { resumeAnswerDigest: message.turn.resumeAnswerDigest } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     abortSignal: abortController.signal,

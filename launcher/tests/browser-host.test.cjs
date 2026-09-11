@@ -1498,6 +1498,7 @@ test("a replacement helper takes over only after the previous owner exited", asy
     tabId: tab.id,
     reused: false,
     connectorBound: false,
+    saveChat: false,
   });
   assert.equal(tab.helperPid, process.pid);
   assert.equal(warnings.length, 1);
@@ -2110,6 +2111,7 @@ test("a later provider round reuses only its exact connector-bound conversation"
     tabId: "tab-reused",
     reused: true,
     connectorBound: true,
+    saveChat: false,
   });
   assert.equal(tab.traceId, "trace_next");
   assert.equal(tab.helperPid, 222);
@@ -2163,6 +2165,7 @@ test("a retained conversation is not reused for a different connector identity",
     tabId: "fresh",
     reused: false,
     connectorBound: false,
+    saveChat: false,
   });
   assert.equal(retained.status, "ready");
 });
@@ -2204,6 +2207,7 @@ test("an Automatic turn never reuses a retained Zero Risk conversation", async (
       tabId: "automatic-fresh",
       reused: false,
       connectorBound: false,
+      saveChat: false,
     },
   );
   assert.equal(retained.status, "ready");
@@ -2257,6 +2261,7 @@ test("a connector conversation is not reused until its connector was bound", asy
       tabId: "fresh",
       reused: false,
       connectorBound: false,
+      saveChat: false,
     },
   );
 });

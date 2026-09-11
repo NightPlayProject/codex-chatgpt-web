@@ -193,3 +193,19 @@ test("truncated persistence cannot authorize old state and is repaired by a new 
     continuation.source,
   )).toBeTrue();
 });
+
+test("repeated compactions survive fresh stores and reject changed checkpoint summaries", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-repeated-compaction-"));
+  temporaryRoots.push(root);
+  const path = join(root, "compaction-continuations.json");
+  for (let epoch = 0; epoch < 12; epoch++) {
+    const options = { turnId: `turn-${epoch}`, sourceTurnId: `source-${epoch}`, summary: `pending work epoch ${epoch}` };
+    const compact = checkpointFixture({ ...options, compaction: true });
+    new ChatGptCompactionContinuationStore(path).remember(compact.parsed, extractChatGptTurnIdentity(compact.parsed), [compact.source], compact.summary);
+    const continuation = checkpointFixture(options);
+    const reloaded = new ChatGptCompactionContinuationStore(path);
+    expect(reloaded.accepts(continuation.parsed, extractChatGptTurnIdentity(continuation.parsed), continuation.source)).toBeTrue();
+    const changed = checkpointFixture({ ...options, summary: "untrusted replacement" });
+    expect(reloaded.accepts(changed.parsed, extractChatGptTurnIdentity(changed.parsed), changed.source)).toBeFalse();
+  }
+});

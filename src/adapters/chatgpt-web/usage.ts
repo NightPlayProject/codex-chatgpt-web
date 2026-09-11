@@ -148,7 +148,15 @@ export function resolveStandardContextMultipartParts(
     mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
     options,
   );
-  return compiledChatGptWebMaxMessageChars(inline) >= CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT
+  const maxChars = compiledChatGptWebMaxMessageChars(inline);
+  // Retained native goal resumes have a stricter browser-generation failure
+  // boundary than ordinary large turns. Keep the same context records and
+  // authority model, but give the final execution commit a smaller reconstruction
+  // burden by using the three-part transport when a large goal resume is staged.
+  if (options.retainedGoalResume && maxChars >= CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT) {
+    return CHATGPT_BIGGER_CONTEXT_PARTS;
+  }
+  return maxChars >= CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT
     ? 2
     : undefined;
 }

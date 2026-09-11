@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest } from "../../types";
 import { extractChatGptTurnIdentity } from "./environment";
+import { inheritGoalContinuationStore } from "./goal-continuation";
+import { inheritCompactionContinuationStore } from "./compaction-continuation";
 
 function messageText(item: Record<string, unknown>): string | undefined {
   const content = item.content;
@@ -48,11 +50,14 @@ export function retainedConversationResumeRequest(
 ): CodexParsedRequest | undefined {
   const lastAssistant = parsed.context.messages.findLastIndex(message => message.role === "assistant");
   if (lastAssistant < 0 || lastAssistant === parsed.context.messages.length - 1) return undefined;
-  return {
+  const resumed: CodexParsedRequest = {
     ...parsed,
     context: {
       ...parsed.context,
       messages: parsed.context.messages.slice(lastAssistant + 1),
     },
   };
+  inheritGoalContinuationStore(parsed, resumed);
+  inheritCompactionContinuationStore(parsed, resumed);
+  return resumed;
 }

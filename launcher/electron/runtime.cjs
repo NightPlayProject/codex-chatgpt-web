@@ -14,7 +14,7 @@ const {
   validateConnectorName,
 } = require("./connector-identity.cjs");
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
-const { redactText } = require("./logging.cjs");
+const { redactText, createDiagnosticLineRedactor } = require("./logging.cjs");
 const { DETACH_OWNED_CHILD, terminateOwnedProcessTree } = require("./process-tree.cjs");
 
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
@@ -27,27 +27,42 @@ const PASSKEY_LOGIN_TIMEOUT_MS = 10 * 60_000;
 const MAX_PASSKEY_STATE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_PASSKEY_MARKER_FILE_BYTES = 64 * 1024;
 function collect(stream, chunks, onLine, onError) {
+  const redactLine = createDiagnosticLineRedactor();
+  const emit = line => onLine(redactLine(line));
+  let discardingLine = false;
+  let discardedTail = "";
   let buffered = "";
   let bytes = 0;
   stream.on("data", (chunk) => {
     bytes += chunk.length;
     if (bytes <= MAX_CAPTURE_BYTES) chunks.push(chunk);
-    buffered += chunk.toString("utf8");
+    let text = chunk.toString("utf8");
+    if (discardingLine) {
+      const end = text.indexOf("\n");
+      if (end < 0) { redactLine(discardedTail + text); discardedTail = (discardedTail + text).slice(-128); return; }
+      redactLine(discardedTail + text.slice(0, end));
+      discardedTail = "";
+      text = text.slice(end + 1);
+      discardingLine = false;
+    }
+    buffered += text;
     for (;;) {
       const newline = buffered.indexOf("\n");
       if (newline < 0) break;
       const line = buffered.slice(0, newline).trimEnd();
       buffered = buffered.slice(newline + 1);
-      if (line) onLine(line);
+      if (line) emit(line);
     }
     if (buffered.length > MAX_RUNTIME_LOG_LINE_CHARS) {
-      onLine(`${buffered.slice(0, MAX_RUNTIME_LOG_LINE_CHARS)}…[truncated]`);
+      emit(buffered);
+      discardingLine = true;
+      discardedTail = buffered.slice(-128);
       buffered = "";
     }
   });
   stream.on("end", () => {
     const line = buffered.trim();
-    if (line) onLine(line);
+    if (line) emit(line);
   });
   stream.on("error", (error) => onError?.(error));
 }

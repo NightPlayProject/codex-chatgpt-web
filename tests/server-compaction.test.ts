@@ -726,6 +726,18 @@ test("native /goal automatic continuation accepts the exact prior /goal command 
     undefined,
     { retainedGoalResume: true },
   ).text).toContain("Continue the active native Codex goal already established");
+  for (const experimentalMultipartParts of [undefined, 2, 3] as const) {
+    const resumed = compileChatGptWebPrompt(
+      toolRound,
+      { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      undefined,
+      { retainedGoalResume: true, experimentalMultipartParts },
+    );
+    expect(resumed.text).toMatch(/<verified_checkpoint_lineage>[a-f0-9]{64}<\/verified_checkpoint_lineage>/);
+    expect(resumed.text).toContain("next unfinished action");
+    expect(resumed.text).not.toContain("Execute the latest active user request now");
+    if (resumed.multipart) expect(resumed.multipart.nativeGoalActive).toBe(true);
+  }
 
   const conflicting = structuredClone(body);
   conflicting.input.push({

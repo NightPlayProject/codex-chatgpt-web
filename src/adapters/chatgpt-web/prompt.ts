@@ -511,6 +511,9 @@ export function compileChatGptWebPrompt(
       { status: 409, errorType: "invalid_request_error", code: "native_goal_context_missing", retryable: false },
     );
   }
+  // A retained native-goal resume is still native-goal execution even though the
+  // current wire turn intentionally does not carry objective plaintext again.
+  // Retained lineage is authorization context, not a new user instruction.
   const nativeGoalActive = nativeGoal !== undefined;
   const system = parsed.context.systemPrompt ?? [];
   const sharedContract = [
@@ -587,7 +590,16 @@ export function compileChatGptWebPrompt(
       ]
       : []),
   ];
-  const nativeGoalContract = !nativeGoalActive
+  // Native goal wrappers are deliberately excluded from history. Preserve their execution and
+  // no-progress semantics for fresh post-compaction prompts too, not only retained tool rounds.
+  const nativeGoalProgressContract = !nativeGoalActive ? [] : [
+    "This is an ongoing goal execution turn. A freshly supplied objective does not restart the task. Recover completed work, decisions, and the next unfinished action from the supplied checkpoint and subsequent task history; verify the relevant current state and continue that action.",
+    "Treat previous implementation plans as execution history. If the user already authorized implementation, carry it out instead of repeating the plan or asking for the same authorization again.",
+    "Check the previous goal turn for concrete progress. Status restatements, repeated repository inventories, and unexecuted plans are no progress. When work remains and tools are available, take the next available action that advances the objective before ending the turn. Do not claim implementation has started when only a plan was produced.",
+    "A verified wait must refer to a process or tool handle confirmed live now. A transient observation timeout does not prove it stopped; recheck the same handle before restarting work.",
+    "Keep the full objective intact. Do not call update_goal complete until current evidence proves every requirement is satisfied. Mark blocked only at a genuine impasse after the same blocker has recurred for at least three consecutive goal turns; a resumed blocked goal starts that count again.",
+  ];
+  const nativeGoalContract = [...nativeGoalProgressContract, ...(!nativeGoalActive
     ? []
     : nativeGoal?.objective !== undefined
       ? [
@@ -599,10 +611,13 @@ export function compileChatGptWebPrompt(
       ]
       : [
         "<codex_native_goal_resume>",
+        `<verified_checkpoint_lineage>${nativeGoal!.checkpointId}</verified_checkpoint_lineage>`,
         "Continue the active native Codex goal already established in this retained ChatGPT conversation. Its objective is intentionally not persisted or reconstructed by the bridge.",
+        "Treat the retained conversation, prior tool results, and completed work as execution history. Continue the established goal from the next unfinished action; do not restart completed discovery or replace ongoing execution with another planning-only response.",
+        "First recover the current implementation state from the retained conversation history. Continue from the next unfinished action needed to complete the goal. Only make a new plan when the existing execution path is genuinely invalid or missing required information.",
         "Native Codex owns this goal's lifecycle. When current evidence proves the full objective is complete, call the available Codex Native update_goal tool with status complete before writing the final answer. If the objective is not yet complete, keep working and leave the goal active.",
         "</codex_native_goal_resume>",
-      ];
+      ])];
   const checkpointContract = captureLunaCheckpoint
     ? [
       "After the complete user-facing answer, append one private rolling task checkpoint for the next Luna turn.",

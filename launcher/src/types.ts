@@ -12,6 +12,8 @@ export interface LauncherState {
   autoStart: boolean;
   keepRunningOnClose: boolean;
   showBrowserDuringTurns: boolean;
+  saveChats: boolean;
+  savedChats: Array<{ url: string; title: string; conversationKey: string | null; updatedAt: string }>;
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
   zeroRiskProEnabled: boolean;
@@ -72,6 +74,7 @@ export interface DoctorCheck {
   status: "ok" | "warning" | "error";
   message: string;
   detail?: string;
+  nextStep?: string;
 }
 
 export interface DoctorReport {
@@ -162,7 +165,7 @@ export interface LauncherApi {
     targetMode: BrowserInteractionMode;
   }>;
   setPreference(
-    key: "keepRunningOnClose" | "showBrowserDuringTurns",
+    key: "keepRunningOnClose" | "showBrowserDuringTurns" | "saveChats",
     value: boolean,
   ): Promise<LauncherState>;
   setSidebarState(state: { open: boolean; width: number }): Promise<LauncherState>;

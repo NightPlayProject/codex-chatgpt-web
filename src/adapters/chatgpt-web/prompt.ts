@@ -555,6 +555,9 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
+      "For computer and browser work, prefer the available task-appropriate Codex Native tool, including native MCP tools. Follow the supplied task instructions and each tool's prerequisites. Use shell-driven UI automation or another fallback only when the preferred tool is unavailable, lacks the required capability, or returns a concrete failure; do not switch routes merely because the model took time to choose its next call.",
+      "Reuse tool names, schemas, and surface handles already discovered in this task while they remain valid. Search for tools only when a required capability is missing; repeat discovery or app inventory only when a result establishes that the available tools or target surface changed. Obtain fresh UI state when needed to ground the next interaction, without repeating an unchanged inventory before every action.",
+      "Reduce unnecessary tool round trips: batch independent reads when the declared tool API supports it, and perform directly available required actions without redundant preflight calls or artificial sleeps. Keep state-dependent UI actions sequential and inspect their results before choosing the next action; never batch speculative clicks or bypass approvals to gain speed.",
       "Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
       "Use actual Codex Native results as evidence for local observations and effects.",
       "A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.",

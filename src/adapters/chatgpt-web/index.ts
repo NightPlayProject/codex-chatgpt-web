@@ -29,7 +29,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
-import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts, resolveStandardContextMultipartParts } from "./usage";
+import { CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT, estimateChatGptWebUsage, resolveBiggerContextMultipartParts, resolveStandardContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
@@ -757,12 +757,30 @@ export function createChatGptWebAdapter(
       );
       activeToken = turnToken;
       try {
-        const compiled = compileChatGptWebPrompt(
+        let compiled = compileChatGptWebPrompt(
           input,
           turnCapabilities,
           turnToken,
           compileOptionsFor(input, retainedGoalResume),
         );
+        // Defense in depth: transport selection should happen in usage.ts before compilation, but
+        // retained goal/browser resume paths can carry a stale compile decision. Never allow a
+        // measured unreliable inline envelope to reach ChatGPT after preparation succeeds.
+        if (!compiled.multipart && compiled.text.length >= CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT
+          && !input._compactionRequest
+          && !isChatGptWebZeroRiskBackendModel(input.modelId)
+          && input.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
+          && !manualRequest) {
+          compiled = compileChatGptWebPrompt(
+            input,
+            turnCapabilities,
+            turnToken,
+            {
+              ...compileOptionsFor(input, retainedGoalResume),
+              experimentalMultipartParts: 2,
+            },
+          );
+        }
         // Publish only after preparation succeeds: otherwise its failure revokes the token
         // before the response observer uses it and masks the cause as an expired capability.
         observeCapabilityRetirement(turnToken, externalProgress);

@@ -26,7 +26,7 @@ import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGpt
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
-import { chatGptWebTurnRetryPolicy } from "./retry-policy";
+import { chatGptWebRateLimitController, chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT, estimateChatGptWebUsage, resolveBiggerContextMultipartParts, resolveStandardContextMultipartParts } from "./usage";
@@ -894,6 +894,18 @@ export function createChatGptWebAdapter(
           : createChatGptStructuredOutputValidator(parsed.options.outputFormat);
         const bufferStructuredOutput = structuredOutputValidator !== undefined;
         const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
+        const terminalRateLimit = chatGptWebRateLimitController.terminalTurnError(retryKey);
+        if (terminalRateLimit) {
+          emit({
+            type: "error",
+            message: terminalRateLimit.message,
+            status: terminalRateLimit.status,
+            errorType: terminalRateLimit.errorType,
+            code: terminalRateLimit.code,
+            retryable: false,
+          });
+          return;
+        }
         const exhaustedRetry = chatGptWebTurnRetryPolicy.exhaustedError(retryKey);
         if (exhaustedRetry) {
           emit({
@@ -1182,6 +1194,7 @@ export function createChatGptWebAdapter(
               emit,
             );
             chatGptWebTurnRetryPolicy.clear(retryKey);
+            chatGptWebRateLimitController.recordSuccess(executionNamespace);
             return;
           }
           const responseExecutionKey = `${executionNamespace}:${chatGptCompactionSourceExecutionKey(parsed)}`;
@@ -1276,6 +1289,7 @@ export function createChatGptWebAdapter(
               ));
               session.completeRound(roundKey);
               chatGptWebTurnRetryPolicy.clear(retryKey);
+              chatGptWebRateLimitController.recordSuccess(executionNamespace);
               return;
             }
 
@@ -1297,6 +1311,7 @@ export function createChatGptWebAdapter(
                     buffer,
                   ));
                   session.completeRound(roundKey);
+                  chatGptWebRateLimitController.recordSuccess(executionNamespace);
                   return;
                 }
                 if (results.length !== outstanding.length) {
@@ -1382,6 +1397,7 @@ export function createChatGptWebAdapter(
                 ));
                 session.completeRound(roundKey);
                 chatGptWebTurnRetryPolicy.clear(retryKey);
+                chatGptWebRateLimitController.recordSuccess(executionNamespace);
               };
               const waitForTrace = () => session.runtime.trace.wait(toolWaitAbort.signal)
                 .then(() => ({ type: "trace" as const }))
@@ -1439,6 +1455,7 @@ export function createChatGptWebAdapter(
                   buffer,
                 ));
                 session.completeRound(roundKey);
+                chatGptWebRateLimitController.recordSuccess(executionNamespace);
                 return;
               }
             } finally {
@@ -1464,6 +1481,7 @@ export function createChatGptWebAdapter(
             : turnError;
           if (!(turnError instanceof ChatGptWebAdapterError && turnError.retryable)) {
             chatGptWebTurnRetryPolicy.clear(retryKey);
+            chatGptWebRateLimitController.recordRequestSettled(executionNamespace);
           }
           if (handledError instanceof ChatGptWebAdapterError && !handledError.retryable) {
             // A deterministic request failure remains replayable so a native reconnect cannot burn

@@ -20,7 +20,7 @@ import {
   CODEX_ACTIVE_COMPACTION_REQUEST_MARKER,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
-import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
+import { ChatGptWebRateLimitController, MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
@@ -1476,7 +1476,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("caps automatic rate-limit browser sends at three retries for one native turn", async () => {
+  test("treats a rate-limited native turn as terminal without another browser send", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-retry-budget-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1497,7 +1497,7 @@ describe("ChatGPT outer-native harness v4", () => {
       });
     };
     try {
-      for (let attempt = 0; attempt < MAX_CHATGPT_WEB_TURN_RETRIES + 2; attempt += 1) {
+      for (let attempt = 0; attempt < Math.max(2, MAX_CHATGPT_WEB_TURN_RETRIES); attempt += 1) {
         const events: AdapterEvent[] = [];
         await createChatGptWebAdapter(provider).runTurn!(
           rawWireRequest(environmentXml),
@@ -1506,18 +1506,44 @@ describe("ChatGPT outer-native harness v4", () => {
         );
         const error = events.at(-1);
         expect(error).toMatchObject({ type: "error", code: "rate_limit_exceeded" });
-        expect((error as Extract<AdapterEvent, { type: "error" }>).retryable)
-          .toBe(attempt < MAX_CHATGPT_WEB_TURN_RETRIES);
-        if (attempt === MAX_CHATGPT_WEB_TURN_RETRIES) {
-          expect((error as Extract<AdapterEvent, { type: "error" }>).message)
-            .toContain("Try again in a few minutes.");
-        }
+        expect((error as Extract<AdapterEvent, { type: "error" }>).retryable).toBeFalse();
       }
-      expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+      expect(browserStarts).toBe(1);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();
     }
+  });
+
+  test("rate-limit recovery cools down one provider scope and admits one recovery probe", () => {
+    const controller = new ChatGptWebRateLimitController(1_000, 10_000);
+    const rateLimit = new ChatGptWebAdapterError("ChatGPT rate limit: too many requests.", {
+      status: 429,
+      errorType: "rate_limit_error",
+      code: "rate_limit_exceeded",
+      retryable: true,
+    });
+
+    const terminal = controller.recordRateLimit("scope-a", "scope-a:turn-a", rateLimit, 100);
+    expect(terminal.retryable).toBeFalse();
+    expect(controller.terminalTurnError("scope-a:turn-a", 200)?.retryable).toBeFalse();
+    expect(controller.terminalTurnError("scope-a:turn-b", 200)).toMatchObject({
+      status: 429,
+      code: "rate_limit_exceeded",
+      retryable: false,
+    });
+    expect(controller.terminalTurnError("scope-b:turn-a", 200)).toBeUndefined();
+
+    expect(controller.terminalTurnError("scope-a:turn-b", 1_200)).toBeUndefined();
+    expect(controller.terminalTurnError("scope-a:turn-c", 1_200)).toMatchObject({
+      status: 429,
+      code: "rate_limit_exceeded",
+      retryable: false,
+    });
+    controller.recordRequestSettled("scope-a", 1_200);
+    expect(controller.terminalTurnError("scope-a:turn-c", 1_201)).toBeUndefined();
+    controller.recordSuccess("scope-a", 1_201);
+    expect(controller.terminalTurnError("scope-a:turn-d", 1_202)).toBeUndefined();
   });
 
   test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {

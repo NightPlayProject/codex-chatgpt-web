@@ -1138,11 +1138,12 @@ export const CHATGPT_MIN_OPERATIONAL_VIEWPORT = Object.freeze({ width: 320, heig
  */
 export const CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS = 30_000;
 
-async function waitForOperationalChatGptViewport(
+export async function waitForOperationalChatGptViewport(
   page: Page,
   signal?: AbortSignal,
   timeoutMs = 10_000,
 ): Promise<void> {
+  if (signal?.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
   try {
     await withBrowserTurnAbort(page.waitForFunction(
       ({ width, height }) => innerWidth >= width && innerHeight >= height,
@@ -1151,8 +1152,9 @@ async function waitForOperationalChatGptViewport(
     ), signal);
   } catch (error) {
     if (signal?.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
-    throw new Error(
-      `ChatGPT browser surface did not expose an operational viewport: ${error instanceof Error ? error.message : String(error)}`,
+    throw new ChatGptWebAdapterError(
+      "ChatGPT browser surface did not expose an operational viewport. Open the ChatGPT tab in the Launcher and check its state before continuing.",
+      { status: 502, errorType: "server_error", code: "chatgpt_browser_viewport_unavailable", retryable: false, cause: error },
     );
   }
 }
@@ -4508,6 +4510,14 @@ export class ChatGptBrowserWorker {
                 // the outer diagnostic capture and finally block to release this exact transport.
                 turnConnection = rebound.browser;
                 diagnosticPage = rebound.page;
+                // CDP attachment can reset emulation too. Reapply on the same owned tab
+                // after attachment; never reload or submit again to repair observation.
+                await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+                  phase: "heartbeat",
+                  traceId: turn.traceId,
+                  helperPid: process.pid,
+                  refreshViewport: true,
+                });
                 await waitForOperationalChatGptViewport(
                   rebound.page,
                   signal,

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { waitForOperationalChatGptViewport } from "../src/adapters/chatgpt-web/browser-worker";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -437,6 +438,24 @@ test("an already-submitted launcher turn gets extra viewport recovery time witho
   expect(fresh).toBeGreaterThan(-1);
   expect(rebind).toBeGreaterThan(fresh);
   expect(recoveryBudget).toBeGreaterThan(rebind);
+  const connection = workerSource.indexOf("turnConnection = rebound.browser;");
+  const refresh = workerSource.indexOf("refreshViewport: true", connection);
+  expect(refresh).toBeGreaterThan(connection);
+  expect(refresh).toBeLessThan(rebind);
+});
+
+test("viewport failure stays actionable and terminal without reloading or sending", async () => {
+  const cause = new Error("fixture viewport timeout");
+  let probes = 0;
+  const page = { waitForFunction: async () => { probes++; throw cause; } };
+  await expect(waitForOperationalChatGptViewport(page as never)).rejects.toMatchObject({
+    code: "chatgpt_browser_viewport_unavailable", retryable: false, cause,
+  });
+  expect(probes).toBe(1);
+  const controller = new AbortController();
+  controller.abort();
+  await expect(waitForOperationalChatGptViewport(page as never, controller.signal))
+    .rejects.toMatchObject({ name: "AbortError" });
 });
 
 test("Luna turns without a retained conversation never send connector identity alone", () => {

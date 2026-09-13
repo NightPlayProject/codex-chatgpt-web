@@ -3653,6 +3653,31 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 10_000);
 
+  test("missing trusted workspace returns a terminal error on reconnect without starting a browser", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://missing-workspace-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let starts = 0;
+    worker.run = async () => { starts++; throw new Error("unexpected browser start"); };
+    try {
+      const adapter = createChatGptWebAdapter(provider);
+      for (let retry = 0; retry < 2; retry++) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(rawWireRequest("Continue"), { headers: new Headers() }, event => events.push(event));
+        expect(events.at(-1)).toMatchObject({
+          type: "error", code: "chatgpt_trusted_environment_missing", status: 409, retryable: false,
+        });
+      }
+      expect(starts).toBe(0);
+    } finally {
+      worker.run = originalRun;
+    }
+  });
+
   test("a retired MCP binding closes the adapter tool boundary before the stale batch can be emitted", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-retired-boundary-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
@@ -3712,7 +3737,7 @@ describe("ChatGPT outer-native harness v4", () => {
         markRetirementObserved();
 
         return await new Promise<string>((_resolve, reject) => {
-          const rejectAborted = () => reject(turn.abortSignal?.reason ?? new DOMException("test browser aborted", "AbortError"));
+          const rejectAborted = () => reject(new DOMException("test browser aborted", "AbortError"));
           if (turn.abortSignal?.aborted) rejectAborted();
           else turn.abortSignal?.addEventListener("abort", rejectAborted, { once: true });
         });
@@ -3734,7 +3759,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
       expect(events.at(-1)).toMatchObject({
         type: "error",
-        code: "chatgpt_submitted_turn_failed",
+        code: "chatgpt_native_binding_retired",
       });
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;

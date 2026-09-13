@@ -22,7 +22,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
+import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds, MissingTrustedCodexEnvironmentError } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
@@ -102,7 +102,12 @@ function cancellableBrowserTurn(
     // Cancellation wins immediately even while the detached Playwright helper is still unwinding.
     // The helper keeps the same abort signal and remains responsible for its normal end/cleanup
     // handshake, but the Codex Responses turn no longer waits on that process cleanup.
-    browser: Promise.race([run, cancellation]),
+    browser: Promise.race([run.catch(error => {
+      // The helper transport can reduce an abort to a generic AbortError. Preserve the
+      // owner's typed reason, including capability retirement, across that boundary.
+      throw controller.signal.aborted && controller.signal.reason instanceof ChatGptWebAdapterError
+        ? controller.signal.reason : error;
+    }), cancellation]),
     // `browser` is the fast client-facing result. Replacement ownership must wait for the actual
     // worker promise, whose finally block completes the launcher /turn/end handshake.
     physicalSettlement: run.then(() => undefined, () => undefined),
@@ -477,7 +482,10 @@ export function createChatGptWebAdapter(
       observedCapabilityTokens.add(turnToken);
       void broker.waitForRetirement(turnToken).then(
         () => {
-          const retirement = new Error("Codex Native retired the turn binding before its tool work completed");
+          const retirement = new ChatGptWebAdapterError(
+            "Codex Native retired the turn binding before its tool work completed. Check completed tool actions before continuing; the prompt was not resent.",
+            { status: 409, errorType: "invalid_request_error", code: "chatgpt_native_binding_retired", retryable: false },
+          );
           externalProgress.retire(retirement);
           if (!browserOwnerSettled && !browserAbort.signal.aborted) browserAbort.abort(retirement);
         },
@@ -907,6 +915,17 @@ export function createChatGptWebAdapter(
             console.warn(
               `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
             );
+            if (error instanceof MissingTrustedCodexEnvironmentError) {
+              emit({
+                type: "error",
+                message: `${error.message}. Reopen the task in its original Codex workspace and try again. No ChatGPT prompt was sent for this request.`,
+                status: 409,
+                errorType: "invalid_request_error",
+                code: "chatgpt_trusted_environment_missing",
+                retryable: false,
+              });
+              return;
+            }
             throw error;
           }
         }

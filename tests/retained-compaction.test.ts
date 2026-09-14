@@ -976,7 +976,7 @@ test("a repeated compaction waits for the previous conversation retirement", asy
   expect(waited).toBeTrue();
 });
 
-test("retained compaction can close its browser epoch while preserving an ordinary final response", async () => {
+test.each(["empty", "settled", "active", "foreign"])("retained compaction can close its browser epoch while preserving an ordinary final response", async (occupied) => {
   const sessions = new ChatGptTurnSessions();
   const conversationKey = "b".repeat(64);
   const text = new ChatGptTextFeed();
@@ -996,11 +996,30 @@ test("retained compaction can close its browser epoch while preserving an ordina
   await source.browserOutcome;
   await source.physicalSettlement;
 
+  if (occupied !== "empty") {
+    const previous = sessions.getOrCreate("compacted-ordinary-final", () => ({
+      mode: "read-only", browser: occupied === "active" ? new Promise<string>(() => {}) : Promise.resolve("previous round"),
+      physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(), conversationKey: occupied === "foreign" ? "foreign" : conversationKey, cancel() {},
+    }));
+    if (occupied !== "active") await previous.browserOutcome;
+  }
+
+  if (occupied === "active" || occupied === "foreign") {
+    await expect(sessions.retireConversationPreservingFinalResponse(
+      conversationKey, source, "compacted-ordinary-final",
+    )).rejects.toThrow("already owned by another session");
+    expect(sessions.find("ordinary-final")).toBe(source);
+    expect(releases).toBe(0);
+    sessions.clear();
+    return;
+  }
+
   expect(await sessions.retireConversationPreservingFinalResponse(
     conversationKey,
     source,
     "compacted-ordinary-final",
-  )).toBe(1);
+  )).toBe(occupied === "settled" ? 2 : 1);
   expect(releases).toBe(1);
   expect(source.conversationKey()).toBeUndefined();
   expect(sessions.findConversationHead(conversationKey)).toBeUndefined();

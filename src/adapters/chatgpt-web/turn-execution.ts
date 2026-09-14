@@ -699,7 +699,11 @@ export class ChatGptTurnSessions {
       throw new Error("The final ChatGPT response does not own the retained conversation being retired");
     }
     const target = preserved ? this.entries.get(preserved.executionKey) : undefined;
-    if (target && target !== preserved?.session) {
+    // Earlier settled rounds in this same epoch are retired below. Their replay key must
+    // not prevent the latest final response from replacing them during compaction.
+    // Never displace an active round or a session from another conversation.
+    if (target && target !== preserved?.session
+      && (target.isActive() || !matches.some(([, session]) => session === target))) {
       throw new Error("The compacted ChatGPT response execution key is already owned by another session");
     }
     this.conversationHeads.delete(conversationKey);

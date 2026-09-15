@@ -700,10 +700,24 @@ export class ChatGptTurnSessions {
     }
     const target = preserved ? this.entries.get(preserved.executionKey) : undefined;
     // Earlier settled rounds in this same epoch are retired below. Their replay key must
-    // not prevent the latest final response from replacing them during compaction.
-    // Never displace an active round or a session from another conversation.
+    // not prevent the latest final response from replacing them during compaction. A
+    // subscription-router migration can also leave a fully-settled replay owner attached to
+    // the previous browser epoch. Native Codex preserves thread_id across that verified history
+    // move, so the same thread may reclaim the replay key after the old physical owner is gone.
+    // Never displace an active/physically-live round or a different native thread.
+    const sameNativeThreadHandoff = Boolean(
+      target
+      && preserved
+      && target !== preserved.session
+      && !target.isActive()
+      && target.isPhysicallySettled()
+      && target.nativeThreadId
+      && preserved.session.nativeThreadId
+      && target.nativeThreadId === preserved.session.nativeThreadId,
+    );
     if (target && target !== preserved?.session
-      && (target.isActive() || !matches.some(([, session]) => session === target))) {
+      && (target.isActive()
+        || (!matches.some(([, session]) => session === target) && !sameNativeThreadHandoff))) {
       throw new Error("The compacted ChatGPT response execution key is already owned by another session");
     }
     this.conversationHeads.delete(conversationKey);

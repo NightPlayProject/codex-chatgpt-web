@@ -1033,6 +1033,86 @@ test.each(["empty", "settled", "active", "foreign"])("retained compaction can cl
   sessions.clear();
 });
 
+test("retained compaction accepts a settled replay owner from the same native thread after subscription migration", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const conversationKey = "m".repeat(64);
+  const nativeThreadId = "019f4edd-1032-7ec2-80bd-5b526a05471d";
+  const source = sessions.getOrCreate("ordinary-final-after-migration", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("ordinary final answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey,
+    releaseRetainedConversation: async () => {},
+    cancel() {},
+  }), undefined, "new-subscription-owner", "new-turn", nativeThreadId);
+  const previous = sessions.getOrCreate("compacted-migrated-final", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("previous subscription answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "previous-subscription-browser-epoch",
+    cancel() {},
+  }), undefined, "previous-subscription-owner", "previous-turn", nativeThreadId);
+  await Promise.all([
+    source.browserOutcome,
+    source.physicalSettlement,
+    previous.browserOutcome,
+    previous.physicalSettlement,
+  ]);
+
+  expect(await sessions.retireConversationPreservingFinalResponse(
+    conversationKey,
+    source,
+    "compacted-migrated-final",
+  )).toBe(1);
+  expect(sessions.find("compacted-migrated-final")).toBe(source);
+  sessions.clear();
+});
+
+test.each([
+  ["different native thread", "019f4edd-1032-7ec2-80bd-5b526a05471e", false],
+  ["active same native thread", "019f4edd-1032-7ec2-80bd-5b526a05471d", true],
+])("retained compaction still rejects a foreign replay owner with %s", async (_name, targetThreadId, active) => {
+  const sessions = new ChatGptTurnSessions();
+  const conversationKey = "n".repeat(64);
+  const nativeThreadId = "019f4edd-1032-7ec2-80bd-5b526a05471d";
+  const source = sessions.getOrCreate("ordinary-final-protected", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("ordinary final answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey,
+    cancel() {},
+  }), undefined, "new-subscription-owner", "new-turn", nativeThreadId);
+  const previous = sessions.getOrCreate("compacted-protected-final", () => ({
+    mode: "read-only",
+    browser: active ? new Promise<string>(() => {}) : Promise.resolve("foreign answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "foreign-browser-epoch",
+    cancel() {},
+  }), undefined, "foreign-owner", "foreign-turn", targetThreadId);
+  await source.browserOutcome;
+  await source.physicalSettlement;
+  if (!active) {
+    await previous.browserOutcome;
+    await previous.physicalSettlement;
+  }
+
+  await expect(sessions.retireConversationPreservingFinalResponse(
+    conversationKey,
+    source,
+    "compacted-protected-final",
+  )).rejects.toThrow("already owned by another session");
+  expect(sessions.find("ordinary-final-protected")).toBe(source);
+  sessions.clear();
+});
+
 test("adapter compact returns one same-agent handoff and preserves a pre-existing ordinary final", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-adapter-retained-compact-"));
   const provider: CodexProviderConfig = {

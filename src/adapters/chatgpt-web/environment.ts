@@ -3,7 +3,12 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { hasOnlyCodexContextualUserContentItemKinds, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
-import { authorizeGoalContinuation, hasCurrentNativeGoalClaim, resolveGoalContinuation } from "./goal-continuation";
+import {
+  authorizeGoalContinuation,
+  hasCurrentNativeGoalClaim,
+  hasTrustedCurrentNativeGoalBeforeInput,
+  resolveGoalContinuation,
+} from "./goal-continuation";
 
 export type ChatGptSandboxPolicy =
   | { type: "dangerFullAccess" }
@@ -297,10 +302,12 @@ export function extractChatGptTurnUserRevisionRecord(parsed: CodexParsedRequest)
   if (!turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
   const revision = latestChatGptTurnUserRevisionRecord(parsed, turnId);
   if (!revision) throw new Error("ChatGPT web requires a current-turn user message for browser-session replay");
-  // Native Codex must expose exactly one current task authority. A human/direct-parent revision and
-  // a native goal claim in the same current turn are ambiguous even if either one looks valid by
-  // itself, so fail closed instead of silently choosing one execution channel.
-  if (revision.turnId === turnId && hasCurrentNativeGoalClaim(parsed, identity)) {
+  // Steering a running goal appends a newer human/direct-parent revision after the current native
+  // goal wrapper. That ordering is unambiguous: the later human revision is the new task authority.
+  // Any malformed/duplicate goal claim or a goal wrapper at/after the human revision still fails
+  // closed so replay cannot silently pick between competing current authorities.
+  if (revision.turnId === turnId && hasCurrentNativeGoalClaim(parsed, identity)
+    && !hasTrustedCurrentNativeGoalBeforeInput(parsed, identity, revision.inputIndex)) {
     throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
   }
   // A pre-turn compact may summarize an earlier user message before native Codex continues

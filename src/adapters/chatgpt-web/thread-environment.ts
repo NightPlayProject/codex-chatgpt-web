@@ -187,17 +187,21 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
-      // Only a current native rollout can supersede an unrecognized historical envelope. Without
-      // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptFilesystemEnvironmentContext(parsed)) throw error;
       const sameThread = this.get(identity.threadId);
-      if (sameThread) return {
+      // Historical replay may retain an old filesystem envelope after Codex stops emitting it on
+      // every follow-up. When this request carries no current filesystem update, an already-
+      // authenticated cache for this exact native thread remains valid authority. Current updates
+      // still fail closed above, and unknown/foreign threads cannot enter this path.
+      if (!hasCurrentFilesystemContext && sameThread) return {
         cwd: sameThread.cwd,
         roots: sameThread.roots,
         writableRoots: sameThread.writableRoots,
         sandboxPolicy: sameThread.sandboxPolicy,
         tools: parsed.context.tools ?? [],
       };
+      // Without current rollout proof or exact-thread cached authority, never derive authority from
+      // an unrecognized historical filesystem envelope.
+      if (hasRawChatGptFilesystemEnvironmentContext(parsed)) throw error;
 
       if (!lineage) throw error;
       const parent = this.get(lineage.parentThreadId);

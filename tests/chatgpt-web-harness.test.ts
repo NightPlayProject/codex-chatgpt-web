@@ -855,44 +855,58 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(second.outstanding()).toEqual([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
   });
 
-  test("rejects a native /goal claim that conflicts with a current human revision", () => {
+  test("accepts a later human steer after one trusted current goal wrapper and rejects ambiguous ordering", () => {
     const raw = rawWireRequest(environmentXml);
     const body = raw._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, unknown> };
     const metadata = JSON.parse(String(body.client_metadata["x-codex-turn-metadata"])) as { thread_id: string; turn_id: string };
-    body.input.push({
+    const goal = {
       type: "message",
       role: "user",
-      id: "msg_goal_exact_replay",
-      content: [{ type: "input_text", text: '<codex_internal_context source="goal">runtime steering</codex_internal_context>' }],
+      id: "msg_goal_before_steer",
+      content: [{ type: "input_text", text: [
+        '<codex_internal_context source="goal">',
+        "Continue working toward the active thread goal.",
+        "<objective>",
+        "Keep implementing the active goal",
+        "</objective>",
+        "runtime budget",
+        "</codex_internal_context>",
+      ].join("\n") }],
       internal_chat_message_metadata_passthrough: {
         turn_id: metadata.turn_id,
         content_item_kinds: ["goal.internal_context"],
       },
+    };
+    // A goal runtime wrapper generated before the current human revision is the normal steering
+    // shape. The later human message supersedes the wrapper and must become a fresh execution key.
+    body.input.splice(body.input.length - 1, 0, goal);
+    const steered = parseRequest({ model: "chatgpt-web/high", stream: false, ...raw._rawBody as Record<string, unknown> });
+    steered.modelId = raw.modelId;
+    steered.options.reasoning = raw.options.reasoning;
+    expect(() => chatGptTurnExecutionKey(steered)).not.toThrow();
+
+    // Reversing the order leaves the goal wrapper as the later authority and remains ambiguous.
+    const goalAfterHuman = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    const wrapper = goalAfterHuman.input.splice(goalAfterHuman.input.length - 2, 1)[0]!;
+    goalAfterHuman.input.push(wrapper);
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...goalAfterHuman,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const malformed = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    const malformedGoal = malformed.input.at(-2)!;
+    malformedGoal.content = [{ type: "input_text", text: '<codex_internal_context source="goal">missing objective</codex_internal_context>' }];
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...malformed,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const duplicate = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    duplicate.input.splice(duplicate.input.length - 1, 0, {
+      ...structuredClone(duplicate.input.at(-2)!), id: "msg_goal_duplicate",
     });
-    // This fixture still owns a human instruction in the same native turn. A goal wrapper cannot
-    // silently override that second current authority; real `/goal` continuation is covered below
-    // with an older checkpoint-bound human source and exact current native goal evidence.
-    const publicBody = { model: "chatgpt-web/high", stream: false, ...raw._rawBody as Record<string, unknown> };
-    const first = parseRequest(publicBody);
-    first.modelId = raw.modelId;
-    first.options.reasoning = raw.options.reasoning;
-    expect(JSON.stringify(first.context.messages)).not.toContain("runtime steering");
-    expect(() => chatGptTurnExecutionKey(first)).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
-
-    const literalHumanBody = structuredClone(publicBody) as unknown as { input: Array<Record<string, unknown>> };
-    const literalHumanGoal = literalHumanBody.input.at(-1)!;
-    literalHumanGoal.internal_chat_message_metadata_passthrough = {
-      turn_id: metadata.turn_id,
-      content_item_kinds: ["user.text"],
-    };
-    expect(JSON.stringify(parseRequest(literalHumanBody).context.messages)).toContain("runtime steering");
-    const mixedKindsBody = structuredClone(publicBody) as unknown as { input: Array<Record<string, unknown>> };
-    mixedKindsBody.input.at(-1)!.internal_chat_message_metadata_passthrough = {
-      turn_id: metadata.turn_id,
-      content_item_kinds: ["goal.internal_context", "user.text"],
-    };
-    expect(JSON.stringify(parseRequest(mixedKindsBody).context.messages)).toContain("runtime steering");
-
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...duplicate,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
   });
 
   test("native /goal execution follows the trusted objective instead of the retained human source", () => {

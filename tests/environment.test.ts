@@ -645,6 +645,56 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(malformedFilesystemUpdate)).toThrow("missing cwd");
   });
 
+  test("historical filesystem replay can reuse only the exact authenticated thread cache", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    const first = currentWire();
+    expect(store.resolve(first).cwd).toBe(root);
+
+    const replay = currentWire();
+    const replayTools: CodexTool[] = [{ name: "replay_tool", description: "replay", parameters: { type: "object" } }];
+    replay.context.tools = replayTools;
+    const replayBody = replay._rawBody as {
+      client_metadata: Record<string, string>;
+      input: Array<Record<string, unknown>>;
+    };
+    replayBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_current", turn_id: "turn_replay_followup",
+    });
+    const historicalEnvironment = structuredClone(replayBody.input[0]!);
+    historicalEnvironment.id = "msg_historical_environment";
+    historicalEnvironment.internal_chat_message_metadata_passthrough = { turn_id: "turn_old" };
+    replayBody.input = [
+      historicalEnvironment,
+      { type: "message", role: "assistant", id: "msg_old_answer", content: [{ type: "output_text", text: "Done" }] },
+      { type: "message", role: "user", id: "msg_current_followup", content: [{ type: "input_text", text: "Continue" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_replay_followup", content_item_kinds: ["user.text"] } },
+    ];
+
+    expect(store.resolve(replay)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: replayTools,
+    });
+
+    const foreign = structuredClone(replay);
+    const foreignBody = foreign._rawBody as { client_metadata: Record<string, string> };
+    foreignBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_without_cached_authority", turn_id: "turn_foreign_followup",
+    });
+    expect(() => store.resolve(foreign)).toThrow("missing cwd");
+
+    const malformedCurrent = structuredClone(replay);
+    const malformedBody = malformedCurrent._rawBody as { input: Array<Record<string, unknown>> };
+    malformedBody.input.push({
+      type: "message", role: "user", id: "msg_current_bad_environment",
+      content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_replay_followup" },
+    });
+    expect(() => store.resolve(malformedCurrent)).toThrow("missing cwd");
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);

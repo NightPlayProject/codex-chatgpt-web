@@ -210,6 +210,21 @@ function nativeGoalEvidence(parsed: CodexParsedRequest, identity: ChatGptTurnIde
   return { state: "absent" };
 }
 
+/**
+ * Steering appends a human/direct-parent revision after Codex's current goal runtime wrapper.
+ * Accept that shape only when the wrapper is the single well-formed current goal claim and it
+ * actually precedes the newer instruction. Malformed, duplicate, or later goal claims remain
+ * ambiguous and must continue to fail closed at the caller.
+ */
+export function hasTrustedCurrentNativeGoalBeforeInput(
+  parsed: CodexParsedRequest,
+  identity: ChatGptTurnIdentity,
+  inputIndex: number,
+): boolean {
+  const evidence = nativeGoalEvidence(parsed, identity);
+  return evidence.state === "valid" && evidence.inputIndex < inputIndex;
+}
+
 function validateScopeKey(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) throw new Error("Invalid persisted ChatGPT goal scope");
   let parsed: unknown;

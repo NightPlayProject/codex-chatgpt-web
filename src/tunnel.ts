@@ -6,8 +6,11 @@ import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-export const TUNNEL_VERSION = "0.0.12";
-const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
+export const TUNNEL_VERSION = "0.0.14";
+// Keep every tunnel version shipped by Web GPT as a trusted in-place upgrade source. The
+// installer must be able to move an existing user directly to the current pinned client instead
+// of failing because the previous pin is no longer the target version.
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.11", "0.0.12", "0.0.13"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;

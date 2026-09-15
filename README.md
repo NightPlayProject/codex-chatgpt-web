@@ -170,8 +170,9 @@ active Codex harness normally.
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
 [developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
-Unexpected approval prompts fail closed unless `--auto-approve-tool-calls` is explicitly enabled;
-that option clicks **Allow once**, never a permanent grant.
+Full automatic mode clicks the one-shot **Allow once** connector prompt automatically; it never
+selects a permanent grant. The ChatGPT connector itself must still use **Allow all actions**, and
+the outer Codex harness remains responsible for its native tool authorization and sandbox policy.
 
 ## Operations
 

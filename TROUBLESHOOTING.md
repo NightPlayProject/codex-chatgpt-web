@@ -136,8 +136,9 @@ cannot forward a tool that Codex itself has not loaded.
    retrying and recheck the account, Tunnel ID, and running Tunnel first.
 
 If tool calls work until native Codex quota is exhausted and then edits are denied by **Automatic
-approval review**, disable that optional Codex review setting and restart Codex. The outer Codex
-sandbox and explicit approvals still apply; this only prevents an unavailable native model from
+approval review**, disable that optional Codex review setting and restart Codex. Full automatic
+mode now accepts the connector's one-shot **Allow once** prompt automatically, but the outer Codex
+sandbox and native approval review still apply; this prevents an unavailable native model from
 being inserted as an extra reviewer after the Web tool call already completed.
 
 ## `Reconnecting`, `stream disconnected`, or `ChatGPT failed`

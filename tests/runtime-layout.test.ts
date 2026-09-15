@@ -99,6 +99,22 @@ test("default setup uses the fixed production connector identities", () => {
   expect(defaultConfig("full").subagentProtocol).toBe("compatibility-v1");
   expect(defaultConfig("full").browserInteractionMode).toBe("automatic");
   expect(defaultConfig("full").zeroRiskProEnabled).toBe(false);
+  expect(defaultConfig("full").autoApproveToolCalls).toBe(true);
+  expect(defaultConfig("browser-only").autoApproveToolCalls).toBe(false);
+});
+
+test("Full automatic provider access upgrades stale approval settings while Zero Risk stays manual", () => {
+  const staleFull = { ...defaultConfig("full"), autoApproveToolCalls: false };
+  expect(providerConfig(staleFull).chatgptWeb).toMatchObject({
+    localToolsEnabled: true,
+    autoApproveToolCalls: true,
+  });
+
+  const zeroRisk = { ...staleFull, browserInteractionMode: "manual" as const };
+  expect(providerConfig(zeroRisk).chatgptWeb).toMatchObject({
+    localToolsEnabled: true,
+    autoApproveToolCalls: false,
+  });
 });
 
 test.each([

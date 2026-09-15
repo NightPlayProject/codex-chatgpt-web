@@ -38,10 +38,11 @@ const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
 // Match Codex's default wait interval while returning before the MCP invocation deadline.
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 30_000;
 const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly ${CHATGPT_WEB_AGENT_WAIT_POLL_MS / 1_000} seconds per call, matching the Codex default, then release the MCP channel so spawned Web agents can use their own tools. A wait timeout is not task completion; check agent progress and wait again if needed. Keep the native tool's declared arguments.`;
-// The OpenAI tunnel currently owns a two-minute command-response deadline. The local MCP server
-// must settle first so an abandoned native tool call is returned as an MCP error instead of
-// letting the tunnel tear down and poison its long-lived stdio transport.
-export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
+// The OpenAI tunnel currently owns a two-minute command-response deadline. Leave a small margin
+// for the MCP response frame while giving the native Codex consumer time to reconnect after a
+// transient browser/Responses disconnect.
+export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 110_000;
+const MCP_SERVER_INSTANCE_ID = randomBytes(16).toString("hex");
 
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
@@ -73,6 +74,13 @@ interface McpRequestExtra {
 
 function scopeHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function mcpInvocationKey(extra: McpRequestExtra): string {
+  // The MCP request id is stable across a transport retry in the same connector session. Scoping
+  // it to this server process and session prevents a reused JSON-RPC id from deduplicating an
+  // unrelated request while still allowing the broker to replay one lost native handoff.
+  return `${MCP_SERVER_INSTANCE_ID}:${scopeHash(`${extra.sessionId ?? ""}:${String(extra.requestId)}`)}`;
 }
 
 function requestScopeSummary(extra: McpRequestExtra): string {
@@ -547,7 +555,7 @@ export async function runChatGptMcpServer(options: {
     bound: ChatGptTurnEnvironment & { expiresAt?: number },
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
-    signal?: AbortSignal,
+    extra: McpRequestExtra,
   ) => {
     const timeoutMs = chatGptMcpInvocationTimeout(bound);
     try {
@@ -557,12 +565,26 @@ export async function runChatGptMcpServer(options: {
         wireName: wireName(tool),
         freeform: tool.freeform === true,
         ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
-      }, timeoutMs, signal);
+        invocationKey: mcpInvocationKey(extra),
+      }, timeoutMs, extra.signal);
       return asMcpResult(response);
     } catch (error) {
-      // A cancelled/timed-out MCP request no longer has a consumer for the native result. Revoke
-      // the whole turn capability so the broker drops the pending invocation and every later call
-      // from that abandoned ChatGPT response fails explicitly against its retired binding.
+      if (error instanceof TurnBrokerTimeoutError) {
+        const toolName = wireName(tool);
+        console.error(
+          `[chatgpt-web-mcp] ${toolName} did not complete within ${timeoutMs}ms; preserving its turn binding for native reconnect`,
+        );
+        return result({
+          code: "codex_tool_timeout",
+          tool: toolName,
+          timeout_ms: timeoutMs,
+          retryable: true,
+          binding_preserved: true,
+          message: `Codex tool ${toolName} did not complete before the MCP transport deadline. The current turn binding remains active and the original call will be replayed to the next native Codex consumer. Retry this same tool request only if the response continues.`,
+        }, true);
+      }
+      // Explicit cancellation and non-timeout broker failures have no safe consumer to resume.
+      // Keep the existing fail-closed behavior for those cases.
       try {
         await callTurnBroker(options.brokerSocketPath, {
           method: "release",
@@ -574,19 +596,6 @@ export async function runChatGptMcpServer(options: {
           "Codex Native invocation failed and its abandoned broker binding could not be retired",
         );
       }
-      if (error instanceof TurnBrokerTimeoutError) {
-        const toolName = wireName(tool);
-        console.error(
-          `[chatgpt-web-mcp] ${toolName} did not complete within ${timeoutMs}ms; retired its turn binding`,
-        );
-        return result({
-          code: "codex_tool_timeout",
-          tool: toolName,
-          timeout_ms: timeoutMs,
-          retryable: false,
-          message: `Codex tool ${toolName} did not complete before the MCP transport deadline. The current turn binding was retired; do not retry it in this ChatGPT response.`,
-        }, true);
-      }
       throw error;
     }
   };
@@ -597,7 +606,7 @@ export async function runChatGptMcpServer(options: {
     nestedToolName: string,
     freeform: boolean,
     payload: { arguments?: Record<string, unknown>; input?: string },
-    signal?: AbortSignal,
+    extra: McpRequestExtra,
   ) => {
     const gateway = execGateway(bound);
     if (!gateway) {
@@ -605,7 +614,7 @@ export async function runChatGptMcpServer(options: {
     }
     return invoke(bindingId, bound, gateway, {
       input: execGatewayProgram(nestedToolName, freeform, payload, bound.tools.map(wireName)),
-    }, signal);
+    }, extra);
   };
 
   server.registerTool(
@@ -645,7 +654,7 @@ export async function runChatGptMcpServer(options: {
         const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
         if (tool) {
           const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
-          return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra.signal);
+          return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra);
         }
         const gateway = execGateway(bound);
         if (!gateway) {
@@ -653,7 +662,7 @@ export async function runChatGptMcpServer(options: {
         }
         return invoke(claimed.bindingId, bound, gateway, {
           input: execCommandGatewayProgram(execCommandArguments, shellCommandArguments),
-        }, extra.signal);
+        }, extra);
       },
     ),
   );
@@ -687,8 +696,8 @@ export async function runChatGptMcpServer(options: {
           ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
         } };
         return tool
-          ? invoke(claimed.bindingId, bound, tool, payload, extra.signal)
-          : invokeNestedNative(claimed.bindingId, bound, "write_stdin", false, payload, extra.signal);
+          ? invoke(claimed.bindingId, bound, tool, payload, extra)
+          : invokeNestedNative(claimed.bindingId, bound, "write_stdin", false, payload, extra);
       },
     ),
   );
@@ -709,10 +718,10 @@ export async function runChatGptMcpServer(options: {
         const { patch } = input;
         const bound = claimed.environment;
         const tool = exactTool(bound, "apply_patch");
-        if (!tool) return invokeNestedNative(claimed.bindingId, bound, "apply_patch", true, { input: patch }, extra.signal);
+        if (!tool) return invokeNestedNative(claimed.bindingId, bound, "apply_patch", true, { input: patch }, extra);
         return tool.freeform
-          ? invoke(claimed.bindingId, bound, tool, { input: patch }, extra.signal)
-          : invoke(claimed.bindingId, bound, tool, { arguments: { input: patch } }, extra.signal);
+          ? invoke(claimed.bindingId, bound, tool, { input: patch }, extra)
+          : invoke(claimed.bindingId, bound, tool, { arguments: { input: patch } }, extra);
       },
     ),
   );
@@ -739,8 +748,8 @@ export async function runChatGptMcpServer(options: {
         const tool = exactTool(bound, "view_image");
         const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
         return tool
-          ? invoke(claimed.bindingId, bound, tool, payload, extra.signal)
-          : invokeNestedNative(claimed.bindingId, bound, "view_image", false, payload, extra.signal);
+          ? invoke(claimed.bindingId, bound, tool, payload, extra)
+          : invokeNestedNative(claimed.bindingId, bound, "view_image", false, payload, extra);
       },
     ),
   );
@@ -800,7 +809,7 @@ export async function runChatGptMcpServer(options: {
               // our own MCP namespace in Zero Risk).
               excludedNames: excludedGatewayNames,
             }),
-          }, extra.signal);
+          }, extra);
           const catalog = gatewayToolCatalogPage(response, new Set(excludedGatewayNames));
           nestedTotal = catalog.total;
           nestedPage = catalog.tools.map(tool => ({
@@ -887,19 +896,19 @@ export async function runChatGptMcpServer(options: {
             input: execGatewayProgram(wire_name, input !== undefined, {
               ...(input !== undefined ? { input } : { arguments: invocationArguments }),
             }, bound.tools.map(wireName)),
-          }, extra.signal);
+          }, extra);
         }
         if (tool.freeform) {
           if (input === undefined) throw new Error(`Freeform Codex tool ${wire_name} requires input`);
           if (args && Object.keys(args).length > 0) throw new Error(`Freeform Codex tool ${wire_name} does not accept arguments`);
           return invoke(claimed.bindingId, bound, tool, {
             input: tool === execGateway(bound) ? transportBoundRawExecProgram(input, wireName(tool)) : input,
-          }, extra.signal);
+          }, extra);
         }
         if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);
         const invocationArguments = args ?? {};
         assertBrowserToolArguments(tool, invocationArguments);
-        return invoke(claimed.bindingId, bound, tool, { arguments: invocationArguments }, extra.signal);
+        return invoke(claimed.bindingId, bound, tool, { arguments: invocationArguments }, extra);
       });
     },
   );

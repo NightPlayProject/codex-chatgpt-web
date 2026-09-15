@@ -2329,6 +2329,57 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test("replays a pending native invocation after a broker response timeout and deduplicates its retry", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-replay-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    const token = await broker.register(environment);
+    try {
+      const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+      const first = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, 25);
+      await expect(first).rejects.toThrow("timed out");
+
+      // The timed-out MCP socket no longer owns the result, but the broker keeps the invocation
+      // available to the next native owner instead of retiring the whole turn.
+      const retry = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, null);
+      await Bun.sleep(25);
+      const [request] = await broker.nextToolBatch(token);
+      expect(request).toMatchObject({ wireName: "exec_command", arguments: { cmd: "reconnect-safe" } });
+      expect(await broker.nextToolBatch(token)).toEqual([request]);
+      broker.completeTool(token, request!.callId, toolResult({ output: "reconnected" }));
+      expect(await retry).toEqual(toolResult({ output: "reconnected" }));
+
+      // If the native result won the race with the MCP deadline, a later retry receives the
+      // committed result instead of starting the side-effecting native tool again.
+      const lateRetry = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, null);
+      expect(await lateRetry).toEqual(toolResult({ output: "reconnected" }));
+    } finally {
+      broker.revoke(token);
+      await broker.close();
+    }
+  });
+
   test("makes capability claim retries idempotent until the turn is revoked", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-claim-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
@@ -3612,7 +3663,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 10_000);
 
-  test("a native tool deadline returns an explicit MCP timeout instead of a transport failure", async () => {
+  test("a native tool deadline returns a retryable MCP timeout before the turn TTL retires it", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-mcp-timeout-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
     const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
@@ -3660,7 +3711,8 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(timeoutResult.structuredContent).toMatchObject({
         code: "codex_tool_timeout",
         tool: "exec_command",
-        retryable: false,
+        retryable: true,
+        binding_preserved: true,
       });
       expect(JSON.stringify(timeoutResult.content)).toContain("did not complete before the MCP transport deadline");
       await retirement;

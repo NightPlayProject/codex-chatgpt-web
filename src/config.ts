@@ -213,7 +213,9 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     proAvailable: false,
     experimentalBiggerContext: false,
     zeroRiskProEnabled: false,
-    autoApproveToolCalls: false,
+    // Full automatic mode is intended to expose the active native Codex tool surface without
+    // stopping on a per-call ChatGPT connector prompt. Zero Risk remains explicitly manual below.
+    autoApproveToolCalls: mode === "full",
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
   };
@@ -518,6 +520,14 @@ function parseConfig(value: unknown, path: string): AppConfig {
     proAvailable,
     experimentalBiggerContext,
     zeroRiskProEnabled,
+    // A stale v3 config may still contain false from releases that required an explicit opt-in.
+    // Full automatic mode now owns this setting so a runtime upgrade does not leave tool calls
+    // waiting for an approval card that the user already authorized through the connector.
+    autoApproveToolCalls: browserInteractionMode === "manual"
+      ? false
+      : parsed.mode === "full"
+        ? true
+        : parsed.autoApproveToolCalls,
   } as AppConfig;
 }
 
@@ -572,7 +582,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
-      autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
+      autoApproveToolCalls: manual ? false : config.mode === "full" ? true : config.autoApproveToolCalls,
     },
   };
 }

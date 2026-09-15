@@ -264,6 +264,9 @@ function baseConfig(
     delete config.browserHostDescriptorPath;
   }
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
+  if (config.mode === "full") {
+    config.autoApproveToolCalls = config.browserInteractionMode === "manual" ? false : true;
+  }
   if (options.experimentalBiggerContext !== undefined) {
     config.experimentalBiggerContext = options.experimentalBiggerContext;
   }

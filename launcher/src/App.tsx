@@ -62,7 +62,8 @@ export function App() {
         ? {
             ...current,
             state,
-            smokePassed: current.smokePassed,
+            smokePassed: current.smokePassed
+              || (state.browserSmokePassed === true && state.browserSmokeVersion === current.version),
           }
         : current);
     });
@@ -90,7 +91,8 @@ export function App() {
       ? {
           ...current,
           state,
-          smokePassed: current.smokePassed,
+          smokePassed: current.smokePassed
+            || (state.browserSmokePassed === true && state.browserSmokeVersion === current.version),
         }
       : current);
   }, []);

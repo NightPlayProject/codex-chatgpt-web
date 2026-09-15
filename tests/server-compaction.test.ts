@@ -490,7 +490,7 @@ for (const format of ["v1", "v2"] as const) test(`${format} native /goal keeps t
   expect(starts).toBe(1);
 
   // A different thread/effort, rewritten or aborted source, malformed native claim, dual current
-  // instruction, or unrecognized checkpoint must not inherit this goal.
+  // instruction before the goal wrapper, or unrecognized checkpoint must not inherit this goal.
   const invalid = [
     { ...goalRequest, client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...goalMetadata, thread_id: "wrong_thread" }) } },
     // The routed model keeps the same Sol backend but changes the authoritative reasoning effort,
@@ -519,14 +519,14 @@ for (const format of ["v1", "v2"] as const) test(`${format} native /goal keeps t
       } } : item) },
     { ...goalRequest, input: goalRequest.input.map(item => (item as { id?: string }).id === goal.id
       ? { ...goal, role: "developer" } : item) },
-    { ...goalRequest, input: [...goalRequest.input, {
+    { ...goalRequest, input: [...goalRequest.input.slice(0, -1), {
       type: "message", role: "user", id: `msg_goal_dual_human_${format}`,
       content: [{ type: "input_text", text: "A simultaneous current human instruction" }],
       internal_chat_message_metadata_passthrough: {
         turn_id: goalMetadata.turn_id,
         content_item_kinds: ["user.text"],
       },
-    }] },
+    }, goal] },
   ];
   for (const body of invalid) {
     const rejected = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
@@ -740,7 +740,8 @@ test("native /goal automatic continuation accepts the exact prior /goal command 
   }
 
   const conflicting = structuredClone(body);
-  conflicting.input.push({
+  // A human message before the native goal is ambiguous; a later message is valid steering.
+  conflicting.input.splice(conflicting.input.length - 1, 0, {
     type: "message", role: "user", id: "msg_goal_native_conflicting_human",
     content: [{ type: "input_text", text: "A simultaneous current human instruction" }],
     internal_chat_message_metadata_passthrough: {

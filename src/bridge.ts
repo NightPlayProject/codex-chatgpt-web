@@ -1,4 +1,4 @@
-import type { AdapterEvent, CodexMessagePhase, CodexProviderContinuationState, CodexUsage } from "./types";
+import { namespacedToolName, type AdapterEvent, type CodexMessagePhase, type CodexProviderContinuationState, type CodexUsage } from "./types";
 import { adapterFailureFromMessage, classifyError, type CodexErrorPayload } from "./lib/errors";
 import { encodeCompactionSummary } from "./responses/compaction";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "./responses/reasoning-envelope";
@@ -535,8 +535,13 @@ export function bridgeToResponsesSSE(
               const mapped = toolNsMap?.get(event.name);
               const realName = mapped?.name ?? event.name;
               const ns = mapped?.namespace;
-              const toolSearch = toolSearchToolNames?.has(realName) ?? false;
-              const freeform = !toolSearch && (freeformToolNames?.has(realName) ?? false);
+              const wire = namespacedToolName(ns, realName);
+              const toolSearch = toolSearchToolNames?.has(wire)
+                || (wire !== realName && (toolSearchToolNames?.has(realName) ?? false))
+                || false;
+              const freeform = !toolSearch && (freeformToolNames?.has(wire)
+                || (wire !== realName && (freeformToolNames?.has(realName) ?? false))
+                || false);
               const itemId = `${toolSearch ? "tsc" : freeform ? "ctc" : "fc"}_${uuid()}`;
               const item = toolSearch
                 ? { type: "tool_search_call", id: itemId, call_id: event.id, execution: "client", arguments: {}, status: "in_progress" }
@@ -937,8 +942,13 @@ export function buildResponseJSON(
     const mapped = options?.toolNsMap?.get(currentToolCallName);
     const realName = mapped?.name ?? currentToolCallName;
     const ns = mapped?.namespace;
-    const toolSearch = options?.toolSearchToolNames?.has(realName) ?? false;
-    const freeform = !toolSearch && (options?.freeformToolNames?.has(realName) ?? false);
+    const wire = namespacedToolName(ns, realName);
+    const toolSearch = options?.toolSearchToolNames?.has(wire)
+      || (wire !== realName && (options?.toolSearchToolNames?.has(realName) ?? false))
+      || false;
+    const freeform = !toolSearch && (options?.freeformToolNames?.has(wire)
+      || (wire !== realName && (options?.freeformToolNames?.has(realName) ?? false))
+      || false);
     if (toolSearch) {
       output.push({
         type: "tool_search_call", id: `tsc_${uuid()}`,

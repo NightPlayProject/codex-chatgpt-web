@@ -72,6 +72,7 @@ describe("native /models augmentation", () => {
         supported_reasoning_levels: [{ effort: route.codexEffort, description: route.displayName }],
         multi_agent_version: "v2",
         supported_in_api: true,
+        supports_search_tool: false,
         priority: 2,
         context_window: limits.contextWindow,
         max_context_window: limits.contextWindow,
@@ -167,6 +168,7 @@ describe("native /models augmentation", () => {
       CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro).map(route => route.slug),
     );
     expect(web.every(model => model.tool_mode === null)).toBe(true);
+    expect(web.every(model => model.supports_search_tool === false)).toBe(true);
     expect(web.every(model => model.multi_agent_version === "v2")).toBe(true);
     expect(web.every(model => (model.supported_reasoning_levels as unknown[]).length === 1)).toBe(true);
     expect(web.map(model => ({
@@ -298,6 +300,7 @@ describe("native /models augmentation", () => {
     expect(web.length).toBe(3);
     expect(web.every(model => model.shell_type === "shell_command")).toBe(true);
     expect(web.every(model => model.tool_mode === null)).toBe(true);
+    expect(web.every(model => model.supports_search_tool === false)).toBe(true);
   });
 
   test("uses a ChatGPT-visible template even when it is not available to API-key auth", () => {

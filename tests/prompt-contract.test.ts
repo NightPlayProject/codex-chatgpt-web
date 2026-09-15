@@ -118,6 +118,12 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(tokenMatches).toHaveLength(1);
   expect(compiled.text).toContain("[retired turn handle]");
   expect(transportOnly).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
+  expect(transportOnly).toContain("Codex Native access has one universal tool path for every local capability: direct shell and process tools, browser and computer-use tools, MCP and connector/app tools, and subagent tools are all callable when the current harness advertises them.");
+  expect(transportOnly).toContain("The visible static native tool list is authoritative on current Codex clients where deferred tool_search is unavailable");
+  expect(transportOnly).toContain("If tool_search is explicitly advertised and the required capability is not visible, use it with a focused query to load deferred tools");
+  expect(transportOnly).toContain("if codex_tool_inventory is exposed by the bridge, use it with include_schema=true as the exact registry fallback");
+  expect(transportOnly).toContain("Use the exact wire_name and parameters returned by codex_tool_inventory with codex_tool_call");
+  expect(transportOnly).toContain("do not report that there is no active local connection until the inventory or the attempted native call returns a concrete result.");
   expect(transportOnly).toContain("Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
   expect(transportOnly).toContain("Use actual Codex Native results as evidence for local observations and effects.");
   expect(transportOnly).toContain("A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.");
@@ -127,7 +133,7 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(transportOnly).toContain("Write the user-facing final answer only after the last required tool result has settled.");
   expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
-  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
+  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex\.control\.turn_complete/);
   expect(transportOnly).not.toMatch(/expired|invalid|revoked|blocked|safety|security layer|permission gate/i);
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");

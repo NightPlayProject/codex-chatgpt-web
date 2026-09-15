@@ -196,8 +196,43 @@ function normalizedToolNamespace(value: unknown): string | undefined {
     : undefined;
 }
 
-function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
-  if (!tools) return undefined;
+/**
+ * Codex has emitted tool collections as arrays, namespace descriptors with an array of children,
+ * and object maps across Responses and Responses Lite revisions. Preserve map keys when a
+ * descriptor omits its name; those keys are often the only exact wire name available for a native
+ * MCP or Computer Use tool.
+ */
+function toolContainerEntries(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter(isObj);
+  if (!isObj(value)) return [];
+
+  const looksLikeDescriptor = typeof value.type === "string"
+    || typeof value.name === "string"
+    || "tools" in value
+    || "parameters" in value
+    || "format" in value;
+  if (looksLikeDescriptor) return [value];
+
+  return Object.entries(value).flatMap(([key, raw]) => {
+    if (Array.isArray(raw)) {
+      return [{ type: "namespace", name: key, tools: raw }];
+    }
+    if (!isObj(raw)) return [];
+    const entry = { ...raw };
+    // Namespace maps use the key as the namespace and retain an explicitly supplied child name.
+    // Direct tool maps use the key as the exact callable wire name.
+    if (entry.type === "namespace" || "tools" in entry) {
+      if (typeof entry.name !== "string" || entry.name.length === 0) entry.name = key;
+    } else {
+      entry.name = key;
+    }
+    return [entry];
+  });
+}
+
+function buildTools(tools: unknown): CodexTool[] | undefined {
+  const entries = toolContainerEntries(tools);
+  if (entries.length === 0) return undefined;
   const out: CodexTool[] = [];
   const pushFn = (t: Record<string, unknown>, namespace?: string) => {
     const tool: CodexTool = {
@@ -209,7 +244,7 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
     if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
-  const pushFreeform = (t: Record<string, unknown>) => {
+  const pushFreeform = (t: Record<string, unknown>, namespace?: string) => {
     const tool: CodexTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
@@ -225,56 +260,57 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
       },
       freeform: true,
     };
+    if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
-  for (const t of tools) {
-    if (!isObj(t)) continue;
-    if (t.type === "function" && typeof t.name === "string") {
-      pushFn(t);
-    } else if (t.type === "namespace" && Array.isArray(t.tools)) {
-      // Responses Lite groups ordinary native functions and the native freeform `exec` tool under
-      // the default `functions` namespace. Flatten normal functions from every namespace, and the
-      // official freeform variant only from that default namespace. Non-default custom namespaces
-      // need a distinct round-trip contract and must not be silently exposed as function calls.
-      const ns = normalizedToolNamespace(t.name);
-      for (const inner of t.tools as unknown[]) {
-        if (!isObj(inner) || typeof inner.name !== "string") continue;
-        if (inner.type === "function") pushFn(inner, ns);
-        else if (t.name === DEFAULT_FUNCTION_NAMESPACE && inner.type === "custom") pushFreeform(inner);
-      }
+  const pushToolSearch = (t: Record<string, unknown>, namespace?: string) => {
+    const tool: CodexTool = {
+      name: typeof t.name === "string" && t.name.length > 0 ? t.name : "tool_search",
+      description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
+      parameters: (isObj(t.parameters) ? t.parameters : {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query for tools to load." },
+          limit: { type: "number", description: "Maximum number of tools to return." },
+        },
+        required: ["query"],
+      }) as Record<string, unknown>,
+      toolSearch: true,
+    };
+    if (namespace) tool.namespace = namespace;
+    out.push(tool);
+  };
+  const append = (t: Record<string, unknown>, inheritedNamespace?: string): void => {
+    if (t.type === "namespace") {
+      const namespace = normalizedToolNamespace(t.name) ?? inheritedNamespace;
+      for (const inner of toolContainerEntries(t.tools)) append(inner, namespace);
+      return;
     }
-    else if (t.type === "custom" && typeof t.name === "string") {
+
+    const name = typeof t.name === "string" && t.name.length > 0 ? t.name : undefined;
+    if (!name) return;
+    const namespace = normalizedToolNamespace(t.namespace) ?? inheritedNamespace;
+    if (t.type === "function") {
+      pushFn(t, namespace);
+    } else if (t.type === "custom") {
       // Freeform custom tool (e.g. apply_patch). Chat models can't emit a lark grammar, so expose a
       // function with a single string `input` carrying the raw tool body; the bridge relays the model's
       // call back as a custom_tool_call (Codex's freeform handler rejects a function_call → fatal abort).
-      pushFreeform(t);
-    }
-    else if (t.type === "tool_search") {
+      pushFreeform(t, namespace);
+    } else if (t.type === "tool_search") {
       // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
       // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
-      out.push({
-        name: "tool_search",
-        description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: (isObj(t.parameters) ? t.parameters : {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Search query for tools to load." },
-            limit: { type: "number", description: "Maximum number of tools to return." },
-          },
-          required: ["query"],
-        }) as Record<string, unknown>,
-        toolSearch: true,
-      });
-    }
-    else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
+      pushToolSearch(t, namespace);
+    } else if (t.type !== "web_search" && t.type !== "image_generation") {
       // Any other named tool (for example a native computer-use tool type this parser does not
       // model) is client-executed. Pass it through as a function so the routed model can call it
       // naturally and the bridge can relay it as a function_call.
-      pushFn(t);
+      pushFn(t, namespace);
     }
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
     // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
-  }
+  };
+  for (const t of entries) append(t);
   return out.length > 0 ? out : undefined;
 }
 
@@ -440,8 +476,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // merge through the exact buildTools path so surface detection (collabSurface)
         // and chat-model tool listing see them. The item itself never becomes a message;
         // the native passthrough keeps it verbatim in _rawBody.
-        const at = item as { tools?: unknown[] };
-        if (Array.isArray(at.tools)) loadedToolSpecs.push(...at.tools);
+        const at = item as { tools?: unknown };
+        loadedToolSpecs.push(...toolContainerEntries(at.tools));
         continue;
       }
 
@@ -651,22 +687,12 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       if (effectiveType === "tool_search_output") {
         pendingReasoning.length = 0;
         // Pair the tool_search call with its result so the model sees what was loaded.
-        const out = item as { call_id?: string; status?: string; tools?: unknown[] };
-        const specs = Array.isArray(out.tools) ? (out.tools as Record<string, unknown>[]) : [];
+        const out = item as { call_id?: string; status?: string; tools?: unknown };
+        const specs = toolContainerEntries(out.tools);
         loadedToolSpecs.push(...specs);
         // List the EXACT wire names the model must call (flattened for namespaced specs), matching
         // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
-        const wireNames: string[] = [];
-        for (const spec of specs) {
-          if (spec.type === "namespace" && Array.isArray(spec.tools)) {
-            const namespace = normalizedToolNamespace(spec.name);
-            for (const inner of spec.tools as Record<string, unknown>[]) {
-              if (typeof inner.name === "string") wireNames.push(namespacedToolName(namespace, inner.name));
-            }
-          } else if (typeof spec.name === "string") {
-            wireNames.push(spec.name);
-          }
-        }
+        const wireNames = (buildTools(specs) ?? []).map(tool => namespacedToolName(tool.namespace, tool.name));
         const failed = typeof out.status === "string" && out.status !== "completed" && out.status !== "success";
         messages.push({
           role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
@@ -707,7 +733,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     }
   }
 
-  const declaredTools = buildTools(data.tools as unknown[] | undefined) ?? [];
+  const declaredTools = buildTools(data.tools) ?? [];
   const loadedTools = buildTools(loadedToolSpecs) ?? [];
   const seenTools = new Set<string>();
   const mergedTools = [...declaredTools, ...loadedTools]

@@ -127,8 +127,15 @@ export function buildChatGptWebModel(
     ...(multiAgentVersion === undefined
       ? {}
       : { multi_agent_version: multiAgentVersion }),
+    // The current Codex desktop/CLI line can advertise computer_use while removing tool_search.
+    // If a routed model inherits supports_search_tool=true, Codex defers MCP/plugin schemas into
+    // Responses Lite additional_tools (and may omit the callable native surface entirely). Keep
+    // the Web rows eager so every concrete native MCP/plugin tool, including Computer Use, is
+    // available to the bridge on those clients. Native catalog rows retain their official value.
+    supports_search_tool: false,
     // Code mode collapses the outer registry into an exec gateway; routed models need the regular
-    // Responses tool surface so MCP namespaces, deferred tool_search, and custom tools reach us.
+    // Responses tool surface so static MCP/plugin tools, and tool_search on clients that still
+    // expose it, reach us.
     tool_mode: null,
     upgrade: null,
     default_reasoning_level: route.codexEffort,

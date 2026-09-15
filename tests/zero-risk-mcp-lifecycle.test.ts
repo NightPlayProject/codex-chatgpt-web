@@ -278,6 +278,8 @@ describe("Zero Risk public MCP ABI", () => {
     try {
       await client.connect(transport);
       expect(client.getInstructions()).toContain("begin with codex_turn_start using the request_id");
+      expect(client.getInstructions()).toContain("Direct and deferred shell, process, browser/computer, MCP, connector/app, and subagent tools use the same bridge");
+      expect(client.getInstructions()).toContain("call codex_tool_inventory with a focused query and include_schema=true");
       expect(client.getInstructions()).toContain("send the complete answer with codex_turn_complete");
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([

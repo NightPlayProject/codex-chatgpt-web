@@ -158,6 +158,7 @@ async function executeGatewayProgram(
   availableToolNames: string[],
   calls: GatewayProgramCall[],
   dynamicRegistry = false,
+  includeRegistry = true,
 ): Promise<Array<{ type: "text"; text: string }>> {
   const emitted: Array<{ type: "text"; text: string }> = [];
   const implementations = Object.fromEntries(availableToolNames.map(name => [
@@ -184,7 +185,9 @@ async function executeGatewayProgram(
   const ignoreOutput = (_value: unknown): void => {};
   await execute(
     nestedTools,
-    availableToolNames.map(name => ({ name, description: `${name} test tool` })),
+    includeRegistry
+      ? availableToolNames.map(name => ({ name, description: `${name} test tool` }))
+      : undefined,
     emitText,
     ignoreOutput,
     ignoreOutput,
@@ -3302,6 +3305,41 @@ describe("ChatGPT outer-native harness v4", () => {
         type: "text",
         text: JSON.stringify({ output: "web__run", exit_code: 0 }),
       }]);
+
+      // Newer MCP registries may use punctuation in an exact wire name and may omit ALL_TOOLS
+      // while still exposing callable properties on the native tools object. The gateway must
+      // preserve that name instead of sanitizing it into a different function key.
+      const punctuationInventory = await inventoryThroughGateway(
+        "desktop/process",
+        true,
+        ["exec", "mcp__desktop/process-list"],
+      );
+      expect(punctuationInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{ wire_name: "mcp__desktop/process-list", name: "mcp__desktop/process-list", kind: "gateway" }],
+      });
+
+      const punctuationCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "mcp__desktop/process-list",
+        arguments: { filter: "Task Manager" },
+      });
+      const [punctuationRequest] = await broker.nextToolBatch(token);
+      const punctuationCalls: GatewayProgramCall[] = [];
+      const punctuationContent = await executeGatewayProgram(
+        punctuationRequest!.input!,
+        ["mcp__desktop/process-list"],
+        punctuationCalls,
+        false,
+        false,
+      );
+      expect(punctuationCalls).toEqual([{
+        name: "mcp__desktop/process-list",
+        input: { filter: "Task Manager" },
+      }]);
+      broker.completeTool(token, punctuationRequest!.callId, { content: punctuationContent });
+      expect((await punctuationCall).isError).not.toBe(true);
 
       const waitPromise = call("codex_tool_call", {
         turn_token: token,

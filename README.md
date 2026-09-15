@@ -162,10 +162,12 @@ npm install -g open-computer-use@0.3.4
 codex mcp add open-computer-use -- open-computer-use mcp
 ```
 
-Fully quit and reopen Codex after registering it. A fresh task can discover the deferred
-`open-computer-use` tools through native `tool_search`; no separate desktop-control tunnel or connector is
-required. If no desktop-control MCP is installed, Full mode continues to provide the rest of the
-active Codex harness normally.
+Fully quit and reopen Codex after registering it. Full mode eagerly exposes the concrete
+`open-computer-use` tools to the bridge so current Codex clients whose deferred `tool_search` path
+is unavailable can still call them. Clients that advertise native `tool_search` may continue to use
+it for tools that remain deferred; no separate desktop-control tunnel or connector is required. If
+no desktop-control MCP is installed, Full mode continues to provide the rest of the active Codex
+harness normally.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See

@@ -47,6 +47,7 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
       effective_context_window_percent?: number;
       auto_compact_token_limit?: number;
       supported_in_api?: boolean;
+      supports_search_tool?: boolean;
       priority?: number;
       multi_agent_version?: string;
     }>;
@@ -71,6 +72,7 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
     expect(model.effective_context_window_percent).toBe(limits.effectiveContextWindowPercent);
     expect(model.auto_compact_token_limit).toBe(limits.autoCompactTokenLimit);
     expect(model.supported_in_api).toBe(true);
+    expect(model.supports_search_tool).toBe(false);
     expect(model.priority).toBe(1);
     expect(model.multi_agent_version).toBe("v2");
   }
@@ -130,6 +132,7 @@ test("Zero Risk returns one generic Web row without using scanned capabilities",
     description: CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE.description,
     visibility: "list",
     supported_in_api: true,
+    supports_search_tool: false,
     supported_reasoning_levels: [{ effort: "low", description: CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE.displayName }],
     tool_mode: null,
     upgrade: null,
@@ -166,10 +169,12 @@ test("ChatGPT-only native catalog rows do not turn model discovery into a 502", 
   );
 
   expect(response.status).toBe(200);
-  const body = await response.json() as { models: Array<{ slug: string; supported_in_api?: boolean }> };
+  const body = await response.json() as {
+    models: Array<{ slug: string; supported_in_api?: boolean; supports_search_tool?: boolean }>;
+  };
   expect(body.models[0]).toMatchObject({ slug: "gpt-chatgpt-only", supported_in_api: false });
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/")))
     .toHaveLength(3);
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))
-    .every(model => model.supported_in_api === true)).toBe(true);
+    .every(model => model.supported_in_api === true && model.supports_search_tool === false)).toBe(true);
 });

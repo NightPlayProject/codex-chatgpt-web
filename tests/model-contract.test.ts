@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode } from "../src/adapters/chatgpt-web/model";
 
 test("the browser adapter maps fixed routed efforts to the visible ChatGPT modes", () => {
-  const capabilities = { localToolsEnabled: true, solAvailable: true, proAvailable: true };
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   expect(resolveChatGptWebModelMode(CHATGPT_WEB_MODEL_ID, "low", capabilities)).toMatchObject({
     displayLabel: "Instant",
     uiEffortIndex: 0,

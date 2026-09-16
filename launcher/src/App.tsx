@@ -14,6 +14,10 @@ import { Icon, type IconName } from "./icons";
 import type {
   BrowserInteractionMode,
   BrowserState,
+  AccountUsageSnapshot,
+  AccountUsageStats,
+  AccountSwitcherSnapshot,
+  CodexAccountSummary,
   DoctorReport,
   Language,
   LauncherSnapshot,
@@ -354,6 +358,7 @@ function LauncherShell({
   const [sidebarOpen, setSidebarOpen] = useState(!compactAtMount);
   const [compactSidebar, setCompactSidebar] = useState(compactAtMount);
   const [browserSlot, setBrowserSlot] = useState<HTMLDivElement | null>(null);
+  const [accountSnapshot, setAccountSnapshot] = useState<AccountSwitcherSnapshot>(snapshot.accounts);
   const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
@@ -377,6 +382,29 @@ function LauncherShell({
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
   const updateVersion = "version" in snapshot.update ? snapshot.update.version : null;
   const selectedManualTab = browser?.tabs.find(tab => tab.active && tab.interactionMode === "manual");
+
+  useEffect(() => {
+    const unsubscribe = api!.onAccountsState(setAccountSnapshot);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    if (surface !== "accounts") return;
+    let cancelled = false;
+    const refresh = () => {
+      void api!.accounts().then(next => {
+        if (!cancelled) setAccountSnapshot(next);
+      }).catch((cause) => {
+        if (!cancelled) setError(messageOf(cause));
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [setError, surface]);
 
   useEffect(() => {
     if (snapshot.state.browserInteractionMode === "manual") {
@@ -629,6 +657,12 @@ function LauncherShell({
                 />
               ) : null}
               <SidebarItem
+                active={surface === "accounts"}
+                icon="accounts"
+                label={copy.accountSwitcher}
+                onClick={() => navigateSurface("accounts")}
+              />
+              <SidebarItem
                 active={surface === "settings"}
                 icon="settings"
                 label={copy.settings}
@@ -687,6 +721,7 @@ function LauncherShell({
                   setSurface("browser");
                 }}
                 operation={operation}
+                platform={snapshot.platform}
                 setError={setError}
                 snapshot={snapshot}
                 updateState={updateState}
@@ -694,6 +729,15 @@ function LauncherShell({
             ) : null}
             {surface === "activity" ? (
               <ActivitySurface copy={copy} language={language} logs={logs} setError={setError} />
+            ) : null}
+            {surface === "accounts" ? (
+              <AccountSwitcherSurface
+                copy={copy}
+                language={language}
+                setError={setError}
+                setSnapshot={setAccountSnapshot}
+                snapshot={accountSnapshot}
+              />
             ) : null}
             {surface === "settings" ? (
               <SettingsSurface
@@ -1231,6 +1275,7 @@ function McpSurface({
   language,
   onDone,
   operation,
+  platform,
   setError,
   snapshot,
   updateState,
@@ -1241,6 +1286,7 @@ function McpSurface({
   language: Language;
   onDone: () => void;
   operation: OperationState | null;
+  platform: string;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
@@ -1258,6 +1304,7 @@ function McpSurface({
   );
   const [replacingCredentials, setReplacingCredentials] = useState(false);
   const [localBusy, setLocalBusy] = useState(false);
+  const [nativeComputerUseReady, setNativeComputerUseReady] = useState(false);
   const busy = localBusy || operation?.status === "running";
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const verified = !configuringInactiveMode && snapshot.state.mcpSetupComplete === true;
@@ -1323,6 +1370,20 @@ function McpSurface({
     setDoctor(null);
     try {
       setDoctor(await api!.verifyMcp());
+      updateState((await api!.snapshot()).state);
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setLocalBusy(false);
+    }
+  };
+  const setupNativeComputerUse = async () => {
+    if (busy) return;
+    setLocalBusy(true);
+    setError(null);
+    try {
+      await api!.setupNativeComputerUse();
+      setNativeComputerUseReady(true);
       updateState((await api!.snapshot()).state);
     } catch (cause) {
       setError(messageOf(cause));
@@ -1457,6 +1518,19 @@ function McpSurface({
                   : copy.mcpCatalogRequired}
               </p>
             ) : null}
+            {step === 1 && !devProfile && platform === "win32" ? (
+              <div className="native-computer-use-actions">
+                <NoticeRow icon="mcp" tone={nativeComputerUseReady ? "success" : "warning"}>
+                  <span>
+                    <strong>{nativeComputerUseReady ? copy.nativeComputerUseReady : copy.nativeComputerUseTitle}</strong>
+                    <small>{copy.nativeComputerUseBody}</small>
+                  </span>
+                </NoticeRow>
+                <SecondaryButton disabled={busy} onClick={() => void setupNativeComputerUse()}>
+                  {nativeComputerUseReady ? copy.nativeComputerUseReadyAction : copy.installNativeComputerUse}
+                </SecondaryButton>
+              </div>
+            ) : null}
             {step === 2 ? (
               <div className="connector-actions">
                 <NoticeRow icon="alert" tone="warning">
@@ -1572,6 +1646,732 @@ function ActivitySurface({
         ))}
       </div>
     </ContentSurface>
+  );
+}
+
+function AccountSwitcherSurface({
+  copy,
+  language,
+  setError,
+  setSnapshot,
+  snapshot,
+}: {
+  copy: Copy;
+  language: Language;
+  setError: (error: string | null) => void;
+  setSnapshot: (snapshot: AccountSwitcherSnapshot) => void;
+  snapshot: AccountSwitcherSnapshot;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+  const [switchingId, setSwitchingId] = useState<string | null>(null);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
+  const [loginPending, setLoginPending] = useState(false);
+  const [showEmails, setShowEmails] = useState(() => {
+    try {
+      return window.localStorage.getItem("codex-web-gpt.account-emails") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(snapshot.activeAccountId);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("codex-web-gpt.account-emails", String(showEmails));
+    } catch {}
+  }, [showEmails]);
+
+  useEffect(() => {
+    if (selectedAccountId && snapshot.accounts.some(account => account.id === selectedAccountId)) return;
+    setSelectedAccountId(snapshot.activeAccountId || snapshot.accounts[0]?.id || null);
+  }, [selectedAccountId, snapshot.activeAccountId, snapshot.accounts]);
+
+  const refresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      setSnapshot(await api!.accounts({ refreshUsage: snapshot.supported }));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const addCurrent = async () => {
+    if (refreshing || switchingId !== null || removingId !== null) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      setSnapshot(await api!.addCurrentAccount());
+      setAddDialogOpen(false);
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const switchAccount = async (account: CodexAccountSummary) => {
+    if (account.isActive || switchingId !== null || !snapshot.officialApp.canSwitch) return;
+    setSwitchingId(account.id);
+    setSelectedAccountId(account.id);
+    setError(null);
+    try {
+      setSnapshot(await api!.switchAccount(account.id));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setSwitchingId(null);
+    }
+  };
+
+  const addAccount = async () => {
+    if (refreshing || switchingId !== null || removingId !== null) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      const result = await api!.addAccount();
+      if (result) {
+        setSnapshot(result);
+        setAddDialogOpen(false);
+      }
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const loginAccount = async () => {
+    if (refreshing || switchingId !== null || removingId !== null || loginPending) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      await api!.startAccountLogin();
+      setLoginPending(true);
+      const result = await api!.completeAccountLogin();
+      setSnapshot(result);
+      setAddDialogOpen(false);
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setLoginPending(false);
+      setRefreshing(false);
+    }
+  };
+
+  const cancelLogin = async () => {
+    try {
+      await api!.cancelAccountLogin();
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setLoginPending(false);
+      setRefreshing(false);
+    }
+  };
+
+  const removeAccount = async (account: CodexAccountSummary) => {
+    if (account.isActive || removingId !== null || switchingId !== null || refreshing) return;
+    if (!window.confirm(copy.accountSwitcherRemoveConfirm)) return;
+    setRemovingId(account.id);
+    setError(null);
+    try {
+      setSnapshot(await api!.removeAccount(account.id));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setRemovingId(null);
+    }
+  };
+
+  const available = snapshot.accounts.filter(account => account.status !== "expired" && account.status !== "unavailable").length;
+  const officialTone = !snapshot.officialApp.installed
+    ? "error"
+    : snapshot.officialApp.running ? "busy" : "ready";
+  const selectedAccount = snapshot.accounts.find(account => account.id === selectedAccountId)
+    || snapshot.accounts.find(account => account.isActive)
+    || snapshot.accounts[0]
+    || null;
+  const selectedTodayTokens = selectedAccount?.stats ? nativeTokensForRange(selectedAccount.stats, 1) : null;
+  const selectedLifetimeTokens = selectedAccount?.stats?.lifetimeTokens ?? null;
+
+  return (
+    <ContentSurface
+      subtitle={copy.accountSwitcherSubtitle}
+      title={copy.accountSwitcherTitle}
+    >
+      <div className="accounts-toolbar">
+        <div className="accounts-app-state">
+          <StateDot state={officialTone} />
+          <span>
+            <strong>{copy.accountSwitcherOfficialApp}</strong>
+            <small>{snapshot.officialApp.running ? copy.accountSwitcherRunning : copy.accountSwitcherNotRunning}</small>
+          </span>
+        </div>
+        <div className="accounts-toolbar-actions">
+          <label className="account-email-toggle">
+            <span>{showEmails ? copy.accountSwitcherHideEmails : copy.accountSwitcherShowEmails}</span>
+            <Switch checked={showEmails} onChange={setShowEmails} />
+          </label>
+          <SecondaryButton disabled={refreshing || switchingId !== null} icon="reload" onClick={() => void refresh()}>
+            {refreshing ? copy.accountSwitcherRefreshing : copy.accountSwitcherRefresh}
+          </SecondaryButton>
+          <PrimaryButton disabled={!snapshot.supported || refreshing || switchingId !== null || removingId !== null} onClick={() => setAddDialogOpen(true)}>
+            {copy.accountSwitcherAddAccount}
+          </PrimaryButton>
+        </div>
+      </div>
+
+      {!snapshot.supported ? (
+        <NoticeRow icon="info" tone="warning">{copy.accountSwitcherUnsupported}</NoticeRow>
+      ) : null}
+
+      <div className="account-metric-band" aria-label={copy.accountSwitcherAccounts}>
+        <AccountMetric value={snapshot.accounts.length} label={copy.accountSwitcherAccounts} />
+        <AccountMetric value={available} label={copy.accountSwitcherAvailable} />
+        <AccountMetric value={formatTokenCount(selectedTodayTokens)} label={copy.accountSwitcherToday} />
+        <div className="account-metric">
+          <strong>{formatTokenCount(selectedLifetimeTokens)}</strong>
+          <span>{copy.accountSwitcherLifetimeTokens}</span>
+        </div>
+      </div>
+
+      <div className="account-dashboard-grid">
+        <section className="account-panel account-list-panel">
+          <div className="account-panel-heading">
+            <div>
+              <SectionHeading label={copy.accountSwitcherAccounts} meta={snapshot.configured ? copy.accountSwitcherManagedBy : undefined} />
+            </div>
+            {snapshot.currentSession.present ? (
+              <span className="account-session-badge">
+                <StateDot state={snapshot.currentSession.managed ? "ready" : "idle"} />
+                {copy.accountSwitcherCurrentSession}
+              </span>
+            ) : null}
+          </div>
+          {snapshot.accounts.length === 0 ? (
+            <div className="account-empty">
+              <div className="account-empty-icon"><Icon name="accounts" /></div>
+              <strong>{copy.accountSwitcherNoAccounts}</strong>
+              <p>{copy.accountSwitcherNoAccountsBody}</p>
+              {snapshot.currentSession.present ? (
+                <SecondaryButton disabled={refreshing} onClick={() => void addCurrent()}>
+                  {copy.accountSwitcherAddCurrent}
+                </SecondaryButton>
+              ) : null}
+            </div>
+          ) : (
+            <div className="account-card-list">
+              {snapshot.accounts.map(account => (
+                <AccountCard
+                  account={account}
+                  busy={switchingId !== null}
+                  copy={copy}
+                  officialAppCanSwitch={snapshot.officialApp.canSwitch}
+                  officialAppRunning={snapshot.officialApp.running}
+                  removing={removingId === account.id}
+                  selected={selectedAccountId === account.id}
+                  showEmail={showEmails}
+                  key={account.id}
+                  onRemove={() => void removeAccount(account)}
+                  onSelect={() => setSelectedAccountId(account.id)}
+                  onSwitch={() => void switchAccount(account)}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="account-panel account-app-panel">
+          <SectionHeading label={copy.accountSwitcherOfficialApp} />
+          <div className="account-app-status">
+            <StateDot state={officialTone} />
+            <div>
+              <strong>{snapshot.officialApp.running ? copy.accountSwitcherRunning : copy.accountSwitcherNotRunning}</strong>
+              <p>{snapshot.officialApp.message}</p>
+            </div>
+          </div>
+          <div className="account-app-facts">
+            <div><span>{copy.version}</span><strong>{snapshot.officialApp.version || copy.accountSwitcherUnavailable}</strong></div>
+            <div><span>{copy.status}</span><strong>{snapshot.officialApp.installed ? copy.healthy : copy.accountSwitcherUnavailable}</strong></div>
+            <div><span>{copy.accountSwitcherCurrentAccount}</span><strong>{snapshot.accounts.find(account => account.isActive)?.name || copy.accountSwitcherUnavailable}</strong></div>
+          </div>
+          <p className="account-app-note">{copy.accountSwitcherOfficialAppBody}</p>
+        </section>
+      </div>
+
+      <AccountActivityPanel account={selectedAccount} copy={copy} language={language} snapshot={snapshot} />
+      {addDialogOpen ? (
+        <AccountAddModal
+          busy={refreshing}
+          copy={copy}
+          loginPending={loginPending}
+          onAddCurrent={() => void addCurrent()}
+          onCancelLogin={() => void cancelLogin()}
+          onClose={() => {
+            if (loginPending) void cancelLogin();
+            setAddDialogOpen(false);
+          }}
+          onImport={() => void addAccount()}
+          onLogin={() => void loginAccount()}
+        />
+      ) : null}
+    </ContentSurface>
+  );
+}
+
+function AccountAddModal({
+  busy,
+  copy,
+  loginPending,
+  onAddCurrent,
+  onCancelLogin,
+  onClose,
+  onImport,
+  onLogin,
+}: {
+  busy: boolean;
+  copy: Copy;
+  loginPending: boolean;
+  onAddCurrent: () => void;
+  onCancelLogin: () => void;
+  onClose: () => void;
+  onImport: () => void;
+  onLogin: () => void;
+}) {
+  return (
+    <div className="account-modal-backdrop" role="presentation" onMouseDown={event => {
+      if (event.target === event.currentTarget && !loginPending) onClose();
+    }}>
+      <div aria-modal="true" className="account-add-modal" role="dialog">
+        <div className="account-add-modal-heading">
+          <div>
+            <span className="eyebrow">{copy.accountSwitcher}</span>
+            <h2>{copy.accountSwitcherAddAccount}</h2>
+          </div>
+          <button aria-label={copy.close} className="icon-button" disabled={busy || loginPending} onClick={onClose} type="button">
+            <Icon name="close" />
+          </button>
+        </div>
+        <p className="account-add-modal-body">{copy.accountSwitcherAddAccountBody}</p>
+        {loginPending ? (
+          <div className="account-login-pending">
+            <span className="account-login-spinner" />
+            <div>
+              <strong>{copy.accountSwitcherLoginWaiting}</strong>
+              <span>{copy.accountSwitcherLoginWaitingBody}</span>
+            </div>
+            <SecondaryButton onClick={onCancelLogin}>{copy.close}</SecondaryButton>
+          </div>
+        ) : (
+          <div className="account-add-options">
+            <button className="account-add-option is-primary" disabled={busy} onClick={onLogin} type="button">
+              <span className="account-add-option-icon"><Icon name="accounts" /></span>
+              <span><strong>{copy.accountSwitcherLogin}</strong><small>{copy.accountSwitcherLoginBody}</small></span>
+            </button>
+            <button className="account-add-option" disabled={busy} onClick={onImport} type="button">
+              <span className="account-add-option-icon"><Icon name="plus" /></span>
+              <span><strong>{copy.accountSwitcherImportFile}</strong><small>{copy.accountSwitcherImportFileBody}</small></span>
+            </button>
+            <button className="account-add-current" disabled={busy} onClick={onAddCurrent} type="button">
+              {copy.accountSwitcherAddCurrent}
+            </button>
+          </div>
+        )}
+        <div className="account-add-modal-footer">
+          <span>{copy.accountSwitcherCredentialsLocal}</span>
+          <SecondaryButton disabled={busy || loginPending} onClick={onClose}>{copy.close}</SecondaryButton>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AccountMetric({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="account-metric">
+      <motion.strong animate={{ opacity: 1, y: 0 }} initial={{ opacity: 0, y: 4 }} key={value}>
+        {typeof value === "number" ? value.toLocaleString("en-US") : value}
+      </motion.strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function AccountCard({
+  account,
+  busy,
+  copy,
+  officialAppCanSwitch,
+  officialAppRunning,
+  onRemove,
+  onSelect,
+  onSwitch,
+  removing,
+  selected,
+  showEmail,
+}: {
+  account: CodexAccountSummary;
+  busy: boolean;
+  copy: Copy;
+  officialAppCanSwitch: boolean;
+  officialAppRunning: boolean;
+  onRemove: () => void;
+  onSelect: () => void;
+  onSwitch: () => void;
+  removing: boolean;
+  selected: boolean;
+  showEmail: boolean;
+}) {
+  const status = accountStatusCopy(account.status, copy);
+  const auth = account.authMode === "chatgpt" ? copy.accountSwitcherAuthChatGPT
+    : account.authMode === "api-key" ? copy.accountSwitcherAuthApiKey : copy.accountSwitcherUnavailable;
+  const lastUsed = account.lastUsedAt ? formatCompactDate(account.lastUsedAt) : copy.accountSwitcherNever;
+  const expiry = account.subscriptionExpiresAt ? ` · ${formatCompactDate(account.subscriptionExpiresAt)}` : "";
+  const email = formatAccountEmail(account.email, showEmail);
+  const credit = accountCreditCopy(account, copy);
+  const resetCredits = account.stats?.resetCreditsAvailable;
+  return (
+    <article className={`account-card${account.isActive ? " is-active" : ""}${selected ? " is-selected" : ""}`}>
+      <div className="account-card-topline">
+        <div className="account-card-identity">
+          <AccountAvatar account={account} />
+          <div>
+            <strong>{account.name}</strong>
+            <span>{email || auth}</span>
+          </div>
+        </div>
+        <span className={`account-status-pill is-${account.status}`}><StateDot state={account.status === "expired" || account.status === "unavailable" ? "error" : account.isActive ? "ready" : "idle"} />{status}</span>
+      </div>
+      <div className="account-card-details">
+        <span>{account.plan || auth}</span>
+        <span>{account.isActive ? copy.accountSwitcherActive : `${copy.accountSwitcherLastSwitch}: ${lastUsed}`}{expiry}</span>
+      </div>
+      <div className="account-entitlements">
+        <span className={`account-entitlement is-${credit.tone}`}>{credit.label}</span>
+        {resetCredits !== null && resetCredits !== undefined ? (
+          <span className={`account-entitlement ${resetCredits > 0 ? "is-positive" : "is-muted"}`}>
+            {resetCredits > 0 ? `${copy.accountSwitcherResetCredits}: ${formatCount(resetCredits)}` : copy.accountSwitcherNoResetCredits}
+            {resetCredits > 0 && account.stats?.resetCreditsNextExpiresAt ? ` · ${copy.accountSwitcherExpires} ${formatCompactDateTime(account.stats.resetCreditsNextExpiresAt)}` : ""}
+          </span>
+        ) : null}
+      </div>
+      {account.usage?.available ? (
+        <div className="account-usage-grid">
+          <AccountUsageWindow
+            copy={copy}
+            label={copy.accountSwitcherSessionWindow}
+            resetsAt={account.usage.primaryResetsAt}
+            usedPercent={account.usage.primaryUsedPercent}
+          />
+          <AccountUsageWindow
+            copy={copy}
+            label={copy.accountSwitcherWeeklyWindow}
+            resetsAt={account.usage.secondaryResetsAt}
+            usedPercent={account.usage.secondaryUsedPercent}
+          />
+        </div>
+      ) : (
+        <div className="account-usage-unavailable">
+          {account.usage?.error || copy.accountSwitcherUsageUnavailable}
+        </div>
+      )}
+      <div className="account-card-footer">
+        <code>{account.shortId || "local"}</code>
+        <div className="account-card-actions">
+          <button className={`account-view-button${selected ? " is-selected" : ""}`} onClick={onSelect} type="button">
+            {selected ? copy.accountSwitcherViewingStats : copy.accountSwitcherViewStats}
+          </button>
+          {!account.isActive ? (
+            <button className="account-remove-button" disabled={removing || busy} onClick={onRemove} type="button">
+              {removing ? copy.accountSwitcherRemoving : copy.accountSwitcherRemoveAccount}
+            </button>
+          ) : null}
+          <button
+            className="account-switch-button"
+            disabled={!officialAppCanSwitch || account.isActive || busy || removing || account.status === "expired" || account.status === "unavailable"}
+            onClick={onSwitch}
+            type="button"
+          >
+            {account.isActive
+              ? copy.accountSwitcherActive
+              : busy
+                ? copy.accountSwitcherSwitching
+                : officialAppRunning
+                  ? copy.accountSwitcherSwitchAndRestart
+                  : copy.accountSwitcherApplyNextLaunch}
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function AccountAvatar({ account }: { account: CodexAccountSummary }) {
+  const [failed, setFailed] = useState(false);
+  if (account.avatarUrl && !failed) {
+    return (
+      <img
+        alt=""
+        className="account-avatar account-avatar-image"
+        onError={() => setFailed(true)}
+        referrerPolicy="no-referrer"
+        src={account.avatarUrl}
+      />
+    );
+  }
+  return <span className="account-avatar">{account.name.slice(0, 1).toUpperCase()}</span>;
+}
+
+function formatAccountEmail(email: string | null, show: boolean): string | null {
+  if (!email) return null;
+  if (show) return email;
+  const at = email.indexOf("@");
+  if (at <= 0) return "••••••";
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  return `${local.slice(0, 1)}${"•".repeat(Math.min(5, Math.max(2, local.length - 1)))}@${domain}`;
+}
+
+function accountCreditCopy(account: CodexAccountSummary, copy: Copy): { label: string; tone: "positive" | "muted" | "warning" } {
+  const usage = account.usage;
+  if (usage?.unlimitedCredits === true) return { label: copy.accountSwitcherUnlimitedCredits, tone: "positive" };
+  if (usage?.hasCredits === true) {
+    return {
+      label: usage.creditsBalance ? `${copy.accountSwitcherCredits}: ${usage.creditsBalance}` : copy.accountSwitcherCreditsAvailable,
+      tone: "positive",
+    };
+  }
+  if (usage?.hasCredits === false) return { label: copy.accountSwitcherNoCredits, tone: "warning" };
+  return { label: copy.accountSwitcherCreditsUnavailable, tone: "muted" };
+}
+
+function AccountUsageWindow({
+  copy,
+  label,
+  resetsAt,
+  usedPercent,
+}: {
+  copy: Copy;
+  label: string;
+  resetsAt: string | null;
+  usedPercent: number | null;
+}) {
+  const remaining = usedPercent === null ? null : Math.max(0, Math.min(100, Math.round(100 - usedPercent)));
+  return (
+    <div className="account-usage-window">
+      <div className="account-usage-label"><span>{label}</span><strong>{remaining === null ? "—" : `${remaining}% ${copy.accountSwitcherLeft}`}</strong></div>
+      <div aria-hidden="true" className="account-usage-track"><i style={{ width: `${remaining ?? 0}%` }} /></div>
+      {resetsAt ? <small>{formatResetDate(resetsAt, copy)}</small> : null}
+    </div>
+  );
+}
+
+function AccountActivityPanel({
+  account,
+  copy,
+  language,
+  snapshot,
+}: {
+  account: CodexAccountSummary | null;
+  copy: Copy;
+  language: Language;
+  snapshot: AccountSwitcherSnapshot;
+}) {
+  const nativeStats = account?.stats ?? null;
+  const nativeDays = nativeActivityDays(nativeStats);
+  const activityDays = nativeDays ?? snapshot.activity.daily.map(day => ({
+    date: day.date,
+    value: day.count,
+  }));
+  const activityMaximum = Math.max(1, ...activityDays.map(day => day.value));
+  const hasNativeActivity = nativeDays !== null;
+  return (
+    <section className="account-panel account-activity-panel">
+      <div className="account-panel-heading">
+        <div>
+          <SectionHeading label={hasNativeActivity ? copy.accountSwitcherTokenActivity : copy.accountSwitcherActivity} />
+          <p className="account-panel-subtitle">
+            {hasNativeActivity
+              ? `${account?.name || copy.accountSwitcherCurrentAccount} · ${copy.accountSwitcherTokenActivityBody}`
+              : copy.accountSwitcherActivityBody}
+          </p>
+        </div>
+        <div className="account-activity-summary">
+          {hasNativeActivity && nativeStats ? (
+            <>
+              <strong>{formatTokenCount(nativeStats.lifetimeTokens)}</strong><span>{copy.accountSwitcherLifetimeTokens}</span>
+              <strong>{formatDuration(nativeStats.longestTaskSeconds)}</strong><span>{copy.accountSwitcherLongestTask}</span>
+            </>
+          ) : (
+            <>
+              <strong>{snapshot.activity.activeDays}</strong><span>{copy.accountSwitcherActive}</span>
+              <strong>{snapshot.activity.totalSwitches}</strong><span>{copy.accountSwitcherSwitchesToday}</span>
+            </>
+          )}
+        </div>
+      </div>
+      {hasNativeActivity && nativeStats ? (
+        <div className="account-native-stats">
+          <AccountNativeStat label={copy.accountSwitcherToday} value={formatTokenCount(nativeTokensForRange(nativeStats, 1))} />
+          <AccountNativeStat label={copy.accountSwitcherLastSevenDays} value={formatTokenCount(nativeTokensForRange(nativeStats, 7))} />
+          <AccountNativeStat label={copy.accountSwitcherStreak} value={formatDays(nativeStats.currentStreakDays)} />
+          <AccountNativeStat label={copy.accountSwitcherLongestStreak} value={formatDays(nativeStats.longestStreakDays)} />
+          <AccountNativeStat label={copy.accountSwitcherLongestTask} value={formatDuration(nativeStats.longestTaskSeconds)} />
+          <AccountNativeStat label={copy.accountSwitcherResetCredits} value={nativeStats.resetCreditsAvailable === null ? "—" : formatCount(nativeStats.resetCreditsAvailable)} />
+          <AccountNativeStat label={copy.accountSwitcherPeakDailyTokens} value={formatTokenCount(nativeStats.peakDailyTokens)} />
+          <AccountNativeStat label={copy.accountSwitcherThreads} value={formatCount(nativeStats.totalThreads)} />
+        </div>
+      ) : null}
+      <div className="account-heatmap-wrap">
+        <div className="account-heatmap" role="grid" aria-label={copy.accountSwitcherActivity}>
+          {activityDays.map(day => (
+            <span
+              aria-label={`${day.date}: ${hasNativeActivity ? formatTokenCount(day.value) : day.value}`}
+              className={`account-heat-cell level-${activityLevel(day.value, activityMaximum)}`}
+              key={day.date}
+              role="gridcell"
+              title={`${day.date}: ${hasNativeActivity ? formatTokenCount(day.value) : day.value}`}
+            />
+          ))}
+        </div>
+        <div className="account-heat-legend"><span>{copy.accountSwitcherHeatmapLess}</span><i className="level-0" /><i className="level-1" /><i className="level-2" /><i className="level-3" /><span>{copy.accountSwitcherHeatmapMore}</span></div>
+      </div>
+      {hasNativeActivity && activityDays.every(day => day.value === 0) ? (
+        <p className="account-no-recent">{copy.accountSwitcherNoTokenActivity}</p>
+      ) : null}
+      <div className="account-recent-heading"><SectionHeading label={copy.accountSwitcherRecentSwitches} /></div>
+      {snapshot.activity.recent.length === 0 ? (
+        <p className="account-no-recent">{copy.accountSwitcherNoRecentActivity}</p>
+      ) : (
+        <div className="account-recent-list">
+          {snapshot.activity.recent.slice(0, 6).map(event => (
+            <div className="account-recent-row" key={`${event.at}-${event.accountId}-${event.kind}`}>
+              <StateDot state="ready" />
+              <span><strong>{event.accountName}</strong><small>{event.kind === "import" ? copy.accountSwitcherImported : copy.accountSwitcherSwitched}</small></span>
+              <time>{formatActivityDate(event.at, language)}</time>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AccountNativeStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="account-native-stat">
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function nativeActivityDays(stats: AccountUsageStats | null): Array<{ date: string; value: number }> | null {
+  if (!stats?.available) return null;
+  const values = new Map(stats.daily.map(day => [dateKey(day.date), day.tokens] as const).filter(([date]) => date));
+  const today = new Date();
+  return Array.from({ length: 84 }, (_, index) => {
+    const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (83 - index)));
+    const key = date.toISOString().slice(0, 10);
+    return { date: key, value: values.get(key) ?? 0 };
+  });
+}
+
+function dateKey(value: string): string | null {
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(value);
+  if (match) return match[1];
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+}
+
+function nativeTokensForRange(stats: AccountUsageStats, days: number): number | null {
+  if (!stats.available) return null;
+  const values = new Map(stats.daily.map(day => [dateKey(day.date), day.tokens] as const).filter(([date]) => date));
+  const today = new Date();
+  let total = 0;
+  for (let offset = 0; offset < days; offset += 1) {
+    const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - offset));
+    total += values.get(date.toISOString().slice(0, 10)) ?? 0;
+  }
+  return total;
+}
+
+function activityLevel(value: number, maximum: number): number {
+  if (value <= 0) return 0;
+  const ratio = value / Math.max(1, maximum);
+  if (ratio >= 0.75) return 3;
+  if (ratio >= 0.35) return 2;
+  return 1;
+}
+
+function formatCount(value: number | null): string {
+  return value === null ? "—" : value.toLocaleString("en-US");
+}
+
+function formatDays(value: number | null): string {
+  return value === null ? "—" : `${Math.round(value)}d`;
+}
+
+function formatDuration(seconds: number | null): string {
+  if (seconds === null) return "—";
+  const rounded = Math.max(0, Math.round(seconds));
+  if (rounded < 60) return `${rounded}s`;
+  const minutes = Math.floor(rounded / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function formatTokenCount(value: number | null): string {
+  if (value === null) return "—";
+  const absolute = Math.abs(value);
+  if (absolute >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
+  if (absolute >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (absolute >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return Math.round(value).toLocaleString("en-US");
+}
+
+function accountStatusCopy(status: CodexAccountSummary["status"], copy: Copy): string {
+  if (status === "active") return copy.accountSwitcherActive;
+  if (status === "expired") return copy.accountSwitcherExpired;
+  if (status === "unavailable") return copy.accountSwitcherUnavailable;
+  return copy.accountSwitcherReady;
+}
+
+function formatCompactDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function formatCompactDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function formatResetDate(value: string, copy: Copy): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const remaining = date.getTime() - Date.now();
+  if (remaining <= 0) return copy.accountSwitcherResetsNow;
+  const minutes = Math.ceil(remaining / 60_000);
+  if (minutes < 60) return `${copy.accountSwitcherResetsIn} ${minutes}m`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 48) return `${copy.accountSwitcherResetsIn} ${hours}h`;
+  return `${copy.accountSwitcherResetsOn} ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+}
+
+function formatActivityDate(value: string, language: Language): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(
+    language === "ja" ? "ja-JP" : language === "zh-CN" ? "zh-CN" : "en-US",
+    { month: "short", day: "numeric" },
   );
 }
 

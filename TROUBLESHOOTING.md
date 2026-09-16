@@ -108,10 +108,32 @@ Browser-only mode needs no connector. Full harness mode requires all of the foll
 Do not rename or refresh an old **Codex Native** connector. ChatGPT caches the public MCP contract by
 connector identity, so create **Codex Native2** as a new connector.
 
+### Check the live tool catalog
+
+After **Connect harness** succeeds, use the bridge's `codex_tool_capabilities` tool with the current
+request ID. It returns the outer catalog hash, source counts for visible tools (`declared`,
+`additional_tools`, or `tool_search_output`), and the availability of direct and gateway-backed
+surfaces. Use `codex_tool_inventory` with `surface: "computer"`, `"browser"`, `"execution"`,
+`"mcp"`, or `"agents"` to obtain exact wire names and schemas before invoking a deferred tool.
+When `tool_search` appears in that catalog, invoke its exact wire name through `codex_tool_call`,
+then use the exact names returned by its `tool_search_output` on the next tool boundary.
+The local `/healthz` response also includes the last observed `tooling.snapshot` for diagnosing a
+stale or changing Codex catalog.
+
+If `codex_tool_capabilities` is absent, ChatGPT is using a cached connector contract. Reload the
+**Codex Native2** connector, then start a new Codex turn. The bridge reports the catalog epoch so a
+safe log can distinguish a stale connector from a native tool that was never advertised.
+
 ### Desktop control is missing
 
 Desktop control is supplied by Codex through an optional native computer-use MCP. The existing
 **Codex Native2** connector can forward it after Codex has loaded it. On Windows, for example:
+
+Open the launcher's **MCP** page and choose **Set up desktop controls**. Current Windows installers
+include the pinned native runtime, so Node.js/npm are not required and users do not need to run
+the setup commands manually. Fully quit and reopen Codex after a new registration so its tool
+catalog reloads. If an older launcher reports that its bundled component is missing, use the
+manual setup below after repairing the Codex installation.
 
 ```powershell
 npm install -g open-computer-use@0.3.4
@@ -120,10 +142,46 @@ codex mcp get open-computer-use
 open-computer-use list-apps
 ```
 
-Then fully quit Codex, reopen it, and start a new task. The first desktop-control request may use
+Then start a new task. The first desktop-control request may use
 native `tool_search` to load the deferred MCP tools. You do not need a separate desktop-control
 tunnel or ChatGPT connector. If `list-apps` fails locally, repair the native MCP setup first; the Full harness
 cannot forward a tool that Codex itself has not loaded.
+
+The launcher records whether each declaration came from the static native catalog, `additional_tools`,
+or a `tool_search_output`. Newer Responses Lite clients may send nested object maps such as
+`Microsoft.windows.Computer -> get_app_state`; the parser preserves those namespaces and alternate
+input schemas. If the capability report still says Computer Use is absent, inspect the current Codex
+process and MCP registry: the web bridge cannot manufacture a native Computer handler that the outer
+process did not advertise.
+
+### Codex Wallpapers
+
+Enable **Codex Wallpapers** in launcher Settings to attach the vendored picker to the separate
+official Microsoft Store Codex/ChatGPT desktop app. It reads the existing
+`%LOCALAPPDATA%\\CodexWallpapers\\library.json` library, validates content-addressed media before
+transfer, and applies the picker to the official app's `app://` pages over a loopback-only local
+debugging endpoint. Codex Web GPT's embedded ChatGPT pages are never modified. An empty library is
+valid and shows the add-wallpaper guide. Open Profile > Wallpapers in the official app to choose a
+media item.
+
+If the official app was already open without its wallpaper endpoint, the setting reports that a
+one-time restart of the official app is required. Leave Codex Web GPT open while restarting the
+official app, then the launcher attaches automatically. Users need a launcher build containing the
+feature; updating or relaunching Codex Web GPT is sufficient when the toggle is missing.
+
+### Account switcher
+
+The Account switcher is available on Windows and reads the compatible Codex Switcher store at
+`%USERPROFILE%\\.codex-switcher\\accounts.json`. Use **Add current account** to import the session
+currently stored in the official Codex profile, then use **Switch and restart** on another account.
+The launcher writes the selected account to `%USERPROFILE%\\.codex\\auth.json` and restarts only the
+verified Microsoft Store Codex process when it was already running. If the official app is stopped,
+the change applies on its next launch and no restart is needed.
+
+Press **Refresh** on the Account switcher page to load the active account's ChatGPT usage windows,
+rate-limit reset time, reset credits, and native token activity. The refresh uses the signed-in
+account's ChatGPT session and stores only redacted usage metadata locally. An API failure is shown on
+that account card and does not prevent switching accounts.
 
 ### ChatGPT shows `Error creating connector`
 

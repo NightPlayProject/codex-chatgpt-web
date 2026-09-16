@@ -110,6 +110,16 @@ the official app over a loopback-only local debugging endpoint. If the official 
 running without that endpoint, restart the official app once after enabling; Codex Web GPT stays
 open.
 
+The lower sidebar also includes an **Account switcher** for Windows users who already use the
+compatible Codex Switcher account store at `%USERPROFILE%\\.codex-switcher\\accounts.json`. It imports
+the current official Codex session, shows redacted account state, usage windows, native token
+activity, and recent local switches, then writes the selected account to the official Codex
+`%USERPROFILE%\\.codex\\auth.json`. Switching restarts only the verified official Microsoft Store
+Codex app when it is running; a stopped app uses the selected account on its next launch. Usage
+refresh is explicit and failures remain attached to the affected account instead of blocking a
+switch. Stored access, refresh, and ID tokens are never sent to the renderer or displayed in the
+launcher.
+
 **Run from source**
 
 ```bash
@@ -161,9 +171,22 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
    **Codex Native2**, with **Authentication: None** and **Allow all actions**.
 3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
 
+The bridge exposes `codex_tool_capabilities` as a live catalog diagnostic. It reports the current
+outer catalog hash, direct/deferred tool provenance, and whether the native `exec` gateway can
+discover tools that were deferred by Codex. Use `codex_tool_inventory` with a focused `surface`
+such as `computer`, `browser`, `execution`, `mcp`, or `agents` to retrieve exact wire names and
+schemas before calling them. If the capability diagnostic itself is missing, reload the ChatGPT
+connector so its cached MCP contract matches the installed bridge.
+
 Desktop control is optional. Full mode forwards native Codex MCP/plugin tools through the same
 **Codex Native2** connector. On Windows, one working option is
 [`open-computer-use`](https://www.npmjs.com/package/open-computer-use):
+
+Open the launcher's **MCP** page and choose **Set up desktop controls** to register the bundled
+Windows native runtime without opening PowerShell or installing Node.js/npm. This is an explicit
+action because it installs a native desktop-control MCP and edits the Codex MCP configuration.
+Codex must be fully restarted after a new registration so it reloads its tool catalog. Older
+launcher builds without the bundled runtime can use the manual fallback:
 
 ```powershell
 npm install -g open-computer-use@0.3.4

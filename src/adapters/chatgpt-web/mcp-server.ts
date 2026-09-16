@@ -6,7 +6,15 @@ import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
+import {
+  buildChatGptToolCapabilityReport,
+  CHATGPT_TOOL_SURFACE_IDS,
+  chatGptToolSurfaceForTool,
+  chatGptUnavailableToolMessage,
+  type ChatGptToolSurfaceId,
+} from "./tool-capabilities";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
+import { observeMcpToolCalls } from "./mcp-observation";
 
 interface ClaimedTurn {
   bindingId: string;
@@ -22,6 +30,7 @@ const BRIDGE_TOOL_NAMES = new Set([
   "codex_write_stdin",
   "codex_apply_patch",
   "codex_view_image",
+  "codex_tool_capabilities",
   "codex_tool_inventory",
   "codex_tool_call",
   "codex_turn_complete",
@@ -42,12 +51,12 @@ const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly 
 // for the MCP response frame while giving the native Codex consumer time to reconnect after a
 // transient browser/Responses disconnect.
 export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 110_000;
-const MCP_SERVER_INSTANCE_ID = randomBytes(16).toString("hex");
 
 const ZERO_RISK_MCP_INSTRUCTIONS = [
   "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id in its request block.",
   "Use that request_id with the Codex tools needed for the task. Direct and deferred shell, process, browser/computer, MCP, connector/app, and subagent tools use the same bridge.",
-  "If the required capability is not listed as a direct tool, use native tool_search when it is available to load deferred tools; otherwise call codex_tool_inventory with a focused query and include_schema=true, then call the exact returned wire_name with codex_tool_call. Use arguments for structured tools and input for freeform tools; do not guess or rename tool names.",
+  "Call codex_tool_capabilities before declaring a surface unavailable. If the required capability is not listed as a direct tool, use an outer Codex tool_search entry when it is advertised by the capability report, invoking its exact wire_name through codex_tool_call; otherwise call codex_tool_inventory with a focused query and include_schema=true, then call the exact returned wire_name with codex_tool_call. Use arguments for structured tools and input for freeform tools; do not guess or rename tool names.",
+  "If codex_tool_capabilities is absent from the connector, refresh or reload the Codex Web GPT connector in ChatGPT before starting a new turn.",
   "When the task is finished, send the complete answer with codex_turn_complete.",
   "If a tool returns an error, report that error instead of changing the request_id.",
 ].join(" ");
@@ -77,11 +86,42 @@ function scopeHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
-function mcpInvocationKey(extra: McpRequestExtra): string {
-  // The MCP request id is stable across a transport retry in the same connector session. Scoping
-  // it to this server process and session prevents a reused JSON-RPC id from deduplicating an
-  // unrelated request while still allowing the broker to replay one lost native handoff.
-  return `${MCP_SERVER_INSTANCE_ID}:${scopeHash(`${extra.sessionId ?? ""}:${String(extra.requestId)}`)}`;
+function canonicalInvocationValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalInvocationValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalInvocationValue(item)]),
+    );
+  }
+  return value;
+}
+
+function mcpInvocationKey(
+  extra: McpRequestExtra,
+  bindingId: string,
+  tool: CodexTool,
+  payload: { arguments?: Record<string, unknown>; input?: string },
+): string {
+  // MCP request ids are stable across a transport retry, but a connector can reuse an id after
+  // a response has completed. Include the bound turn, exact wire tool, call mode, and canonical
+  // payload so a reused id cannot replay a different native action while preserving idempotent
+  // replay for the same lost handoff.
+  const identity = canonicalInvocationValue({
+    sessionId: extra.sessionId ?? "",
+    requestId: String(extra.requestId),
+    bindingId,
+    wireName: wireName(tool),
+    freeform: tool.freeform === true,
+    payload: tool.freeform === true
+      ? { input: payload.input ?? "" }
+      : { arguments: payload.arguments ?? {} },
+  });
+  // Keep the key independent of the short-lived MCP server process. ChatGPT may recreate the
+  // stdio connector while the outer Codex turn and broker binding are still alive; a retry after
+  // that reconnect must be able to receive the already-completed native result.
+  return `mcp:${scopeHash(JSON.stringify(identity))}`;
 }
 
 function requestScopeSummary(extra: McpRequestExtra): string {
@@ -105,10 +145,10 @@ function requestScopeSummary(extra: McpRequestExtra): string {
   });
 }
 
-function result(value: Record<string, unknown>, isError = false) {
+function result<T extends object>(value: T, isError = false) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value) }],
-    structuredContent: value,
+    structuredContent: value as Record<string, unknown>,
     ...(isError ? { isError: true } : {}),
   };
 }
@@ -125,13 +165,6 @@ function wireName(tool: CodexTool): string {
 
 function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
-}
-
-function toolNamed(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
-  const direct = exactTool(environment, name);
-  if (direct) return direct;
-  const namespaced = environment.tools.filter(tool => tool.name === name);
-  return namespaced.length === 1 ? namespaced[0] : undefined;
 }
 
 const GATEWAY_TOOL_NAME_MAX_LENGTH = 1_000;
@@ -257,8 +290,21 @@ function asMcpResult(value: BrokerToolResult) {
 }
 
 function execGateway(environment: ChatGptTurnEnvironment): CodexTool | undefined {
-  const tool = toolNamed(environment, "exec");
+  const tool = exactTool(environment, "exec");
   return tool?.freeform ? tool : undefined;
+}
+
+function toolCapabilityReport(
+  bound: ChatGptTurnEnvironment,
+  contract: ChatGptMcpContract,
+) {
+  const visibleTools = safeVisibleTools(bound, contract);
+  return buildChatGptToolCapabilityReport({
+    outerTools: bound.tools,
+    visibleTools,
+    gateway: execGateway(bound),
+    contract,
+  });
 }
 
 interface GatewayToolDescriptor {
@@ -324,32 +370,62 @@ function gatewayToolCatalogProgram(options: {
   offset: number;
   limit: number;
   excludedNames: string[];
+  surface?: ChatGptToolSurfaceId;
 }): string {
   const needle = options.query?.trim().toLowerCase() ?? "";
   return [
     `const excludedNames = new Set(${JSON.stringify(options.excludedNames)});`,
     `const needle = ${JSON.stringify(needle)};`,
+    `const requestedSurface = ${JSON.stringify(options.surface ?? null)};`,
+    "const surfaceOf = (name, description) => {",
+    "  const value = String(name ?? '') + '\\n' + String(description ?? '');",
+    "  if (/(computer[_-]?use|computer-use|desktop|screen|screenshot|get[_-]?app[_-]?state|mouse|keyboard|click|double[_-]?click|scroll|drag|keypress|type[_-]?text|open[_-]?app|close[_-]?app|window)/i.test(value)) return 'computer';",
+    "  if (/(browser|web[_-]?run|search[_-]?query|open[_-]?url|navigate|page|tab|website|fetch[_-]?url)/i.test(value)) return 'browser';",
+    "  if (/(agent|subagent|multi[_-]?agent|collaboration|spawn[_-]?agent|send[_-]?message|wait[_-]?agent)/i.test(value)) return 'agents';",
+    "  if (/(^|[\\n_:/-])(exec|exec[_-]?command|shell[_-]?command|terminal|process|kill[_-]?process|write[_-]?stdin|run[_-]?command)([\\n_:/-]|$)/i.test(value)) return 'execution';",
+    "  if (/(apply[_-]?patch|read[_-]?file|write[_-]?file|file|filesystem|directory|path|view[_-]?image|image)/i.test(value)) return 'filesystem';",
+    "  if (/(tool[_-]?search|tool[_-]?inventory|discover)/i.test(value)) return 'discovery';",
+    "  if (/(^mcp(?:__|[_:/-])|\\bmcp\\b|connector|plugin|app)/i.test(value)) return 'mcp';",
+    "  return 'other';",
+    "};",
     "const visibleName = name => {",
     `  return typeof name === "string" && name.length > 0 && name.length <= ${GATEWAY_TOOL_NAME_MAX_LENGTH} && !/[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]/.test(name) && !${JSON.stringify([...GATEWAY_FORBIDDEN_TOOL_NAMES])}.includes(name) && !excludedNames.has(name);`,
     "};",
-    "const suppliedRegistry = typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined;",
-    "const registryEntries = Array.isArray(suppliedRegistry)",
-    "  ? suppliedRegistry",
-    "  : suppliedRegistry && typeof suppliedRegistry === \"object\"",
-    "    ? Object.entries(suppliedRegistry).map(([name, value]) => value && typeof value === \"object\" && !Array.isArray(value) ? { ...value, name: typeof value.name === \"string\" ? value.name : name } : { name })",
-    "    : [];",
     "const entries = new Map();",
-    "const addEntry = (entry, fallbackName) => {",
-    "  const name = typeof entry === \"string\" ? entry : entry && typeof entry === \"object\" && !Array.isArray(entry) && typeof entry.name === \"string\" ? entry.name : fallbackName;",
+    "const isObject = value => value !== null && typeof value === \"object\" && !Array.isArray(value);",
+    "const descriptorLike = value => isObject(value) && (typeof value.type === \"string\" || typeof value.name === \"string\" || typeof value.description === \"string\" || \"parameters\" in value || \"input_schema\" in value || \"inputSchema\" in value || \"schema\" in value || \"format\" in value);",
+    "const addEntry = (entry, fallbackName, prefix = \"\") => {",
+    "  const ownName = typeof entry === \"string\" ? entry : isObject(entry) && typeof entry.name === \"string\" ? entry.name : fallbackName;",
+    "  const explicitNamespace = isObject(entry) && typeof entry.namespace === \"string\" ? entry.namespace : \"\";",
+    "  const name = explicitNamespace ? explicitNamespace + \"__\" + ownName : prefix ? (ownName?.startsWith(prefix + \"__\") ? ownName : prefix + \"__\" + ownName) : ownName;",
     "  if (!visibleName(name) || entries.has(name)) return;",
-    "  const description = entry && typeof entry === \"object\" && !Array.isArray(entry) && typeof entry.description === \"string\" ? entry.description : \"\";",
-    "  const parameters = entry && typeof entry === \"object\" && !Array.isArray(entry) ? [entry.parameters, entry.inputSchema, entry.input_schema, entry.schema].find(value => value && typeof value === \"object\" && !Array.isArray(value)) : undefined;",
+    "  const description = isObject(entry) && typeof entry.description === \"string\" ? entry.description : \"\";",
+    "  const parameters = isObject(entry) ? [entry.parameters, entry.inputSchema, entry.input_schema, entry.schema].find(value => value && typeof value === \"object\" && !Array.isArray(value)) : undefined;",
     "  entries.set(name, { name, description, ...(parameters ? { parameters } : {}) });",
     "};",
-    "for (const entry of registryEntries) addEntry(entry);",
-    "try { for (const name of Reflect.ownKeys(tools)) addEntry({ name }, typeof name === \"string\" ? name : undefined); } catch { /* registry enumeration is optional */ }",
+    "const flatten = (value, prefix = \"\") => {",
+    "  if (Array.isArray(value)) {",
+    "    for (const entry of value) {",
+    "      if (isObject(entry) && (entry.type === \"namespace\" || \"tools\" in entry)) flatten(entry.tools, typeof entry.name === \"string\" ? entry.name : prefix);",
+    "      else addEntry(entry, undefined, prefix);",
+    "    }",
+    "    return;",
+    "  }",
+    "  if (!isObject(value)) return;",
+    "  if (value.type === \"namespace\" || (\"tools\" in value && !descriptorLike(value))) { flatten(value.tools, typeof value.name === \"string\" ? value.name : prefix); return; }",
+    "  for (const key of Reflect.ownKeys(value)) {",
+    "    if (typeof key !== \"string\") continue;",
+    "    const child = Reflect.get(value, key, value);",
+    "    if (isObject(child) && (child.type === \"namespace\" || \"tools\" in child)) { flatten(child.tools, typeof child.name === \"string\" ? child.name : (prefix ? prefix + \"__\" + key : key)); continue; }",
+    "    if (isObject(child) && !descriptorLike(child)) { flatten(child, prefix ? prefix + \"__\" + key : key); continue; }",
+    "    addEntry(child, key, prefix);",
+    "  }",
+    "};",
+    "const suppliedRegistry = typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined;",
+    "try { flatten(suppliedRegistry); } catch { /* registry enumeration is optional */ }",
+    "try { flatten(tools); } catch { /* callable properties remain directly addressable */ }",
     "const matches = [...entries.values()]",
-    "  .filter(tool => !needle || (tool.name + \"\\n\" + tool.description).toLowerCase().includes(needle));",
+    "  .filter(tool => (!needle || (tool.name + \"\\n\" + tool.description).toLowerCase().includes(needle)) && (!requestedSurface || surfaceOf(tool.name, tool.description) === requestedSurface));",
     `const page = matches.slice(${options.offset}, ${options.offset + options.limit});`,
     "text(JSON.stringify({ tools: page, total: matches.length }));",
   ].join("\n");
@@ -442,19 +518,56 @@ function execGatewayProgram(
     `const nestedToolName = ${JSON.stringify(nestedToolName)};`,
     `const excludedNames = new Set(${JSON.stringify(excludedNames)});`,
     "if (excludedNames.has(nestedToolName)) throw new Error(\"Native nested tool is not callable through the structured gateway\");",
+    "const isObject = value => value !== null && typeof value === \"object\" && !Array.isArray(value);",
+    "const descriptorLike = value => isObject(value) && (typeof value.type === \"string\" || typeof value.name === \"string\" || typeof value.description === \"string\" || \"parameters\" in value || \"input_schema\" in value || \"inputSchema\" in value || \"schema\" in value || \"format\" in value);",
+    "const registryNames = new Set();",
+    "const paths = new Map();",
+    "const addEntry = (entry, fallbackName, prefix = \"\", path = []) => {",
+    "  const ownName = typeof entry === \"string\" ? entry : isObject(entry) && typeof entry.name === \"string\" ? entry.name : fallbackName;",
+    "  const explicitNamespace = isObject(entry) && typeof entry.namespace === \"string\" ? entry.namespace : \"\";",
+    "  const name = explicitNamespace ? explicitNamespace + \"__\" + ownName : prefix ? (ownName?.startsWith(prefix + \"__\") ? ownName : prefix + \"__\" + ownName) : ownName;",
+    "  if (typeof name !== \"string\" || name.length === 0) return;",
+    "  registryNames.add(name);",
+    "  const candidate = path.length > 0 ? path : [name];",
+    "  const list = paths.get(name) || [];",
+    "  if (!list.some(item => item.length === candidate.length && item.every((part, index) => part === candidate[index]))) list.push(candidate);",
+    "  paths.set(name, list);",
+    "};",
+    "const flatten = (value, prefix = \"\", path = []) => {",
+    "  if (Array.isArray(value)) {",
+    "    for (const entry of value) {",
+    "      if (isObject(entry) && (entry.type === \"namespace\" || \"tools\" in entry)) flatten(entry.tools, typeof entry.name === \"string\" ? entry.name : prefix, path);",
+    "      else addEntry(entry, undefined, prefix, path);",
+    "    }",
+    "    return;",
+    "  }",
+    "  if (!isObject(value)) return;",
+    "  if (value.type === \"namespace\" || (\"tools\" in value && !descriptorLike(value))) { flatten(value.tools, typeof value.name === \"string\" ? value.name : prefix, path); return; }",
+    "  for (const key of Reflect.ownKeys(value)) {",
+    "    if (typeof key !== \"string\") continue;",
+    "    const child = Reflect.get(value, key, value);",
+    "    const childPath = [...path, key];",
+    "    if (isObject(child) && (child.type === \"namespace\" || \"tools\" in child)) { flatten(child.tools, typeof child.name === \"string\" ? child.name : (prefix ? prefix + \"__\" + key : key), childPath); continue; }",
+    "    if (isObject(child) && !descriptorLike(child)) { flatten(child, prefix ? prefix + \"__\" + key : key, childPath); continue; }",
+    "    addEntry(child, key, prefix, childPath);",
+    "  }",
+    "};",
     "const suppliedRegistry = typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined;",
-    "const registryEntries = Array.isArray(suppliedRegistry)",
-    "  ? suppliedRegistry",
-    "  : suppliedRegistry && typeof suppliedRegistry === \"object\"",
-    "    ? Object.entries(suppliedRegistry).map(([name, value]) => value && typeof value === \"object\" && !Array.isArray(value) ? { ...value, name: typeof value.name === \"string\" ? value.name : name } : { name })",
-    "    : [];",
-    "const registryNames = new Set(registryEntries.map(entry => typeof entry === \"string\" ? entry : entry && typeof entry === \"object\" && !Array.isArray(entry) && typeof entry.name === \"string\" ? entry.name : undefined).filter(name => typeof name === \"string\"));",
-    "let listed = registryNames.has(nestedToolName);",
-    "if (!listed) { try { listed = Reflect.has(tools, nestedToolName); } catch { listed = false; } }",
-    "if (!listed) throw new Error(\"Native nested tool is not listed in this turn\");",
-    "const nestedTool = tools[nestedToolName];",
-    "if (typeof nestedTool !== \"function\") throw new Error(\"Native nested tool is listed but unavailable\");",
-    `const result = await nestedTool(${JSON.stringify(nestedInput)});`,
+    "try { flatten(suppliedRegistry); } catch { /* registry enumeration is optional */ }",
+    "try { flatten(tools); } catch { /* callable properties remain directly addressable */ }",
+    "const resolveNative = name => {",
+    "  try { const direct = Reflect.get(tools, name, tools); if (typeof direct === \"function\") return { value: direct, owner: tools }; } catch {}",
+    "  for (const path of paths.get(name) || []) {",
+    "    let owner = tools;",
+    "    try { for (const part of path.slice(0, -1)) owner = Reflect.get(owner, part, owner); const value = Reflect.get(owner, path.at(-1), owner); if (typeof value === \"function\") return { value, owner }; } catch {}",
+    "  }",
+    "  return undefined;",
+    "};",
+    "if (!registryNames.has(nestedToolName)) { try { if (typeof Reflect.get(tools, nestedToolName, tools) === \"function\") registryNames.add(nestedToolName); } catch {} }",
+    "if (!registryNames.has(nestedToolName)) throw new Error(\"Native nested tool is not listed in this turn\");",
+    "const resolved = resolveNative(nestedToolName);",
+    "if (!resolved) throw new Error(\"Native nested tool is listed but unavailable\");",
+    `const result = await Reflect.apply(resolved.value, resolved.owner, [${JSON.stringify(nestedInput)}]);`,
   ]);
 }
 
@@ -472,16 +585,55 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     `  const waitNames = new Set(${JSON.stringify([...GATEWAY_AGENT_WAIT_TOOL_NAMES])});`,
     `  const blockedExecName = ${JSON.stringify(blockedExecName)};`,
     `  const pollMs = ${CHATGPT_WEB_AGENT_WAIT_POLL_MS};`,
-    "  const registryNames = new Set(Reflect.ownKeys(source));",
-    "  if (typeof ALL_TOOLS !== \"undefined\" && Array.isArray(ALL_TOOLS)) {",
-    "    for (const tool of ALL_TOOLS) if (typeof tool?.name === \"string\") registryNames.add(tool.name);",
-    "  } else if (typeof ALL_TOOLS !== \"undefined\" && ALL_TOOLS && typeof ALL_TOOLS === \"object\") {",
-    "    for (const name of Reflect.ownKeys(ALL_TOOLS)) if (typeof name === \"string\") registryNames.add(name);",
-    "  }",
+    "  const isObject = value => value !== null && typeof value === \"object\" && !Array.isArray(value);",
+    "  const descriptorLike = value => isObject(value) && (typeof value.type === \"string\" || typeof value.name === \"string\" || typeof value.description === \"string\" || \"parameters\" in value || \"input_schema\" in value || \"inputSchema\" in value || \"schema\" in value || \"format\" in value);",
+    "  const registryNames = new Set();",
+    "  const paths = new Map();",
+    "  const addEntry = (entry, fallbackName, prefix = \"\", path = []) => {",
+    "    const ownName = typeof entry === \"string\" ? entry : isObject(entry) && typeof entry.name === \"string\" ? entry.name : fallbackName;",
+    "    const explicitNamespace = isObject(entry) && typeof entry.namespace === \"string\" ? entry.namespace : \"\";",
+    "    const name = explicitNamespace ? explicitNamespace + \"__\" + ownName : prefix ? (ownName?.startsWith(prefix + \"__\") ? ownName : prefix + \"__\" + ownName) : ownName;",
+    "    if (typeof name !== \"string\" || name.length === 0) return;",
+    "    registryNames.add(name);",
+    "    const candidate = path.length > 0 ? path : [name];",
+    "    const list = paths.get(name) || [];",
+    "    if (!list.some(item => item.length === candidate.length && item.every((part, index) => part === candidate[index]))) list.push(candidate);",
+    "    paths.set(name, list);",
+    "  };",
+    "  const flatten = (value, prefix = \"\", path = []) => {",
+    "    if (Array.isArray(value)) {",
+    "      for (const entry of value) {",
+    "        if (isObject(entry) && (entry.type === \"namespace\" || \"tools\" in entry)) flatten(entry.tools, typeof entry.name === \"string\" ? entry.name : prefix, path);",
+    "        else addEntry(entry, undefined, prefix, path);",
+    "      }",
+    "      return;",
+    "    }",
+    "    if (!isObject(value)) return;",
+    "    if (value.type === \"namespace\" || (\"tools\" in value && !descriptorLike(value))) { flatten(value.tools, typeof value.name === \"string\" ? value.name : prefix, path); return; }",
+    "    for (const key of Reflect.ownKeys(value)) {",
+    "      if (typeof key !== \"string\") continue;",
+    "      const child = Reflect.get(value, key, value);",
+    "      const childPath = [...path, key];",
+    "      if (isObject(child) && (child.type === \"namespace\" || \"tools\" in child)) { flatten(child.tools, typeof child.name === \"string\" ? child.name : (prefix ? prefix + \"__\" + key : key), childPath); continue; }",
+    "      if (isObject(child) && !descriptorLike(child)) { flatten(child, prefix ? prefix + \"__\" + key : key, childPath); continue; }",
+    "      addEntry(child, key, prefix, childPath);",
+    "    }",
+    "  };",
+    "  try { flatten(typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined); } catch {}",
+    "  try { flatten(source); } catch {}",
+    "  const resolveNative = name => {",
+    "    try { const direct = Reflect.get(source, name, source); if (typeof direct === \"function\") return { value: direct, owner: source }; } catch {}",
+    "    for (const path of paths.get(name) || []) {",
+    "      let owner = source;",
+    "      try { for (const part of path.slice(0, -1)) owner = Reflect.get(owner, part, owner); const value = Reflect.get(owner, path.at(-1), owner); if (typeof value === \"function\") return { value, owner }; } catch {}",
+    "    }",
+    "    return undefined;",
+    "  };",
     "  const wrappers = new Map();",
     "  const expose = name => {",
     "    if (wrappers.has(name)) return wrappers.get(name);",
-    "    const value = Reflect.get(source, name, source);",
+    "    const resolved = resolveNative(name);",
+    "    const value = resolved?.value;",
     "    let exposed = value;",
     "    if (typeof value === \"function\" && name === blockedExecName) {",
     "      exposed = () => { throw new Error(\"Nested raw exec is unavailable inside ChatGPT Web exec\"); };",
@@ -490,17 +642,17 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "        if (!args || typeof args !== \"object\" || Array.isArray(args) || args.timeout_ms !== pollMs) {",
     "          throw new Error(\"ChatGPT Web wait_agent requires timeout_ms=\" + pollMs + \" so the shared MCP channel remains available to spawned Web agents\");",
     "        }",
-    "        return Reflect.apply(value, source, [args]);",
+    "        return Reflect.apply(value, resolved.owner, [args]);",
     "      };",
     "    } else if (typeof value === \"function\") {",
-    "      exposed = (...args) => Reflect.apply(value, source, args);",
+    "      exposed = (...args) => Reflect.apply(value, resolved.owner, args);",
     "    }",
     "    wrappers.set(name, exposed);",
     "    return exposed;",
     "  };",
     "  return new Proxy(Object.create(null), {",
     "    get: (_target, name) => expose(name),",
-    "    has: (_target, name) => registryNames.has(name) || Reflect.has(source, name),",
+    "    has: (_target, name) => registryNames.has(name) || Boolean(resolveNative(name)),",
     "    ownKeys: () => [...registryNames],",
     "    getOwnPropertyDescriptor: (_target, name) =>",
     "      registryNames.has(name) || Reflect.has(source, name)",
@@ -524,20 +676,37 @@ function execCommandGatewayProgram(
   const execCommandName = "exec_command";
   const shellCommandName = "shell_command";
   return execGatewayResultProgram([
-    "const suppliedRegistry = typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined;",
-    "const registryEntries = Array.isArray(suppliedRegistry)",
-    "  ? suppliedRegistry",
-    "  : suppliedRegistry && typeof suppliedRegistry === \"object\"",
-    "    ? Object.entries(suppliedRegistry).map(([name, value]) => value && typeof value === \"object\" && !Array.isArray(value) ? { ...value, name: typeof value.name === \"string\" ? value.name : name } : { name })",
-    "    : [];",
-    "const nativeCommandNames = new Set(registryEntries.map(entry => typeof entry === \"string\" ? entry : entry && typeof entry === \"object\" && !Array.isArray(entry) && typeof entry.name === \"string\" ? entry.name : undefined).filter(name => typeof name === \"string\"));",
-    `const nativeCommandCandidates = ${JSON.stringify([execCommandName, shellCommandName])}.filter(name => (nativeCommandNames.size === 0 || nativeCommandNames.has(name)) && typeof tools[name] === \"function\");`,
+    "const isObject = value => value !== null && typeof value === \"object\" && !Array.isArray(value);",
+    "const descriptorLike = value => isObject(value) && (typeof value.type === \"string\" || typeof value.name === \"string\" || typeof value.description === \"string\" || \"parameters\" in value || \"input_schema\" in value || \"inputSchema\" in value || \"schema\" in value || \"format\" in value);",
+    "const nativeNames = new Set();",
+    "const paths = new Map();",
+    "const addEntry = (entry, fallbackName, prefix = \"\", path = []) => {",
+    "  const ownName = typeof entry === \"string\" ? entry : isObject(entry) && typeof entry.name === \"string\" ? entry.name : fallbackName;",
+    "  const explicitNamespace = isObject(entry) && typeof entry.namespace === \"string\" ? entry.namespace : \"\";",
+    "  const name = explicitNamespace ? explicitNamespace + \"__\" + ownName : prefix ? (ownName?.startsWith(prefix + \"__\") ? ownName : prefix + \"__\" + ownName) : ownName;",
+    "  if (typeof name !== \"string\" || name.length === 0) return;",
+    "  nativeNames.add(name);",
+    "  const candidate = path.length > 0 ? path : [name];",
+    "  const list = paths.get(name) || [];",
+    "  if (!list.some(item => item.length === candidate.length && item.every((part, index) => part === candidate[index]))) list.push(candidate);",
+    "  paths.set(name, list);",
+    "};",
+    "const flatten = (value, prefix = \"\", path = []) => {",
+    "  if (Array.isArray(value)) { for (const entry of value) { if (isObject(entry) && (entry.type === \"namespace\" || \"tools\" in entry)) flatten(entry.tools, typeof entry.name === \"string\" ? entry.name : prefix, path); else addEntry(entry, undefined, prefix, path); } return; }",
+    "  if (!isObject(value)) return;",
+    "  if (value.type === \"namespace\" || (\"tools\" in value && !descriptorLike(value))) { flatten(value.tools, typeof value.name === \"string\" ? value.name : prefix, path); return; }",
+    "  for (const key of Reflect.ownKeys(value)) { if (typeof key !== \"string\") continue; const child = Reflect.get(value, key, value); const childPath = [...path, key]; if (isObject(child) && (child.type === \"namespace\" || \"tools\" in child)) { flatten(child.tools, typeof child.name === \"string\" ? child.name : (prefix ? prefix + \"__\" + key : key), childPath); continue; } if (isObject(child) && !descriptorLike(child)) { flatten(child, prefix ? prefix + \"__\" + key : key, childPath); continue; } addEntry(child, key, prefix, childPath); }",
+    "};",
+    "try { flatten(typeof ALL_TOOLS !== \"undefined\" ? ALL_TOOLS : undefined); } catch {}",
+    "try { flatten(tools); } catch {}",
+    "const resolveNative = name => { try { const direct = Reflect.get(tools, name, tools); if (typeof direct === \"function\") return { value: direct, owner: tools }; } catch {} for (const path of paths.get(name) || []) { let owner = tools; try { for (const part of path.slice(0, -1)) owner = Reflect.get(owner, part, owner); const value = Reflect.get(owner, path.at(-1), owner); if (typeof value === \"function\") return { value, owner }; } catch {} } return undefined; };",
+    `const nativeCommandCandidates = ${JSON.stringify([execCommandName, shellCommandName])}.filter(name => (nativeNames.size === 0 || nativeNames.has(name)) && resolveNative(name));`,
     "if (nativeCommandCandidates.length !== 1) throw new Error(\"Expected exactly one native command tool; found \" + (nativeCommandCandidates.join(\", \") || \"none\"));",
     "const nativeCommandName = nativeCommandCandidates[0];",
-    "const nativeCommand = tools[nativeCommandName];",
-    "if (typeof nativeCommand !== \"function\") throw new Error(\"Native command tool \" + nativeCommandName + \" is listed but unavailable\");",
+    "const nativeCommand = resolveNative(nativeCommandName);",
+    "if (!nativeCommand) throw new Error(\"Native command tool \" + nativeCommandName + \" is listed but unavailable\");",
     `const nativeCommandInput = nativeCommandName === ${JSON.stringify(execCommandName)} ? ${JSON.stringify(execCommandArguments)} : ${JSON.stringify(shellCommandArguments)};`,
-    "const result = await nativeCommand(nativeCommandInput);",
+    "const result = await Reflect.apply(nativeCommand.value, nativeCommand.owner, [nativeCommandInput]);",
   ]);
 }
 
@@ -657,7 +826,7 @@ export async function runChatGptMcpServer(options: {
         wireName: wireName(tool),
         freeform: tool.freeform === true,
         ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
-        invocationKey: mcpInvocationKey(extra),
+        invocationKey: mcpInvocationKey(extra, bindingId, tool, payload),
       }, timeoutMs, extra.signal);
       return asMcpResult(response);
     } catch (error) {
@@ -702,7 +871,7 @@ export async function runChatGptMcpServer(options: {
   ) => {
     const gateway = execGateway(bound);
     if (!gateway) {
-      throw new Error(`This Codex turn did not advertise ${nestedToolName} or the native exec gateway`);
+      throw new Error(chatGptUnavailableToolMessage(nestedToolName, toolCapabilityReport(bound, contract)));
     }
     return invoke(bindingId, bound, gateway, {
       input: execGatewayProgram(nestedToolName, freeform, payload, bound.tools.map(wireName)),
@@ -721,6 +890,12 @@ export async function runChatGptMcpServer(options: {
         yield_time_ms: z.number().int().min(250).max(30_000).optional(),
         max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
         tty: z.boolean().optional(),
+        sandbox_permissions: z.enum(["use_default", "require_escalated"]).optional()
+          .describe("Native Codex sandbox request, only when the current command tool supports it. Codex decides whether to approve."),
+        justification: z.string().optional()
+          .describe("Approval question for a native require_escalated request; omit otherwise."),
+        prefix_rule: z.array(z.string()).optional()
+          .describe("Optional native approval prefix for require_escalated; Codex owns its approval and persistence."),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
@@ -729,28 +904,42 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { cmd, workdir, yield_time_ms, max_output_tokens, tty } = input;
+        const { cmd, workdir, yield_time_ms, max_output_tokens, tty, sandbox_permissions, justification, prefix_rule } = input;
         const bound = claimed.environment;
+        const permissions = {
+          ...(sandbox_permissions !== undefined ? { sandbox_permissions } : {}),
+          ...(justification !== undefined ? { justification } : {}),
+          ...(prefix_rule !== undefined ? { prefix_rule } : {}),
+        };
         const execCommandArguments = {
           cmd,
           ...(workdir ? { workdir } : {}),
           ...(yield_time_ms !== undefined ? { yield_time_ms } : {}),
           ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
           ...(tty !== undefined ? { tty } : {}),
+          ...permissions,
         };
         const shellCommandArguments = {
           command: cmd,
           ...(workdir ? { workdir } : {}),
           ...(yield_time_ms !== undefined ? { timeout_ms: yield_time_ms } : {}),
+          ...permissions,
         };
-        const tool = toolNamed(bound, "exec_command") ?? toolNamed(bound, "shell_command");
+        const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
         if (tool) {
+          // Never silently discard an approval request on a native registry that cannot express it.
+          const properties = tool.parameters.properties;
+          for (const key of Object.keys(permissions)) {
+            if (!properties || typeof properties !== "object" || !Object.hasOwn(properties, key)) {
+              throw new Error(`The current native ${tool.name} tool does not support ${key}`);
+            }
+          }
           const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
           return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra);
         }
         const gateway = execGateway(bound);
         if (!gateway) {
-          throw new Error("This Codex turn did not advertise a native command tool or the native exec gateway");
+          throw new Error(chatGptUnavailableToolMessage("exec_command", toolCapabilityReport(bound, contract)));
         }
         return invoke(claimed.bindingId, bound, gateway, {
           input: execCommandGatewayProgram(execCommandArguments, shellCommandArguments),
@@ -780,7 +969,7 @@ export async function runChatGptMcpServer(options: {
       async claimed => {
         const { session_id, chars, yield_time_ms, max_output_tokens } = input;
         const bound = claimed.environment;
-        const tool = toolNamed(bound, "write_stdin");
+        const tool = exactTool(bound, "write_stdin");
         const payload = { arguments: {
           session_id,
           ...(chars !== undefined ? { chars } : {}),
@@ -809,7 +998,7 @@ export async function runChatGptMcpServer(options: {
       async claimed => {
         const { patch } = input;
         const bound = claimed.environment;
-        const tool = toolNamed(bound, "apply_patch");
+        const tool = exactTool(bound, "apply_patch");
         if (!tool) return invokeNestedNative(claimed.bindingId, bound, "apply_patch", true, { input: patch }, extra);
         return tool.freeform
           ? invoke(claimed.bindingId, bound, tool, { input: patch }, extra)
@@ -837,12 +1026,31 @@ export async function runChatGptMcpServer(options: {
       async claimed => {
         const { path, detail } = input;
         const bound = claimed.environment;
-        const tool = toolNamed(bound, "view_image");
+        const tool = exactTool(bound, "view_image");
         const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
         return tool
           ? invoke(claimed.bindingId, bound, tool, payload, extra)
           : invokeNestedNative(claimed.bindingId, bound, "view_image", false, payload, extra);
       },
+    ),
+  );
+
+  server.registerTool(
+    "codex_tool_capabilities",
+    {
+      title: "Inspect current Codex tool capabilities",
+      description: afterSafeStart(contract,
+        "Return the exact tool catalog hash, logical surfaces, direct/deferred provenance, and recovery action for this Codex turn. "
+        + "Use this before reporting browser, computer, execution, MCP, or subagent tooling as unavailable. "
+        + "A missing capability here means the outer Codex harness did not advertise it; the bridge will not fabricate a native handler."),
+      inputSchema: turnReferenceInput(contract),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => withClaimedTurn(
+      "codex_tool_capabilities",
+      turnReference(contract, input),
+      extra,
+      async claimed => result(toolCapabilityReport(claimed.environment, contract)),
     ),
   );
 
@@ -856,6 +1064,7 @@ export async function runChatGptMcpServer(options: {
       inputSchema: {
         ...turnReferenceInput(contract),
         query: z.string().max(500).optional(),
+        surface: z.enum(CHATGPT_TOOL_SURFACE_IDS).optional(),
         offset: z.number().int().min(0).max(100_000).default(0),
         limit: z.number().int().min(1).max(50).default(20),
         include_schema: z.boolean().default(true),
@@ -867,7 +1076,7 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { query, offset, limit, include_schema } = input;
+        const { query, surface, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
         const directMatches = safeVisibleTools(bound, contract).filter(tool => !needle || [
@@ -875,7 +1084,8 @@ export async function runChatGptMcpServer(options: {
           tool.name,
           tool.namespace ?? "",
           tool.description,
-        ].join("\n").toLowerCase().includes(needle));
+        ].join("\n").toLowerCase().includes(needle))
+          .filter(tool => !surface || chatGptToolSurfaceForTool(tool) === surface);
         const directPage = directMatches.slice(offset, offset + limit).map(tool => ({
           wire_name: wireName(tool),
           name: tool.name,
@@ -898,6 +1108,7 @@ export async function runChatGptMcpServer(options: {
           const response = await invoke(claimed.bindingId, bound, gateway, {
             input: gatewayToolCatalogProgram({
               query,
+              surface,
               offset: nestedOffset,
               limit: nestedLimit,
               // A gateway-discovered entry may supplement the outer registry, but it must never
@@ -974,7 +1185,7 @@ export async function runChatGptMcpServer(options: {
           const gateway = execGateway(bound);
           const hiddenOuterTool = bound.tools.some(candidate => wireName(candidate) === wire_name);
           if (!gateway || hiddenOuterTool || !gatewayToolNameIsValid(wire_name)) {
-            throw new Error(`Codex tool is not available in this turn: ${wire_name}`);
+            throw new Error(chatGptUnavailableToolMessage(wire_name, toolCapabilityReport(bound, contract)));
           }
           if (input !== undefined && args && Object.keys(args).length > 0) {
             throw new Error(`Codex nested tool ${wire_name} accepts either arguments or freeform input, not both`);
@@ -1033,5 +1244,5 @@ export async function runChatGptMcpServer(options: {
     );
   }
 
-  await server.connect(new StdioServerTransport());
+  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES));
 }

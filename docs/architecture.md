@@ -39,6 +39,11 @@ launcher-owned codex-chatgpt-web daemon
   runtime registry and can invoke an exact listed name through bridge-owned code. Full mode also
   preserves Codex's native freeform `exec`; its tool registry enforces the same bounded
   `wait_agent` contract as direct and structured calls.
+- The `codex_tool_capabilities` report records the live outer catalog hash, source provenance, and
+  direct, deferred, and gateway-backed logical surfaces. `codex_tool_inventory` can filter that
+  catalog by surface and returns exact wire names and schemas; `codex_tool_call` invokes only names
+  returned by that catalog. A catalog epoch identifies when ChatGPT is using a stale connector
+  contract, while the outer Codex environment remains the authority for execution and approvals.
 - Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
 
 ### Repository DEV driver

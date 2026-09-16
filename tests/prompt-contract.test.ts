@@ -141,7 +141,7 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
 
 test("Pro preserves the same native Codex delegation contract as Extra High", () => {
   const token = "turn_12345678901234567890123456789012";
-  const capabilities = { localToolsEnabled: true, solAvailable: true, proAvailable: true };
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   const pro = compileChatGptWebPrompt(request("max"), capabilities, token);
   const extraHigh = compileChatGptWebPrompt(request("xhigh"), capabilities, token);
 

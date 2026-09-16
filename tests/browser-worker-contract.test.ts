@@ -2871,7 +2871,7 @@ test("auto-approval recognizes the observed non-dialog approval card", async () 
 
 test("browser preflight separates model context from one-message transport limits", () => {
   const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
-  const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+  const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   const luna = { localToolsEnabled: false, solAvailable: false, proAvailable: false };
 
   try {

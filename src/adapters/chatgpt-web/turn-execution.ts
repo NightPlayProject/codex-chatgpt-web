@@ -701,7 +701,7 @@ export class ChatGptTurnSessions {
     const target = preserved ? this.entries.get(preserved.executionKey) : undefined;
     // Earlier settled rounds in this same epoch are retired below. Their replay key must
     // not prevent the latest final response from replacing them during compaction. A
-    // subscription-router migration can also leave a fully-settled replay owner attached to
+    // A retained browser migration can also leave a fully-settled replay owner attached to
     // the previous browser epoch. Native Codex preserves thread_id across that verified history
     // move, so the same thread may reclaim the replay key after the old physical owner is gone.
     // Never displace an active/physically-live round or a different native thread.

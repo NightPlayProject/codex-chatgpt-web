@@ -62,6 +62,26 @@ function objectMappedComputerUseTools() {
   };
 }
 
+function directNamespaceMapComputerUseTools() {
+  return {
+    "Microsoft.windows.Computer": {
+      get_app_state: {
+        description: "Read the current Windows app state",
+        input_schema: { type: "object", properties: {} },
+      },
+      click: {
+        type: "function",
+        description: "Click a visible Windows target",
+        inputSchema: {
+          type: "object",
+          properties: { x: { type: "number" }, y: { type: "number" } },
+          required: ["x", "y"],
+        },
+      },
+    },
+  };
+}
+
 test("Responses Lite preserves client tools from every namespace", () => {
   const parsed = parseRequest({
     model: "chatgpt-web/luna",
@@ -71,6 +91,7 @@ test("Responses Lite preserves client tools from every namespace", () => {
   expect(parsed.context.tools).toContainEqual(expect.objectContaining({
     name: "exec",
     freeform: true,
+    source: "additional_tools",
   }));
   const waitTool = parsed.context.tools?.find(tool => tool.name === "wait");
   expect(waitTool).toEqual(expect.objectContaining({ name: "wait" }));
@@ -79,7 +100,49 @@ test("Responses Lite preserves client tools from every namespace", () => {
     name: "run_script",
     namespace: "mcp__python",
     freeform: true,
+    source: "additional_tools",
   }));
+});
+
+test("Responses Lite keeps unnamed tool_search declarations", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/high",
+    tools: [{ type: "tool_search" }],
+    input: [{ type: "message", role: "user", content: "Find the desktop tools" }],
+  });
+
+  expect(parsed.context.tools).toContainEqual(expect.objectContaining({
+    name: "tool_search",
+    toolSearch: true,
+    source: "declared",
+  }));
+});
+
+test("Responses Lite preserves namespaced allowed tool choices", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/high",
+    tools: [{
+      type: "function",
+      name: "click",
+      namespace: "mcp__open_computer_use",
+      parameters: { type: "object", properties: {} },
+    }],
+    tool_choice: {
+      type: "allowed_tools",
+      mode: "required",
+      tools: [{
+        type: "function",
+        name: "click",
+        namespace: "mcp__open_computer_use",
+      }],
+    },
+    input: [{ type: "message", role: "user", content: "Click" }],
+  });
+
+  expect(parsed.options.toolChoice).toEqual({
+    allowedTools: ["mcp__open_computer_use__click"],
+    mode: "required",
+  });
 });
 
 test("Responses Lite keeps object-mapped Computer Use tools addressable by exact wire name", () => {
@@ -89,8 +152,51 @@ test("Responses Lite keeps object-mapped Computer Use tools addressable by exact
   });
 
   expect(parsed.context.tools).toEqual(expect.arrayContaining([
-    expect.objectContaining({ name: "get_app_state", namespace: "mcp__open_computer_use" }),
-    expect.objectContaining({ name: "click", namespace: "mcp__open_computer_use" }),
+    expect.objectContaining({ name: "get_app_state", namespace: "mcp__open_computer_use", source: "additional_tools" }),
+    expect.objectContaining({ name: "click", namespace: "mcp__open_computer_use", source: "additional_tools" }),
+  ]));
+});
+
+test("Responses Lite preserves direct namespace maps used by the native Computer registry", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/high",
+    tools: directNamespaceMapComputerUseTools(),
+    input: [{ type: "message", role: "user", content: "Read the current app state" }],
+  });
+
+  expect(parsed.context.tools).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      name: "get_app_state",
+      namespace: "Microsoft.windows.Computer",
+      parameters: { type: "object", properties: {} },
+    }),
+    expect.objectContaining({
+      name: "click",
+      namespace: "Microsoft.windows.Computer",
+      parameters: expect.objectContaining({ required: ["x", "y"] }),
+    }),
+  ]));
+});
+
+test("Responses Lite merges top-level deferred tool registries without losing nested namespaces", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/high",
+    additional_tools: directNamespaceMapComputerUseTools(),
+    tool_search_output: {
+      "mcp__desktop": {
+        screenshot: {
+          type: "function",
+          description: "Capture the desktop",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    },
+    input: [{ type: "message", role: "user", content: "Inspect the desktop" }],
+  });
+
+  expect(parsed.context.tools).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "get_app_state", namespace: "Microsoft.windows.Computer", source: "additional_tools" }),
+    expect.objectContaining({ name: "screenshot", namespace: "mcp__desktop", source: "tool_search_output" }),
   ]));
 });
 
@@ -109,8 +215,8 @@ test("Responses Lite flattens object-mapped tool-search output and reports calla
   });
 
   expect(parsed.context.tools).toEqual(expect.arrayContaining([
-    expect.objectContaining({ name: "get_app_state", namespace: "mcp__open_computer_use" }),
-    expect.objectContaining({ name: "click", namespace: "mcp__open_computer_use" }),
+    expect.objectContaining({ name: "get_app_state", namespace: "mcp__open_computer_use", source: "tool_search_output" }),
+    expect.objectContaining({ name: "click", namespace: "mcp__open_computer_use", source: "tool_search_output" }),
   ]));
   const result = parsed.context.messages.find(message => message.role === "toolResult");
   expect(result?.role === "toolResult" ? result.content : "").toContain(
@@ -165,6 +271,51 @@ test("Responses Lite relays a static Computer Use call through its namespace", a
     call_id: "call_get_app_state",
     name: "get_app_state",
     namespace: "mcp__open_computer_use",
+    arguments: "{}",
+  })]);
+});
+
+test("Responses Lite relays a direct Microsoft.windows.Computer registry call without renaming it", async () => {
+  const config = defaultConfig("full");
+  config.solAvailable = false;
+  config.proAvailable = false;
+  const turnId = "turn_responses_lite_windows_computer";
+  const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt-web/luna",
+      stream: false,
+      metadata: { turn_id: turnId, thread_id: "thread_responses_lite_windows_computer" },
+      tools: directNamespaceMapComputerUseTools(),
+      input: [{
+        type: "message",
+        id: "msg_responses_lite_windows_computer",
+        role: "user",
+        content: [{ type: "input_text", text: "Read the current app state" }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    }),
+  }), config, () => ({
+    name: "responses-lite-windows-computer",
+    async runTurn(parsed, _incoming, emit) {
+      expect(parsed.context.tools).toContainEqual(expect.objectContaining({
+        name: "get_app_state",
+        namespace: "Microsoft.windows.Computer",
+      }));
+      emit({ type: "tool_call_start", id: "call_windows_get_app_state", name: "Microsoft.windows.Computer__get_app_state" });
+      emit({ type: "tool_call_delta", arguments: "{}" });
+      emit({ type: "tool_call_end" });
+      emit({ type: "done", endTurn: false });
+    },
+  }), { rememberState: false });
+
+  expect(response.status).toBe(200);
+  const body = await response.json() as { output: Array<Record<string, unknown>> };
+  expect(body.output.filter(item => item.type === "function_call")).toEqual([expect.objectContaining({
+    call_id: "call_windows_get_app_state",
+    name: "get_app_state",
+    namespace: "Microsoft.windows.Computer",
     arguments: "{}",
   })]);
 });

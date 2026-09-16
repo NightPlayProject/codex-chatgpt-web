@@ -66,7 +66,7 @@ public static class CWPackageActivation {
  public static void Open(string id,string args){var manager=(Manager)new ActivationManager();try{uint pid;Marshal.ThrowExceptionForHR(manager.ActivateApplication(id,args,0,out pid));}finally{Marshal.ReleaseComObject(manager);}}
 }
 '@}
-[CWPackageActivation]::Open($env:CW_APP_ID,"--remote-debugging-address=127.0.0.1 --remote-debugging-port=$($env:CW_PORT)")
+[CWPackageActivation]::Open($env:CW_APP_ID,$env:CW_ARGS)
 [pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
 `;
 
@@ -136,8 +136,15 @@ async function validateOfficialEndpoint(endpoint, identity) {
 }
 
 async function launchOfficialCodex(identity, port) {
+  return launchOfficialCodexApplication(
+    identity,
+    `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`,
+  );
+}
+
+async function launchOfficialCodexApplication(identity, args = "") {
   await runPowerShellJson(LAUNCH_STORE_APP_SCRIPT, {
-    env: { CW_APP_ID: identity.AppId, CW_PORT: String(port) },
+    env: { CW_APP_ID: identity.AppId, CW_ARGS: String(args) },
   });
 }
 
@@ -526,6 +533,35 @@ function createOfficialCodexWallpaperController({
     restartTimer.unref?.();
   }
 
+  async function prepareExternalRestart() {
+    if (!enabled) return null;
+    const nextIdentity = identity || await resolveIdentity();
+    stopRestartWait();
+    stopRefresh();
+    identity = nextIdentity;
+    publish({ status: "restarting", restartRequired: false, error: null });
+    return { identity: nextIdentity };
+  }
+
+  async function resumeExternalRestart() {
+    if (!enabled) return null;
+    const nextIdentity = identity || await resolveIdentity();
+    return launchAndAttach(nextIdentity);
+  }
+
+  async function abortExternalRestart() {
+    if (!enabled) return null;
+    const nextIdentity = identity || await resolveIdentity();
+    const stored = await attachStoredEndpoint(nextIdentity);
+    if (stored) {
+      return startRefresh(nextIdentity, stored);
+    }
+    const processes = await listProcesses(nextIdentity).catch(() => []);
+    beginRestartWait(nextIdentity, processes);
+    publish({ status: "restart-required", restartRequired: true, error: null });
+    return null;
+  }
+
   const setEnabledNow = async next => {
     if (platform !== "win32") {
       if (next) throw new Error("Codex Wallpapers official-app integration is currently available on Windows only");
@@ -599,6 +635,9 @@ function createOfficialCodexWallpaperController({
       stopRestartWait();
       stopRefresh();
     },
+    prepareExternalRestart,
+    resumeExternalRestart,
+    abortExternalRestart,
     endpointPath,
     dataRoot: resolvedDataRoot,
   };
@@ -615,6 +654,7 @@ module.exports = {
   endpointRecordLooksValid,
   findLoopbackPort,
   launchOfficialCodex,
+  launchOfficialCodexApplication,
   listOfficialCodexProcesses,
   officialAppTarget,
   resolveOfficialCodexIdentity,

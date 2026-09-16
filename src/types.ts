@@ -137,6 +137,8 @@ export interface CodexTool {
   freeform?: boolean;
   /** Client-executed tool discovery (tool_search): the model's call must be relayed as a tool_search_call. */
   toolSearch?: boolean;
+  /** Where the current Responses request supplied this tool declaration. */
+  source?: "declared" | "additional_tools" | "tool_search_output";
 }
 
 /**
@@ -309,6 +311,8 @@ export interface CodexProviderConfig {
     localToolsEnabled?: boolean;
     /** Account capability proven by the authenticated browser probe. */
     solAvailable?: boolean;
+    /** Account capability proven by the authenticated browser probe. */
+    extraHighAvailable?: boolean;
     /** Account capability proven by the authenticated browser probe. */
     proAvailable?: boolean;
     /** Full automatic mode authorizes per-call "Allow once" confirmation clicks for this connector. */

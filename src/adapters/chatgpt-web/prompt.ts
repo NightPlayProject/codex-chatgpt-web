@@ -162,7 +162,7 @@ export function formatChatGptWebMultipartCommit(
   ].join("\n");
 }
 
-const RETIRED_TURN_HANDLE = /\b(turn|request|binding)_[A-Za-z0-9_-]{24,}/g;
+const RETIRED_TURN_HANDLE = /(?<![A-Za-z0-9_-])(turn|request|binding)_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/g;
 
 /**
  * The accumulated Codex context replays earlier turns, including the broker handles those turns
@@ -170,7 +170,11 @@ const RETIRED_TURN_HANDLE = /\b(turn|request|binding)_[A-Za-z0-9_-]{24,}/g;
  * the current turn is supplied by the contract text, never by the replayed context.
  */
 export function withoutRetiredTurnHandles(contextJson: string): string {
-  return contextJson.replace(RETIRED_TURN_HANDLE, (_handle, kind: string) => `[retired ${kind} handle]`);
+  // Match decoded string values: in serialized JSON a newline's `n` is a word character
+  // immediately before the handle. Leave structural keys and native tool-call IDs intact.
+  return JSON.stringify(JSON.parse(contextJson, (_key, value: unknown) => typeof value === "string"
+    ? value.replace(RETIRED_TURN_HANDLE, (_handle, kind: string) => `[retired ${kind} handle]`)
+    : value));
 }
 
 /** ChatGPT accepts at most this many attachments on one message. */
@@ -556,7 +560,9 @@ export function compileChatGptWebPrompt(
     ? [
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
       "Codex Native access has one universal tool path for every local capability: direct shell and process tools, browser and computer-use tools, MCP and connector/app tools, and subagent tools are all callable when the current harness advertises them.",
+      "Before reporting a browser, computer, execution, MCP, or subagent surface as unavailable, call codex_tool_capabilities when the bridge exposes it. If that bridge tool is missing, refresh or reload the Codex Web GPT connector because ChatGPT may be using a stale connector catalog.",
       "The visible static native tool list is authoritative on current Codex clients where deferred tool_search is unavailable. If tool_search is explicitly advertised and the required capability is not visible, use it with a focused query to load deferred tools; otherwise, if codex_tool_inventory is exposed by the bridge, use it with include_schema=true as the exact registry fallback. A missing named direct tool, a previous assistant statement, or a long-running turn is not evidence that the capability is absent.",
+      "When tool_search appears in the outer Codex catalog, invoke that exact wire name through codex_tool_call with its declared query schema, then use the exact names returned by its tool_search_output on the next tool boundary. ChatGPT-native discovery is separate and must not be treated as proof that an outer Codex tool is callable.",
       "Use the exact wire_name and parameters returned by codex_tool_inventory with codex_tool_call: pass structured tools through arguments and freeform tools through input. Do not rename, sanitize, guess, or substitute a native tool that the inventory exposes, and do not report that there is no active local connection until the inventory or the attempted native call returns a concrete result.",
       "For computer and browser work, prefer the available task-appropriate Codex Native tool, including native MCP tools. Follow the supplied task instructions and each tool's prerequisites. Use shell-driven UI automation or another fallback only when the preferred tool is unavailable, lacks the required capability, or returns a concrete failure; do not switch routes merely because the model took time to choose its next call.",
       "Reuse tool names, schemas, and surface handles already discovered in this task while they remain valid. Search for tools only when a required capability is missing; repeat discovery or app inventory only when a result establishes that the available tools or target surface changed. Obtain fresh UI state when needed to ground the next interaction, without repeating an unchanged inventory before every action.",
@@ -695,7 +701,7 @@ export function compileChatGptWebPrompt(
       "The task context is complete. Execute the latest active user request now under the capability contract above.",
       "</codex_transport_resume>",
     ];
-  const build = (sourceMessages: readonly CodexMessage[]): CompiledChatGptWebPrompt => {
+  const build = (sourceMessages: readonly CodexMessage[], omittedMessages = 0): CompiledChatGptWebPrompt => {
     const images: ChatGptWebPromptImage[] = [];
     const budget: ImageBudget = {
       seen: 0,
@@ -774,7 +780,15 @@ export function compileChatGptWebPrompt(
       "<codex_context_json>",
       envelopeJson,
       "</codex_context_json>",
-      ...transportResume,
+      ...(omittedMessages > 0 ? [
+        "<codex_transport_resume>",
+        `${omittedMessages} earlier history items were omitted to fit this compaction request; the supplied history is incomplete.`,
+        "Preserve still-relevant progress, constraints, and pending work from any supplied cumulative checkpoint and the remaining evidence. Do not infer that omitted work was never done or invent missing details.",
+        manualControl
+          ? "Produce the requested checkpoint summary now."
+          : "Produce the requested checkpoint summary now without calling tools.",
+        "</codex_transport_resume>",
+      ] : transportResume),
     ].join("\n");
     return { text, images };
   };
@@ -795,20 +809,22 @@ export function compileChatGptWebPrompt(
     chatGptPromptJsonBytes(compiled.text) > CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET
   );
 
-  // Match native Codex compaction recovery: discard oldest history items one at a time until the
-  // summarization request fits. Never discard the final compaction instruction itself, and rebuild
-  // image references after every trim so removed messages cannot leave orphaned attachments.
-  while (
-    exceedsCompactionBudget()
-    && sourceMessages.length > 1
-  ) {
-    sourceMessages = sourceMessages.slice(1);
-    compiled = build(sourceMessages);
+  // A cumulative checkpoint may be the only remaining account of earlier work. Preserve the
+  // newest one and the final compaction instruction; trim other history in its original order.
+  let checkpointIndex = sourceMessages.findLastIndex(message =>
+    message.role === "user" && isReadableCompactionSummaryText(plainMessageText(message))
+  );
+  while (exceedsCompactionBudget() && sourceMessages.length > 1) {
+    const discardIndex = checkpointIndex === 0 ? 1 : 0;
+    if (discardIndex === sourceMessages.length - 1) break;
+    sourceMessages.splice(discardIndex, 1);
+    if (checkpointIndex > discardIndex) checkpointIndex -= 1;
+    compiled = build(sourceMessages, initialMessageCount - sourceMessages.length);
   }
   const encodedBytes = chatGptPromptJsonBytes(compiled.text);
   if (exceedsCompactionBudget()) {
     throw new Error(
-      `ChatGPT Web compaction prompt still requires ${encodedBytes.toLocaleString("en-US")} JSON bytes after all older history was trimmed; the final compaction instruction alone exceeds the browser compaction budget`,
+      `ChatGPT Web compaction prompt still requires ${encodedBytes.toLocaleString("en-US")} JSON bytes after other history was trimmed; ${checkpointIndex >= 0 ? "the cumulative checkpoint and final compaction instruction exceed" : "the final compaction instruction alone exceeds"} the browser compaction budget`,
     );
   }
   const trimmedCompactionMessages = initialMessageCount - sourceMessages.length;

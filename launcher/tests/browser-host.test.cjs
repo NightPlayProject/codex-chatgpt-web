@@ -410,6 +410,7 @@ test("session inspection delegates navigation and capability detection to the sh
           temporary: true,
           url: "https://chatgpt.com/?temporary-chat=true",
           solAvailable: true,
+          extraHighAvailable: true,
           proAvailable: true,
         },
       };
@@ -423,6 +424,7 @@ test("session inspection delegates navigation and capability detection to the sh
     temporary: true,
     url: "https://chatgpt.com/?temporary-chat=true",
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   });
   assert.equal(calls.length, 2);
@@ -1625,12 +1627,20 @@ test("an uninitialized browser surface is reaped instead of remaining as a gray 
   assert.equal(fixture.selectedTabId, "home");
   assert.equal(fixture.closedTurnOwners.get(tab.traceId), tab.helperPid);
   assert.deepEqual(closed, ["view", "contents"]);
-  assert.deepEqual(warnings, [["browser.orphan_turn_reaped", {
+  assert.deepEqual(warnings, [
+    ["browser.orphan_turn_expired", {
+      tabId: tab.id,
+      traceId: tab.traceId,
+      helperPid: tab.helperPid,
+      evidence: "browser_surface_bootstrap_timeout",
+    }],
+    ["browser.orphan_turn_reaped", {
     tabId: tab.id,
     traceId: tab.traceId,
     helperPid: tab.helperPid,
     evidence: "browser_surface_bootstrap_timeout",
-  }]]);
+    }],
+  ]);
 });
 
 test("removing the final turn tab keeps the descriptor-owned idle host attached offscreen", () => {
@@ -2963,6 +2973,7 @@ test("interaction-mode changes preserve mode-bound retained tabs on failure and 
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     getBrowserInteractionMode: () => "manual",
     interactionModeOverride: null,
+    writeDescriptor: () => {},
     manualOperation: null,
     turnTabs: new Map([
       [retainedAutomatic.id, retainedAutomatic],
@@ -3011,6 +3022,7 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     getBrowserInteractionMode: () => "manual",
     interactionModeOverride: null,
+    writeDescriptor: () => {},
     manualOperation: null,
     turnTabs: new Map(),
     selectedTabId: "home",
@@ -3036,6 +3048,7 @@ test("a failed Automatic ownership proof stays inside the runtime rollback bound
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     getBrowserInteractionMode: () => "manual",
     interactionModeOverride: null,
+    writeDescriptor: () => {},
     manualOperation: null,
     turnTabs: new Map([[retained.id, retained]]),
     selectedTabId: retained.id,

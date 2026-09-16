@@ -8,7 +8,10 @@ const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "ut
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
+const officialWallpaperSource = fs.readFileSync(path.join(launcherRoot, "electron", "official-codex-wallpapers.cjs"), "utf8");
+const wallpaperSource = fs.readFileSync(path.join(launcherRoot, "wallpapers", "runtime.js"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
+const accountSwitcherSource = fs.readFileSync(path.join(launcherRoot, "electron", "account-switcher.cjs"), "utf8");
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -143,6 +146,58 @@ test("Bigger Context startup recommendation reuses the persisted setting and set
   assert.match(appSource, /<Switch checked=\{checked\} disabled=\{busy\} onChange=\{onChange\} \/>/);
   assert.match(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*position:\s*fixed;/s);
   assert.doesNotMatch(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*backdrop-filter:/s);
+});
+
+test("Codex Wallpapers is routed only to the official Store Codex app", () => {
+  assert.match(appSource, /snapshot\.state\.codexWallpapersEnabled/);
+  assert.match(appSource, /api!\.setWallpapersEnabled\(enabled\)/);
+  const wallpaperSetting = appSource.slice(
+    appSource.indexOf('<SettingRow body={copy.codexWallpapersBody}'),
+    appSource.indexOf('<SettingRow', appSource.indexOf('<SettingRow body={copy.codexWallpapersBody}') + 1),
+  );
+  assert.match(wallpaperSetting, /disabled=\{busy\}/);
+  assert.doesNotMatch(wallpaperSetting, /browserInteractionMode/);
+  assert.match(preloadSource, /setWallpapersEnabled:[\s\S]*?launcher:wallpapers/);
+  assert.match(electronMain, /handle\("launcher:wallpapers"/);
+  assert.match(electronMain, /createOfficialCodexWallpaperController/);
+  assert.match(electronMain, /officialCodexWallpaperController\.setEnabled\(enabled === true\)/);
+  assert.match(electronMain, /persistOfficialCodexWallpaperStatus/);
+  assert.doesNotMatch(electronMain, /createWallpaperManager/);
+  assert.doesNotMatch(electronMain, /wallpaperManager:/);
+  assert.doesNotMatch(browserHostSource, /wallpaperManager|applyWallpapersToContents|setWallpapersEnabled|WALLPAPER_RETRY/);
+  assert.match(officialWallpaperSource, /Get-AppxPackage -Name OpenAI\.Codex/);
+  assert.match(officialWallpaperSource, /SignatureKind -ne 'Store'/);
+  assert.match(officialWallpaperSource, /--remote-debugging-address=127\.0\.0\.1/);
+  assert.match(officialWallpaperSource, /target\.url\.startsWith\("app:\/\/"\)/);
+  assert.match(wallpaperSource, /const api=\{[^}]*setEnabled/s);
+});
+
+test("account switching stays in the official Windows Codex session", () => {
+  assert.match(appSource, /surface === "accounts"/);
+  assert.match(appSource, /label=\{copy\.accountSwitcher\}/);
+  assert.match(appSource, /api!\.addCurrentAccount\(\)/);
+  assert.match(appSource, /api!\.switchAccount\(account\.id\)/);
+  assert.match(preloadSource, /addCurrentAccount:[\s\S]*?launcher:account-add-current/);
+  assert.match(preloadSource, /switchAccount:[\s\S]*?launcher:account-switch/);
+  assert.match(electronMain, /createAccountSwitcher\(/);
+  assert.match(electronMain, /codexHome:\s*LAUNCHER_PROFILE\.codexHome/);
+  assert.match(accountSwitcherSource, /\.codex-switcher/, "the compatible Codex Switcher store is an input");
+  assert.match(accountSwitcherSource, /Get-AppxPackage|resolveOfficialCodexIdentity/);
+  assert.match(accountSwitcherSource, /writePrivateFileAtomic\(authPath/);
+  assert.match(accountSwitcherSource, /Official Codex account switching is currently available on Windows/);
+  assert.doesNotMatch(appSource, /auth_data/);
+});
+
+test("native Windows Computer Use setup is explicit, production-scoped, and reloads Codex", () => {
+  assert.match(appSource, /copy\.installNativeComputerUse/);
+  assert.match(appSource, /api!\.setupNativeComputerUse\(\)/);
+  assert.match(appSource, /step === 1 && !devProfile && platform === "win32"/);
+  assert.match(preloadSource, /setupNativeComputerUse:[\s\S]*?launcher:native-computer-use-setup/);
+  assert.match(electronMain, /handle\("launcher:native-computer-use-setup"/);
+  assert.match(electronMain, /if \(IS_DEV_PROFILE\)[\s\S]*?the DEV launcher cannot edit it/);
+  assert.match(electronMain, /codexCatalogVerified: false,[\s\S]*?codexRestartRequired: true/);
+  assert.match(electronMain, /startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
+  assert.doesNotMatch(browserHostSource, /setWallpapersEnabled/);
 });
 
 test("Zero Risk setup commits state after the runtime transaction and preserves manual inspection boundaries", () => {

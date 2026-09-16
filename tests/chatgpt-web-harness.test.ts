@@ -159,6 +159,8 @@ async function executeGatewayProgram(
   calls: GatewayProgramCall[],
   dynamicRegistry = false,
   includeRegistry = true,
+  toolsOverride?: unknown,
+  registryOverride?: unknown,
 ): Promise<Array<{ type: "text"; text: string }>> {
   const emitted: Array<{ type: "text"; text: string }> = [];
   const implementations = Object.fromEntries(availableToolNames.map(name => [
@@ -184,9 +186,9 @@ async function executeGatewayProgram(
   };
   const ignoreOutput = (_value: unknown): void => {};
   await execute(
-    nestedTools,
+    toolsOverride ?? nestedTools,
     includeRegistry
-      ? availableToolNames.map(name => ({ name, description: `${name} test tool` }))
+      ? registryOverride ?? availableToolNames.map(name => ({ name, description: `${name} test tool` }))
       : undefined,
     emitText,
     ignoreOutput,
@@ -2961,6 +2963,7 @@ describe("ChatGPT outer-native harness v4", () => {
         "codex_apply_patch",
         "codex_exec",
         "codex_tool_call",
+        "codex_tool_capabilities",
         "codex_tool_inventory",
         "codex_view_image",
         "codex_write_stdin",
@@ -2976,7 +2979,7 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("5cb59b378c7d1939e260a2b4a60f58e22da31208fe09c2cc17a2cf31eb5ff3ad");
+        .toBe("4ab3b622b3d9198f17a317cee29b3d16c40b73df5083a4c3ba72a72cbed74375");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -3018,6 +3021,24 @@ describe("ChatGPT outer-native harness v4", () => {
         destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
+      });
+
+      const capabilities = await call("codex_tool_capabilities", { turn_token: token });
+      expect(capabilities.structuredContent).toMatchObject({
+        protocol_version: 2,
+        contract: "native",
+        gateway: {
+          available: true,
+          wire_name: "exec",
+          can_discover_deferred: true,
+        },
+        discovery: { inventory: true, exact_call: true },
+        surfaces: {
+          execution: { availability: "direct", deferred_possible: true },
+          agents: { availability: "direct", deferred_possible: true },
+        },
+        connector: { contract_version: "codex-web-gpt-tooling-v2" },
+        recovery: { status: "ready" },
       });
 
       const firstExec = call("codex_exec", {
@@ -3080,11 +3101,13 @@ describe("ChatGPT outer-native harness v4", () => {
         query: string,
         includeSchema: boolean,
         nestedToolNames: string[],
+        surface?: string,
       ) => {
         const pending = call("codex_tool_inventory", {
           turn_token: token,
           query,
           include_schema: includeSchema,
+          ...(surface ? { surface } : {}),
         });
         const [request] = await broker.nextToolBatch(token);
         expect(request).toMatchObject({ wireName: "exec", freeform: true });
@@ -3107,6 +3130,81 @@ describe("ChatGPT outer-native harness v4", () => {
         total: 0,
         next_offset: null,
       });
+
+      // Native runtimes may expose a namespace as an object map instead of a flat ALL_TOOLS
+      // array. The gateway must preserve the dotted namespace and resolve the nested function
+      // against its owning object so methods that depend on `this` keep working.
+      const nestedNamespaceCalls: GatewayProgramCall[] = [];
+      const nestedNamespaceTools = {
+        "Microsoft.windows.Computer": {
+          get_app_state: async (input: unknown) => {
+            nestedNamespaceCalls.push({
+              name: "Microsoft.windows.Computer__get_app_state",
+              input,
+            });
+            return { output: "desktop", exit_code: 0 };
+          },
+        },
+      };
+      const nestedNamespaceRegistry = {
+        "Microsoft.windows.Computer": {
+          get_app_state: {
+            type: "function",
+            name: "get_app_state",
+            description: "Read the current Windows app state",
+            input_schema: { type: "object", additionalProperties: false },
+          },
+        },
+      };
+      const nestedNamespaceInventoryPending = call("codex_tool_inventory", {
+        turn_token: token,
+        query: "get_app_state",
+        include_schema: true,
+      });
+      const [nestedNamespaceInventoryRequest] = await broker.nextToolBatch(token);
+      const nestedNamespaceInventoryContent = await executeGatewayProgram(
+        nestedNamespaceInventoryRequest!.input!,
+        [],
+        [],
+        false,
+        true,
+        nestedNamespaceTools,
+        nestedNamespaceRegistry,
+      );
+      broker.completeTool(token, nestedNamespaceInventoryRequest!.callId, { content: nestedNamespaceInventoryContent });
+      expect((await nestedNamespaceInventoryPending).structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "Microsoft.windows.Computer__get_app_state",
+          name: "Microsoft.windows.Computer__get_app_state",
+          namespace: null,
+          kind: "gateway",
+          parameters: { type: "object", additionalProperties: false },
+        }],
+      });
+
+      const nestedNamespaceCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "Microsoft.windows.Computer__get_app_state",
+        arguments: { include_windows: true },
+      });
+      const [nestedNamespaceRequest] = await broker.nextToolBatch(token);
+      const nestedNamespaceContent = await executeGatewayProgram(
+        nestedNamespaceRequest!.input!,
+        [],
+        nestedNamespaceCalls,
+        false,
+        true,
+        nestedNamespaceTools,
+        nestedNamespaceRegistry,
+      );
+      expect(nestedNamespaceCalls).toEqual([{
+        name: "Microsoft.windows.Computer__get_app_state",
+        input: { include_windows: true },
+      }]);
+      broker.completeTool(token, nestedNamespaceRequest!.callId, { content: nestedNamespaceContent });
+      expect((await nestedNamespaceCall).isError).not.toBe(true);
 
       // Fresh Codex tasks can keep optional MCPs deferred behind tool_search. Full mode must be
       // able to discover tool_search through the native exec gateway, invoke it, then see and use
@@ -3158,6 +3256,21 @@ describe("ChatGPT outer-native harness v4", () => {
           wire_name: "mcp__open_computer_use__list_apps",
           name: "mcp__open_computer_use__list_apps",
           namespace: null,
+          kind: "gateway",
+        }],
+      });
+
+      const desktopSurfaceInventory = await inventoryThroughGateway(
+        "list_apps",
+        true,
+        ["exec", "mcp__open_computer_use__list_apps"],
+        "computer",
+      );
+      expect(desktopSurfaceInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "mcp__open_computer_use__list_apps",
           kind: "gateway",
         }],
       });
@@ -3518,6 +3631,54 @@ describe("ChatGPT outer-native harness v4", () => {
       }));
       broker.completeTool(token, viewRequest!.callId, toolResult({ output: "image-ready" }));
       expect((await view).structuredContent).toEqual({ output: "image-ready" });
+    } finally {
+      await client.close().catch(() => {});
+      broker.revoke(token);
+      await broker.close();
+    }
+  }, 30_000);
+
+  test("does not treat a namespaced MCP tool as a native bridge or exec gateway", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-mcp-collision-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    environment.tools = [{
+      name: "exec_command",
+      namespace: "mcp__unrelated",
+      description: "An unrelated MCP command-shaped tool",
+      parameters: { type: "object" },
+    }, {
+      name: "exec",
+      namespace: "mcp__unrelated",
+      description: "An unrelated namespaced freeform tool",
+      parameters: { type: "object" },
+      freeform: true,
+    }];
+    const token = await broker.register(environment, 60_000);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+      cwd: process.cwd(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "codex-chatgpt-web-collision-test", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+      const capabilities = await client.callTool({
+        name: "codex_tool_capabilities",
+        arguments: { turn_token: token },
+      });
+      expect(capabilities.structuredContent).toMatchObject({
+        gateway: { available: false, wire_name: null },
+      });
+
+      const exec = await client.callTool({
+        name: "codex_exec",
+        arguments: { turn_token: token, cmd: "should-not-route" },
+      });
+      expect(exec.isError).toBe(true);
+      expect(JSON.stringify(exec.content)).toContain("no native exec gateway");
     } finally {
       await client.close().catch(() => {});
       broker.revoke(token);

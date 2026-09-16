@@ -8,6 +8,10 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import {
+  buildChatGptToolCapabilityReport,
+  chatGptToolingHealth,
+} from "./tool-capabilities";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -265,11 +269,53 @@ export class TurnBroker implements TurnBrokerOwner {
   // previous turn's handle" from "this handle never existed".
   private readonly retiredBindings = new Map<string, string>();
   private readonly retiredTokens = new Map<string, string>();
+  private latestToolingHealth?: {
+    observedAt: string;
+    report: ReturnType<typeof chatGptToolingHealth>;
+  };
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
 
   private constructor(readonly socketPath: string) {}
+
+  private observeTooling(traceId: string, environment: ChatGptTurnEnvironment): void {
+    const gateway = environment.tools.find(tool => !tool.namespace && tool.name === "exec" && tool.freeform === true);
+    const report = buildChatGptToolCapabilityReport({
+      outerTools: environment.tools,
+      visibleTools: environment.tools,
+      ...(gateway ? { gateway } : {}),
+      contract: "native",
+    });
+    const snapshot = chatGptToolingHealth(report);
+    const changed = this.latestToolingHealth?.report.catalog_hash !== snapshot.catalog_hash
+      || this.latestToolingHealth?.report.outer_catalog_hash !== snapshot.outer_catalog_hash;
+    this.latestToolingHealth = {
+      observedAt: new Date().toISOString(),
+      report: snapshot,
+    };
+    if (!changed) return;
+    console.info(
+      `[chatgpt-web] tooling trace=${traceId} catalog=${report.catalog_hash.slice(0, 12)}`
+      + ` outer=${report.outer_tool_count} direct=${report.direct_tool_count}`
+      + ` gateway=${report.gateway.available} toolSearch=${report.discovery.tool_search}`,
+    );
+  }
+
+  toolingHealth(): {
+    status: "ok" | "no_turn_observed";
+    active_turns: number;
+    last_observed_at: string | null;
+    snapshot: ReturnType<typeof chatGptToolingHealth> | null;
+  } {
+    this.prune();
+    return {
+      status: this.latestToolingHealth ? "ok" : "no_turn_observed",
+      active_turns: this.channels.size,
+      last_observed_at: this.latestToolingHealth?.observedAt ?? null,
+      snapshot: this.latestToolingHealth?.report ?? null,
+    };
+  }
 
   /**
    * A ChatGPT turn outlives the request that started it, and its Codex Native calls arrive from a
@@ -320,6 +366,7 @@ export class TurnBroker implements TurnBrokerOwner {
     };
     this.channels.set(token, channel);
     this.pending.set(token, channel);
+    this.observeTooling(traceId, environment);
     console.info(`[chatgpt-web] broker trace=${traceId} registered tokenHash=${handleFingerprint(token)}`);
     return token;
   }
@@ -384,6 +431,7 @@ export class TurnBroker implements TurnBrokerOwner {
         ? { expiresAt: channel.environment.expiresAt }
         : {}),
     };
+    this.observeTooling(channel.traceId, environment);
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {

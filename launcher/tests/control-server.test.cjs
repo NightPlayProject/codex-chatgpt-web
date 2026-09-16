@@ -321,6 +321,7 @@ test("manual-to-automatic transaction exposes capability inspection and preserve
   const host = Object.assign(Object.create(BrowserHost.prototype), {
     getBrowserInteractionMode: () => "manual",
     interactionModeOverride: null,
+    writeDescriptor: () => {},
     manualOperation: null,
     turnTabs: new Map([[retained.id, retained]]),
     selectedTabId: retained.id,

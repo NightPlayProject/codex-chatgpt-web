@@ -226,6 +226,7 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
     ...defaultConfig("browser-only"),
     purpose: "dev-harness" as const,
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   };
   const factory = (): ProviderAdapter => ({
@@ -268,6 +269,7 @@ test("browser-only DEV driver runs real turns without advertising simulated tool
     ...defaultConfig("browser-only"),
     purpose: "dev-harness" as const,
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   };
   const factory = (): ProviderAdapter => ({

@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
@@ -17,6 +18,7 @@ const {
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
+const { createAccountSwitcher } = require("./account-switcher.cjs");
 const { createOfficialCodexWallpaperController } = require("./official-codex-wallpapers.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
@@ -56,7 +58,8 @@ const X_URL = "https://x.com/miu21590";
 const CONNECTORS_URL = "https://chatgpt.com/#settings/Plugins";
 const TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels";
 const KEYS_URL = "https://platform.openai.com/settings/organization/api-keys";
-const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL]);
+const CODEX_SWITCHER_URL = "https://github.com/Lampese/codex-switcher";
+const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL, CODEX_SWITCHER_URL]);
 const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
 const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
 
@@ -89,6 +92,7 @@ let exitCommitted = false;
 let smokePassedThisSession = false;
 let cdpPort = 0;
 let officialCodexWallpaperController = null;
+let accountSwitcher = null;
 let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
@@ -440,6 +444,14 @@ function smokePassedForCurrentVersion(state) {
 
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
+  const refreshAccountsInBackground = () => {
+    if (!accountSwitcher) return;
+    void accountSwitcher.refreshUsage()
+      .then(async () => send("launcher:accounts-state", await accountSwitcher.snapshot()))
+      .catch(error => logger.warn("accounts.background_refresh_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }));
+  };
   handle("launcher:snapshot", async () => ({
     profile: LAUNCHER_PROFILE.kind,
     profilePaths: {
@@ -456,13 +468,21 @@ function registerIpc({ logger, stateStore }) {
     },
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
     logs: logger.recent(),
-    urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
+    urls: {
+      github: GITHUB_URL,
+      x: X_URL,
+      connectors: CONNECTORS_URL,
+      tunnels: TUNNELS_URL,
+      keys: KEYS_URL,
+      codexSwitcher: CODEX_SWITCHER_URL,
+    },
     platform: process.platform,
     packaged: app.isPackaged,
     version: app.getVersion(),
     smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(stateStore.read()),
     operation: lastOperation,
     update: updateController?.getState() ?? { status: "disabled" },
+    accounts: accountSwitcher ? await accountSwitcher.snapshot() : null,
   }));
 
   handle("launcher:set-language", (_event, language) => {
@@ -684,6 +704,7 @@ function registerIpc({ logger, stateStore }) {
     if (setupState.browserInteractionMode === "automatic") {
       const browser = await browserHost.probeAuthentication();
       if (!browser.authenticated) {
+        if (browser.status === "error") throw new Error(browser.message);
         throw new Error(
           IS_DEV_PROFILE
             ? "Sign in to the isolated DEV ChatGPT profile before configuring the harness"
@@ -759,6 +780,21 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout };
   });
+  handle("launcher:native-computer-use-setup", async () => {
+    if (IS_DEV_PROFILE) {
+      throw new Error("Native Computer Use setup is kept on the production Codex profile; the DEV launcher cannot edit it");
+    }
+    const result = await runtimeHost.setupNativeComputerUse();
+    if (result.restartRequired) {
+      const state = stateStore.update({
+        codexCatalogVerified: false,
+        codexRestartRequired: true,
+      });
+      send("launcher:state-changed", state);
+      startCatalogVerificationMonitor({ logger, stateStore });
+    }
+    return result;
+  });
   handle("launcher:set-mcp-step", (_event, step) => {
     if (!Number.isInteger(step) || step < 0 || step > 2) throw new Error("Invalid MCP guide step");
     return stateStore.update({ mcpGuideStep: step });
@@ -823,6 +859,84 @@ function registerIpc({ logger, stateStore }) {
       restartRequired: state.codexWallpapersRestartRequired,
     });
     return state;
+  });
+  handle("launcher:accounts", (_event, options) => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    return accountSwitcher.snapshot({ refreshUsage: options?.refreshUsage === true });
+  });
+  handle("launcher:account-add-current", async () => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    const operationName = "account-add-current";
+    publishOperation({ name: operationName, status: "running", message: "Reading the current official Codex account" });
+    try {
+      const result = await accountSwitcher.addCurrentAccount();
+      send("launcher:accounts-state", result);
+      publishOperation({ name: operationName, status: "completed", message: "Current official Codex account is available in the switcher" });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      publishOperation({ name: operationName, status: "failed", message });
+      throw error;
+    }
+  });
+  handle("launcher:account-add", async () => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    const selected = await dialog.showOpenDialog(mainWindow, {
+      title: "Add Codex account",
+      properties: ["openFile"],
+      filters: [{ name: "Codex auth.json", extensions: ["json"] }],
+    });
+    if (selected.canceled || selected.filePaths.length === 0) return null;
+    const operationName = "account-add";
+    publishOperation({ name: operationName, status: "running", message: "Adding a Codex account" });
+    try {
+      const result = await accountSwitcher.addAccountFromFile(selected.filePaths[0]);
+      send("launcher:accounts-state", result);
+      publishOperation({ name: operationName, status: "completed", message: "Codex account added" });
+      refreshAccountsInBackground();
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      publishOperation({ name: operationName, status: "failed", message });
+      throw error;
+    }
+  });
+  handle("launcher:account-login-start", async (_event, accountName) => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    return accountSwitcher.startOAuthLogin(typeof accountName === "string" ? accountName : "");
+  });
+  handle("launcher:account-login-complete", async () => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    const result = await accountSwitcher.completeOAuthLogin();
+    send("launcher:accounts-state", result);
+    refreshAccountsInBackground();
+    return result;
+  });
+  handle("launcher:account-login-cancel", async () => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    await accountSwitcher.cancelOAuthLogin();
+    return true;
+  });
+  handle("launcher:account-switch", async (_event, accountId) => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    const operationName = "account-switch";
+    publishOperation({ name: operationName, status: "running", message: "Switching the official Codex account" });
+    try {
+      const result = await accountSwitcher.switchAccount(accountId);
+      send("launcher:accounts-state", result);
+      publishOperation({ name: operationName, status: "completed", message: "Official Codex restarted with the selected account" });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      publishOperation({ name: operationName, status: "failed", message });
+      throw error;
+    }
+  });
+  handle("launcher:account-remove", async (_event, accountId) => {
+    if (!accountSwitcher) throw new Error("Account switching is unavailable");
+    const result = await accountSwitcher.removeAccount(accountId);
+    send("launcher:accounts-state", result);
+    return result;
   });
   handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
     const mode = validateBrowserInteractionMode(rawMode);
@@ -1004,6 +1118,33 @@ async function start() {
     logger,
     onStatus: status => persistOfficialCodexWallpaperStatus({ stateStore, status }),
   });
+  accountSwitcher = createAccountSwitcher({
+    platform: IS_DEV_PROFILE ? "dev" : process.platform,
+    codexHome: LAUNCHER_PROFILE.codexHome,
+    accountStorePath: IS_DEV_PROFILE
+      ? path.join(launcherUserData, "account-store", "accounts.json")
+      : path.join(os.homedir(), ".codex-switcher", "accounts.json"),
+    usageCachePath: path.join(launcherUserData, "account-usage.json"),
+    activityPath: path.join(launcherUserData, "account-activity.json"),
+    logger,
+    openExternal: openWebUrl,
+    beforeOfficialRestart: async ({ identity }) => {
+      if (!officialCodexWallpaperController || stateStore.read().codexWallpapersEnabled !== true) return null;
+      return officialCodexWallpaperController.prepareExternalRestart({ identity });
+    },
+    afterOfficialRestart: async ({ identity, restartContext }) => {
+      if (restartContext && officialCodexWallpaperController) {
+        return officialCodexWallpaperController.resumeExternalRestart();
+      }
+      const { launchOfficialCodexApplication } = require("./official-codex-wallpapers.cjs");
+      return launchOfficialCodexApplication(identity);
+    },
+    abortOfficialRestart: async ({ restartContext }) => {
+      if (restartContext && officialCodexWallpaperController) {
+        await officialCodexWallpaperController.abortExternalRestart();
+      }
+    },
+  });
   const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
   nativeTheme.themeSource = "system";
   mainWindow = createWindow({
@@ -1038,6 +1179,8 @@ async function start() {
     coreHome: CORE_HOME,
     codexHome: LAUNCHER_PROFILE.codexHome,
     launcherProfile: LAUNCHER_PROFILE.kind,
+    arch: process.arch,
+    resourcesPath: process.resourcesPath,
     publishOperation,
     supervisor: runtimeSupervisor,
     getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
@@ -1052,7 +1195,7 @@ async function start() {
     descriptorPath: BROWSER_DESCRIPTOR_PATH,
     cdpPort,
     control: browserControl.descriptor(),
-    cancelTurn: IS_DEV_PROFILE ? undefined : traceId => runtimeSupervisor.cancelBrowserTurn(traceId),
+    cancelTurn: IS_DEV_PROFILE ? undefined : (traceId, reason) => runtimeSupervisor.cancelBrowserTurn(traceId, reason),
     getConnectorName: () => runtimeHost.browserConnectorName(),
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
     logger,

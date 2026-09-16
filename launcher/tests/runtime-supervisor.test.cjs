@@ -782,14 +782,17 @@ test("launcher adopts a healthy native managed tunnel without spawning a foregro
     connects += 1;
     return { code: 0, output: "{}" };
   };
+  const healthFile = path.join(root, "health.url");
+  fs.writeFileSync(healthFile, health.baseUrl);
   supervisor.runTunnelCommand = async () => ({ code: 0,
-    output: JSON.stringify({ local: { effective_health: { base_url: health.baseUrl } } }) });
+    output: JSON.stringify({ aliases: [{ alias: "codex-chatgpt-web", health_url_file: healthFile }] }) });
   supervisor.startTunnelMonitor = () => { monitors += 1; };
   try {
     await supervisor.startTunnel({
-      mode: "full",
-      tunnel: {
-        binaryPath,
+        mode: "full",
+        tunnel: {
+          alias: "codex-chatgpt-web",
+          binaryPath,
         runtimeKeyFile,
         profileDir,
         profileName: "codex-chatgpt-web",
@@ -822,12 +825,14 @@ for (const existingReady of [true, false]) {
     });
     let connected = existingReady;
     let monitoring = false;
-    const config = { mode: "full", tunnel: { alias: "owned-test" } };
+      const config = { mode: "full", tunnel: { alias: "owned-test" } };
     supervisor.assertTunnelClientReady = () => {};
     supervisor.readTunnelHealth = async () => ({ ready: connected, statusKnown: true,
       state: connected ? "ready" : "stopped", processRunning: connected, pid: null });
+    const healthFile = path.join(root, "health.url");
+    fs.writeFileSync(healthFile, health.baseUrl);
     supervisor.runTunnelCommand = async () => ({ code: 0,
-      output: JSON.stringify({ local: { effective_health: { base_url: health.baseUrl } } }) });
+      output: JSON.stringify({ aliases: [{ alias: "owned-test", health_url_file: healthFile }] }) });
     supervisor.runTunnelConnectCommand = async () => { connected = true; return { code: 0 }; };
     supervisor.runTunnelStopCommand = async () => { connected = false; return { code: 0 }; };
     supervisor.waitForTunnelStopped = async () => { assert.equal(connected, false); };
@@ -929,13 +934,15 @@ test("fresh tunnel recovery discovers its official loopback diagnostics before p
       profileDir: root,
     },
   };
-  const commands = [];
+    const commands = [];
+    const healthFile = path.join(root, "health.url");
+    fs.writeFileSync(healthFile, "http://127.0.0.1:43127\n");
   supervisor.runTunnelCommand = async (_config, args) => {
     commands.push(args);
     return {
       code: 0,
       output: JSON.stringify({
-        local: { health: { base_url: "http://127.0.0.1:43127" } },
+        aliases: [{ alias: "codex-chatgpt-web", health_url_file: healthFile }],
       }),
     };
   };
@@ -948,7 +955,7 @@ test("fresh tunnel recovery discovers its official loopback diagnostics before p
   try {
     await supervisor.waitForTunnelMcpTransport(config, 25);
     assert.equal(supervisor.tunnelHealthBaseUrl, "http://127.0.0.1:43127");
-    assert.deepEqual(commands, [["runtimes", "status", "codex-chatgpt-web", "--json"]]);
+    assert.deepEqual(commands, [["runtimes", "list", "--json"]]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -963,9 +970,11 @@ test("tunnel diagnostics discovery rejects a non-loopback endpoint", async () =>
     coreHome: root,
     browserDescriptorPath: path.join(root, "launcher.json"),
   });
+  const healthFile = path.join(root, "health.url");
+  fs.writeFileSync(healthFile, "https://example.com/healthz\n");
   supervisor.runTunnelCommand = async () => ({
     code: 0,
-    output: JSON.stringify({ health_url: "https://example.com/healthz" }),
+    output: JSON.stringify({ aliases: [{ alias: "codex-chatgpt-web", health_url_file: healthFile }] }),
   });
   try {
     await assert.rejects(

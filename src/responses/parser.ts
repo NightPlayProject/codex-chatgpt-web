@@ -158,7 +158,14 @@ function mapToolChoice(value: unknown): CodexRequestOptions["toolChoice"] {
 
 function allowedToolName(tool: unknown): string | undefined {
   if (!isObj(tool)) return undefined;
-  if (typeof tool.name === "string" && tool.name.length > 0) return tool.name;
+  if (typeof tool.name === "string" && tool.name.length > 0) {
+    const namespace = typeof tool.namespace === "string"
+      && tool.namespace.length > 0
+      && tool.namespace !== DEFAULT_FUNCTION_NAMESPACE
+      ? tool.namespace
+      : undefined;
+    return namespacedToolName(namespace, tool.name);
+  }
   if (tool.type === "web_search" || tool.type === "web_search_preview") return "web_search";
   if (tool.type === "tool_search") return "tool_search";
   return undefined;
@@ -201,6 +208,12 @@ function normalizedToolNamespace(value: unknown): string | undefined {
  * and object maps across Responses and Responses Lite revisions. Preserve map keys when a
  * descriptor omits its name; those keys are often the only exact wire name available for a native
  * MCP or Computer Use tool.
+ *
+ * A newer native registry shape nests a namespace directly as a map, for example:
+ * `{ "Microsoft.windows.Computer": { "get_app_state": { ... } } }`.
+ * Treat that outer key as a namespace instead of manufacturing a zero-argument function named
+ * `Microsoft.windows.Computer`. This keeps every child callable while retaining punctuation in the
+ * exact namespace and wire name.
  */
 function toolContainerEntries(value: unknown): Record<string, unknown>[] {
   if (Array.isArray(value)) return value.filter(isObj);
@@ -208,8 +221,12 @@ function toolContainerEntries(value: unknown): Record<string, unknown>[] {
 
   const looksLikeDescriptor = typeof value.type === "string"
     || typeof value.name === "string"
+    || typeof value.description === "string"
     || "tools" in value
     || "parameters" in value
+    || "input_schema" in value
+    || "inputSchema" in value
+    || "schema" in value
     || "format" in value;
   if (looksLikeDescriptor) return [value];
 
@@ -218,6 +235,18 @@ function toolContainerEntries(value: unknown): Record<string, unknown>[] {
       return [{ type: "namespace", name: key, tools: raw }];
     }
     if (!isObj(raw)) return [];
+    const rawLooksLikeDescriptor = typeof raw.type === "string"
+      || typeof raw.name === "string"
+      || typeof raw.description === "string"
+      || "tools" in raw
+      || "parameters" in raw
+      || "input_schema" in raw
+      || "inputSchema" in raw
+      || "schema" in raw
+      || "format" in raw;
+    if (!rawLooksLikeDescriptor) {
+      return [{ type: "namespace", name: key, tools: raw }];
+    }
     const entry = { ...raw };
     // Namespace maps use the key as the namespace and retain an explicitly supplied child name.
     // Direct tool maps use the key as the exact callable wire name.
@@ -230,21 +259,59 @@ function toolContainerEntries(value: unknown): Record<string, unknown>[] {
   });
 }
 
-function buildTools(tools: unknown): CodexTool[] | undefined {
+function markToolSpecSource(
+  entries: Record<string, unknown>[],
+  source: Exclude<NonNullable<CodexTool["source"]>, "declared">,
+): Record<string, unknown>[] {
+  return entries.map(entry => ({ ...entry, __codexSource: source }));
+}
+
+function toolSpecsFromWireContainer(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.flatMap(item => {
+      if (isObj(item) && (item.type === "additional_tools" || item.type === "tool_search_output")) {
+        return toolContainerEntries(item.tools);
+      }
+      return isObj(item) ? [item] : [];
+    });
+  }
+  if (isObj(value) && (value.type === "additional_tools" || value.type === "tool_search_output")) {
+    return toolContainerEntries(value.tools);
+  }
+  return toolContainerEntries(value);
+}
+
+type CodexToolSource = NonNullable<CodexTool["source"]>;
+
+function toolSource(value: unknown, fallback: CodexToolSource): CodexToolSource {
+  return value === "declared" || value === "additional_tools" || value === "tool_search_output"
+    ? value
+    : fallback;
+}
+
+function buildTools(tools: unknown, defaultSource: CodexToolSource = "declared"): CodexTool[] | undefined {
   const entries = toolContainerEntries(tools);
   if (entries.length === 0) return undefined;
   const out: CodexTool[] = [];
-  const pushFn = (t: Record<string, unknown>, namespace?: string) => {
+  const parametersOf = (t: Record<string, unknown>): Record<string, unknown> => {
+    const value = [t.parameters, t.inputSchema, t.input_schema, t.schema]
+      .find(candidate => isObj(candidate));
+    return (value ?? {}) as Record<string, unknown>;
+  };
+  const pushFn = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
     const tool: CodexTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
-      parameters: (t.parameters ?? {}) as Record<string, unknown>,
+      parameters: parametersOf(t),
+      source,
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
     if (namespace) tool.namespace = namespace;
+    if (t.freeform === true) tool.freeform = true;
+    if (t.toolSearch === true) tool.toolSearch = true;
     out.push(tool);
   };
-  const pushFreeform = (t: Record<string, unknown>, namespace?: string) => {
+  const pushFreeform = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
     const tool: CodexTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
@@ -259,15 +326,16 @@ function buildTools(tools: unknown): CodexTool[] | undefined {
         required: ["input"],
       },
       freeform: true,
+      source,
     };
     if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
-  const pushToolSearch = (t: Record<string, unknown>, namespace?: string) => {
+  const pushToolSearch = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
     const tool: CodexTool = {
       name: typeof t.name === "string" && t.name.length > 0 ? t.name : "tool_search",
       description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-      parameters: (isObj(t.parameters) ? t.parameters : {
+      parameters: (parametersOf(t) && Object.keys(parametersOf(t)).length > 0 ? parametersOf(t) : {
         type: "object",
         properties: {
           query: { type: "string", description: "Search query for tools to load." },
@@ -276,36 +344,46 @@ function buildTools(tools: unknown): CodexTool[] | undefined {
         required: ["query"],
       }) as Record<string, unknown>,
       toolSearch: true,
+      source,
     };
     if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
-  const append = (t: Record<string, unknown>, inheritedNamespace?: string): void => {
+  const append = (
+    t: Record<string, unknown>,
+    inheritedNamespace?: string,
+    inheritedSource: CodexToolSource = defaultSource,
+  ): void => {
+    const source = toolSource(t.__codexSource, inheritedSource);
     if (t.type === "namespace") {
       const namespace = normalizedToolNamespace(t.name) ?? inheritedNamespace;
-      for (const inner of toolContainerEntries(t.tools)) append(inner, namespace);
+      for (const inner of toolContainerEntries(t.tools)) append(inner, namespace, source);
+      return;
+    }
+
+    const namespace = normalizedToolNamespace(t.namespace) ?? inheritedNamespace;
+    if (t.toolSearch === true || t.type === "tool_search") {
+      // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
+      // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
+      pushToolSearch(t, namespace, source);
       return;
     }
 
     const name = typeof t.name === "string" && t.name.length > 0 ? t.name : undefined;
     if (!name) return;
-    const namespace = normalizedToolNamespace(t.namespace) ?? inheritedNamespace;
-    if (t.type === "function") {
-      pushFn(t, namespace);
-    } else if (t.type === "custom") {
+    if (t.freeform === true || t.type === "custom"
+      || (isObj(t.format) && t.format.type === "grammar")) {
       // Freeform custom tool (e.g. apply_patch). Chat models can't emit a lark grammar, so expose a
       // function with a single string `input` carrying the raw tool body; the bridge relays the model's
       // call back as a custom_tool_call (Codex's freeform handler rejects a function_call → fatal abort).
-      pushFreeform(t, namespace);
-    } else if (t.type === "tool_search") {
-      // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
-      // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
-      pushToolSearch(t, namespace);
+      pushFreeform(t, namespace, source);
+    } else if (t.type === "function") {
+      pushFn(t, namespace, source);
     } else if (t.type !== "web_search" && t.type !== "image_generation") {
       // Any other named tool (for example a native computer-use tool type this parser does not
       // model) is client-executed. Pass it through as a function so the routed model can call it
       // naturally and the bridge can relay it as a function_call.
-      pushFn(t, namespace);
+      pushFn(t, namespace, source);
     }
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
     // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
@@ -477,7 +555,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // and chat-model tool listing see them. The item itself never becomes a message;
         // the native passthrough keeps it verbatim in _rawBody.
         const at = item as { tools?: unknown };
-        loadedToolSpecs.push(...toolContainerEntries(at.tools));
+        loadedToolSpecs.push(...markToolSpecSource(toolSpecsFromWireContainer(at.tools), "additional_tools"));
         continue;
       }
 
@@ -688,8 +766,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         pendingReasoning.length = 0;
         // Pair the tool_search call with its result so the model sees what was loaded.
         const out = item as { call_id?: string; status?: string; tools?: unknown };
-        const specs = toolContainerEntries(out.tools);
-        loadedToolSpecs.push(...specs);
+        const specs = toolSpecsFromWireContainer(out.tools);
+        loadedToolSpecs.push(...markToolSpecSource(specs, "tool_search_output"));
         // List the EXACT wire names the model must call (flattened for namespaced specs), matching
         // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
         const wireNames = (buildTools(specs) ?? []).map(tool => namespacedToolName(tool.namespace, tool.name));
@@ -731,6 +809,22 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         });
       }
     }
+  }
+
+  // Preserve clients that send deferred tool declarations as top-level Responses Lite fields.
+  // They are merged through the same exact flattening and provenance path as input items.
+  const topLevelBody = data as typeof data & { additional_tools?: unknown; tool_search_output?: unknown };
+  if (topLevelBody.additional_tools !== undefined) {
+    loadedToolSpecs.push(...markToolSpecSource(
+      toolSpecsFromWireContainer(topLevelBody.additional_tools),
+      "additional_tools",
+    ));
+  }
+  if (topLevelBody.tool_search_output !== undefined) {
+    loadedToolSpecs.push(...markToolSpecSource(
+      toolSpecsFromWireContainer(topLevelBody.tool_search_output),
+      "tool_search_output",
+    ));
   }
 
   const declaredTools = buildTools(data.tools) ?? [];

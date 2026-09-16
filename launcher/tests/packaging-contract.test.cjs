@@ -35,6 +35,22 @@ test("launcher publishes native packages for all supported desktop operating sys
   assert.deepEqual(manifest.build.linux.target, ["AppImage"]);
   assert.ok(manifest.build.files.includes("assets/icon.png"));
   assert.ok(manifest.build.files.includes("assets/linux-appimage-runner.sh"));
+  assert.ok(manifest.build.files.includes("wallpapers/**"));
+  assert.deepEqual(
+    manifest.build.extraResources.find(resource => resource.to === "native/open-computer-use"),
+    { from: "native/open-computer-use", to: "native/open-computer-use" },
+  );
+  for (const asset of [
+    "LICENSE",
+    "UPSTREAM.md",
+    "win32-x64/open-computer-use.exe",
+    "win32-arm64/open-computer-use.exe",
+  ]) {
+    assert.ok(fs.existsSync(path.join(launcherRoot, "native", "open-computer-use", asset)), `missing native Computer Use asset: ${asset}`);
+  }
+  for (const asset of ["runtime.js", "appearance.css", "modal.css", "LICENSE", "UPSTREAM.md"]) {
+    assert.ok(fs.existsSync(path.join(launcherRoot, "wallpapers", asset)), `missing wallpaper asset: ${asset}`);
+  }
   assert.ok(manifest.build.asarUnpack.includes("assets/linux-appimage-runner.sh"));
   assert.equal(manifest.build.afterPack, undefined);
   assert.ok(fs.existsSync(path.join(launcherRoot, "assets", "icon.ico")));

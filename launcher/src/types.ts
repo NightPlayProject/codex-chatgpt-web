@@ -17,6 +17,10 @@ export interface LauncherState {
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
   zeroRiskProEnabled: boolean;
+  codexWallpapersEnabled: boolean;
+  codexWallpapersRestartRequired: boolean;
+  codexWallpapersStatus: string | null;
+  codexWallpapersError: string | null;
   sidebarOpen: boolean;
   sidebarWidth: number;
   browserSmokePassed?: boolean;
@@ -159,6 +163,7 @@ export interface LauncherApi {
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
   setBiggerContext(enabled: boolean): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
+  setWallpapersEnabled(enabled: boolean): Promise<LauncherState>;
   setBrowserInteractionMode(mode: BrowserInteractionMode): Promise<{
     state: LauncherState;
     credentialsRequired: boolean;

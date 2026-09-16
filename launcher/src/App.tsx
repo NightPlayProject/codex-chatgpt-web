@@ -1637,6 +1637,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setWallpapers = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setWallpapersEnabled(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const setInteractionMode = async (mode: BrowserInteractionMode) => {
     setBusy(true);
     setError(null);
@@ -1716,6 +1727,23 @@ function SettingsSurface({
               .catch((cause) => setError(messageOf(cause)))}
           />
         </SettingRow>
+        <SettingRow body={copy.codexWallpapersBody} label={copy.codexWallpapers}>
+          <Switch
+            checked={snapshot.state.codexWallpapersEnabled}
+            disabled={busy}
+            onChange={(checked) => void setWallpapers(checked)}
+          />
+        </SettingRow>
+        {snapshot.state.codexWallpapersRestartRequired ? (
+          <NoticeRow icon="alert" tone="warning">
+            {copy.codexWallpapersRestartRequired}
+          </NoticeRow>
+        ) : null}
+        {snapshot.state.codexWallpapersError ? (
+          <NoticeRow icon="alert" tone="warning">
+            {snapshot.state.codexWallpapersError}
+          </NoticeRow>
+        ) : null}
         <SettingRow
           body={snapshot.state.browserInteractionMode === "manual"
             ? copy.manualBiggerContextUnavailable

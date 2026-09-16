@@ -17,6 +17,7 @@ const {
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
+const { createOfficialCodexWallpaperController } = require("./official-codex-wallpapers.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
   createLogger,
@@ -87,6 +88,7 @@ let shutdownInProgress = false;
 let exitCommitted = false;
 let smokePassedThisSession = false;
 let cdpPort = 0;
+let officialCodexWallpaperController = null;
 let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
@@ -109,6 +111,22 @@ function send(channel, value) {
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
     mainWindow.webContents.send(channel, value);
   }
+}
+
+function persistOfficialCodexWallpaperStatus({ stateStore, status }) {
+  const current = stateStore.read();
+  const next = stateStore.update({
+    codexWallpapersEnabled: typeof status?.enabled === "boolean"
+      ? status.enabled
+      : current.codexWallpapersEnabled,
+    codexWallpapersRestartRequired: status?.restartRequired === true,
+    codexWallpapersStatus: typeof status?.status === "string"
+      ? status.status
+      : current.codexWallpapersStatus,
+    codexWallpapersError: status?.error == null ? null : String(status.error),
+  });
+  send("launcher:state-changed", next);
+  return next;
 }
 
 function publishOperation(operation) {
@@ -785,6 +803,27 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
+  handle("launcher:wallpapers", async (_event, enabled) => {
+    if (!officialCodexWallpaperController) {
+      throw new Error("Codex Wallpapers official-app integration is unavailable");
+    }
+    const result = await officialCodexWallpaperController.setEnabled(enabled === true);
+    const state = persistOfficialCodexWallpaperStatus({
+      stateStore,
+      status: {
+        ...result,
+        enabled: result.enabled === true,
+        status: result.status || (result.enabled === true ? "ready" : "disabled"),
+      },
+    });
+    logger.info("launcher.wallpapers_preference_changed", {
+      enabled: state.codexWallpapersEnabled,
+      applied: result.applied,
+      status: state.codexWallpapersStatus,
+      restartRequired: state.codexWallpapersRestartRequired,
+    });
+    return state;
+  });
   handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
     const mode = validateBrowserInteractionMode(rawMode);
     const current = stateStore.read();
@@ -880,6 +919,7 @@ async function requestQuit() {
     quitting = true;
     await browserHost?.persistSession();
     browserHost?.destroy();
+    officialCodexWallpaperController?.destroy();
     await browserControl?.close();
     exitCommitted = true;
     app.quit();
@@ -959,6 +999,10 @@ async function start() {
   const logger = createLogger({
     filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
     publish: (record) => send("launcher:log", record),
+  });
+  officialCodexWallpaperController = createOfficialCodexWallpaperController({
+    logger,
+    onStatus: status => persistOfficialCodexWallpaperStatus({ stateStore, status }),
   });
   const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
   nativeTheme.themeSource = "system";
@@ -1047,6 +1091,13 @@ async function start() {
   const trayAvailable = createTray(logger, stateStore.read().language);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
+  if (!launcherSmokeTest && stateStore.read().codexWallpapersEnabled === true) {
+    void officialCodexWallpaperController.setEnabled(true).catch(error => {
+      logger.warn("launcher.wallpapers_startup_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
   let startupAuthenticationRefresh = Promise.resolve();
   if (!launcherSmokeTest && stateStore.read().browserInteractionMode === "automatic") {
     startupAuthenticationRefresh = browserHost.refreshAuthentication().catch((error) => {
@@ -1090,6 +1141,7 @@ async function start() {
       runtimeVerified: true,
     })}\n`);
     browserHost.destroy();
+    officialCodexWallpaperController?.destroy();
     await browserControl.close();
     mainWindow.destroy();
     app.quit();

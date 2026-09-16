@@ -18,6 +18,10 @@ const DEFAULT_STATE = Object.freeze({
   browserInteractionMode: "automatic",
   experimentalBiggerContext: false,
   zeroRiskProEnabled: false,
+  codexWallpapersEnabled: false,
+  codexWallpapersRestartRequired: false,
+  codexWallpapersStatus: null,
+  codexWallpapersError: null,
   browserSmokePassed: false,
   browserSmokeVersion: null,
   sidebarOpen: true,
@@ -49,6 +53,8 @@ function readState(filePath) {
       "showBrowserDuringTurns",
       "experimentalBiggerContext",
       "zeroRiskProEnabled",
+      "codexWallpapersEnabled",
+      "codexWallpapersRestartRequired",
       "browserSmokePassed",
       "sidebarOpen",
     ]) {
@@ -56,6 +62,14 @@ function readState(filePath) {
     }
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
+    }
+    if (state.codexWallpapersStatus !== null
+      && (typeof state.codexWallpapersStatus !== "string" || state.codexWallpapersStatus.length > 64)) {
+      state.codexWallpapersStatus = DEFAULT_STATE.codexWallpapersStatus;
+    }
+    if (state.codexWallpapersError !== null
+      && (typeof state.codexWallpapersError !== "string" || state.codexWallpapersError.length > 2_000)) {
+      state.codexWallpapersError = DEFAULT_STATE.codexWallpapersError;
     }
     state.saveChats = state.saveChats === true;
     state.savedChats = Array.isArray(state.savedChats) ? state.savedChats.filter(row =>

@@ -102,6 +102,14 @@ is optional and guides the full-harness setup without terminal commands.
 The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. It needs no
 model API key, installed Chrome/Chromium, system Node/Bun, or project-managed browser download.
 
+The launcher Settings page includes a **Codex Wallpapers** toggle. When enabled, it attaches the
+vendored Codex Wallpapers picker to the separate official Microsoft Store Codex/ChatGPT desktop
+app and reuses the existing `%LOCALAPPDATA%\\CodexWallpapers` library. Codex Web GPT never injects
+wallpaper code into its embedded ChatGPT surface. The launcher validates media and transfers it to
+the official app over a loopback-only local debugging endpoint. If the official app was already
+running without that endpoint, restart the official app once after enabling; Codex Web GPT stays
+open.
+
 **Run from source**
 
 ```bash

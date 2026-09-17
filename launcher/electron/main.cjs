@@ -13,6 +13,7 @@ const {
   nativeImage,
   nativeTheme,
   screen,
+  session,
   shell,
   Tray,
 } = require("electron");
@@ -145,6 +146,7 @@ function stopCatalogVerificationMonitor() {
 
 function startCatalogVerificationMonitor({ logger, stateStore }) {
   stopCatalogVerificationMonitor();
+  let reportedFailure = null;
   const check = async () => {
     const current = stateStore.read();
     if (current.coreSetupComplete !== true || current.codexCatalogVerified === true) {
@@ -157,7 +159,26 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
       const config = runtimeSupervisor.readConfig();
       const health = await runtimeSupervisor.proxyHealthPayload(config);
       if (!Number.isInteger(health?.successful_model_catalog_requests)
-        || health.successful_model_catalog_requests < 1) return;
+        || health.successful_model_catalog_requests < 1) {
+        const result = health?.last_model_catalog_result;
+        if (!result || !Number.isInteger(result.status) || result.status < 400 || result.status > 599
+          || !Number.isInteger(result.request) || result.request < 1 || lastOperation?.status === "running") return;
+        const identity = `${health.pid}:${result.request}:${result.at}`;
+        if (identity === reportedFailure) return;
+        reportedFailure = identity;
+        const reason = typeof result.failure?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(result.failure.code)
+          ? result.failure.code
+          : ["config", "request", "transport", "upstream", "catalog"].includes(result.failure?.stage) ? result.failure.stage : "catalog";
+        const state = stateStore.update({ codexRestartRequired: false });
+        send("launcher:state-changed", state);
+        logger.warn("codex.model_catalog_failed", { status: result.status, reason, request: result.request });
+        publishOperation({
+          name: "catalog-verification", status: "failed",
+          message: nativeCopyFor(current.language).catalogFailure
+            .replace("{status}", String(result.status)).replace("{reason}", reason),
+        });
+        return;
+      }
       const state = stateStore.update({
         codexCatalogVerified: true,
         codexRestartRequired: false,
@@ -222,6 +243,7 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "Remove Codex Web GPT",
     removeMessage: "Remove the ChatGPT Web models from Codex and restore the previous model route?",
     removeDetail: "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+    catalogFailure: "Codex reached the launcher, but loading its model catalog failed (HTTP {status}; {reason}). Check Activity for details and export a safe log if it persists.",
   }),
   "zh-CN": Object.freeze({
     openLauncher: "打开 Codex Web GPT",
@@ -232,6 +254,7 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "移除 Codex Web GPT",
     removeMessage: "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？",
     removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
+    catalogFailure: "Codex 已连接到启动器，但模型列表加载失败（HTTP {status}；{reason}）。请查看“活动”了解详情；若问题持续，请导出安全日志。",
   }),
   ja: Object.freeze({
     openLauncher: "Codex Web GPT を開く",
@@ -242,6 +265,7 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "Codex Web GPT を削除",
     removeMessage: "Codex から ChatGPT Web モデルを削除し、以前のモデルルートを復元しますか？",
     removeDetail: "ランチャーの ChatGPT ログインプロファイルは保持されます。Codex を一度再起動する必要があります。",
+    catalogFailure: "Codex はランチャーに接続しましたが、モデル一覧を読み込めませんでした（HTTP {status}、{reason}）。「アクティビティ」で詳細を確認し、問題が続く場合は安全なログをエクスポートしてください。",
   }),
 });
 
@@ -693,6 +717,7 @@ function registerIpc({ logger, stateStore }) {
       codexRestartRequired: true,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
+      experimentalSkillAttachments: false,
       zeroRiskProEnabled: false,
     });
     send("launcher:state-changed", state);
@@ -766,7 +791,7 @@ function registerIpc({ logger, stateStore }) {
       : await runSetup();
     const state = stateStore.update({
       browserInteractionMode: interactionMode,
-      ...(interactionMode === "manual" ? { experimentalBiggerContext: false } : {}),
+      ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -818,6 +843,15 @@ function registerIpc({ logger, stateStore }) {
     });
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:skill-attachments", async (_event, enabled) => {
+    if (browserHost.activeTraceId || browserHost.currentOperation()) {
+      throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
+    }
+    const result = await runtimeHost.setSkillAttachments(enabled === true);
+    const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
+    send("launcher:state-changed", state);
     return state;
   });
   handle("launcher:zero-risk-pro", async (_event, enabled) => {
@@ -961,7 +995,7 @@ function registerIpc({ logger, stateStore }) {
     );
     const state = stateStore.update({
       browserInteractionMode: mode,
-      ...(mode === "manual" ? { experimentalBiggerContext: false } : {}),
+      ...(mode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       ...(result.configured ? {
         codexCatalogVerified: IS_DEV_PROFILE,
         codexRestartRequired: !IS_DEV_PROFILE,
@@ -1157,6 +1191,7 @@ async function start() {
     logger,
     getBrowserHost: () => browserHost,
     getPreferences: () => stateStore.read(),
+    resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
   }).start();
   runtimeSupervisor = new RuntimeSupervisor({
     app,
@@ -1307,6 +1342,7 @@ async function start() {
       codexRestartRequired: false,
       autoStart: false,
       experimentalBiggerContext: config?.experimentalBiggerContext === true,
+      experimentalSkillAttachments: config?.experimentalSkillAttachments === true,
       zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
     });
     send("launcher:state-changed", state);
@@ -1333,6 +1369,7 @@ async function start() {
         codexCatalogVerified: false,
         codexRestartRequired: true,
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
+        experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
         zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1355,11 +1392,13 @@ async function start() {
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
+      const experimentalSkillAttachments = configuredRuntime.config?.experimentalSkillAttachments === true;
       const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
       const saved = stateStore.read();
-      if (saved.experimentalBiggerContext !== enabled
+      if (saved.experimentalSkillAttachments !== experimentalSkillAttachments
+        || saved.experimentalBiggerContext !== enabled
         || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled, zeroRiskProEnabled });
+        const state = stateStore.update({ experimentalBiggerContext: enabled, experimentalSkillAttachments, zeroRiskProEnabled });
         send("launcher:state-changed", state);
       }
     }
@@ -1375,6 +1414,7 @@ async function start() {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
         experimentalBiggerContext: config.experimentalBiggerContext === true,
+        experimentalSkillAttachments: config.experimentalSkillAttachments === true,
         zeroRiskProEnabled: config.zeroRiskProEnabled === true,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,

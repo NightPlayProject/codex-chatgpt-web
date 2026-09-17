@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { formatAccountDisplayName, formatAccountEmail } from "./account-display";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import type {
@@ -391,15 +392,15 @@ function LauncherShell({
   useEffect(() => {
     if (surface !== "accounts") return;
     let cancelled = false;
-    const refresh = () => {
-      void api!.accounts().then(next => {
+    const refresh = (refreshUsage = false) => {
+      void api!.accounts({ refreshUsage }).then(next => {
         if (!cancelled) setAccountSnapshot(next);
       }).catch((cause) => {
         if (!cancelled) setError(messageOf(cause));
       });
     };
-    refresh();
-    const timer = window.setInterval(refresh, 15_000);
+    refresh(true);
+    const timer = window.setInterval(() => refresh(), 15_000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1798,6 +1799,7 @@ function AccountSwitcherSurface({
     || null;
   const selectedTodayTokens = selectedAccount?.stats ? nativeTokensForRange(selectedAccount.stats, 1) : null;
   const selectedLifetimeTokens = selectedAccount?.stats?.lifetimeTokens ?? null;
+  const activeAccount = snapshot.accounts.find(account => account.isActive) || null;
 
   return (
     <ContentSurface
@@ -1898,13 +1900,13 @@ function AccountSwitcherSurface({
           <div className="account-app-facts">
             <div><span>{copy.version}</span><strong>{snapshot.officialApp.version || copy.accountSwitcherUnavailable}</strong></div>
             <div><span>{copy.status}</span><strong>{snapshot.officialApp.installed ? copy.healthy : copy.accountSwitcherUnavailable}</strong></div>
-            <div><span>{copy.accountSwitcherCurrentAccount}</span><strong>{snapshot.accounts.find(account => account.isActive)?.name || copy.accountSwitcherUnavailable}</strong></div>
+            <div><span>{copy.accountSwitcherCurrentAccount}</span><strong>{activeAccount ? formatAccountDisplayName(activeAccount, showEmails) : copy.accountSwitcherUnavailable}</strong></div>
           </div>
           <p className="account-app-note">{copy.accountSwitcherOfficialAppBody}</p>
         </section>
       </div>
 
-      <AccountActivityPanel account={selectedAccount} copy={copy} language={language} snapshot={snapshot} />
+      <AccountActivityPanel account={selectedAccount} copy={copy} language={language} showEmail={showEmails} snapshot={snapshot} />
       {addDialogOpen ? (
         <AccountAddModal
           busy={refreshing}
@@ -2033,6 +2035,7 @@ function AccountCard({
   const lastUsed = account.lastUsedAt ? formatCompactDate(account.lastUsedAt) : copy.accountSwitcherNever;
   const expiry = account.subscriptionExpiresAt ? ` · ${formatCompactDate(account.subscriptionExpiresAt)}` : "";
   const email = formatAccountEmail(account.email, showEmail);
+  const displayName = formatAccountDisplayName(account, showEmail);
   const credit = accountCreditCopy(account, copy);
   const resetCredits = account.stats?.resetCreditsAvailable;
   return (
@@ -2041,7 +2044,7 @@ function AccountCard({
         <div className="account-card-identity">
           <AccountAvatar account={account} />
           <div>
-            <strong>{account.name}</strong>
+            <strong>{displayName}</strong>
             <span>{email || auth}</span>
           </div>
         </div>
@@ -2124,17 +2127,7 @@ function AccountAvatar({ account }: { account: CodexAccountSummary }) {
       />
     );
   }
-  return <span className="account-avatar">{account.name.slice(0, 1).toUpperCase()}</span>;
-}
-
-function formatAccountEmail(email: string | null, show: boolean): string | null {
-  if (!email) return null;
-  if (show) return email;
-  const at = email.indexOf("@");
-  if (at <= 0) return "••••••";
-  const local = email.slice(0, at);
-  const domain = email.slice(at + 1);
-  return `${local.slice(0, 1)}${"•".repeat(Math.min(5, Math.max(2, local.length - 1)))}@${domain}`;
+  return <span className="account-avatar">{formatAccountDisplayName(account, true).slice(0, 1).toUpperCase()}</span>;
 }
 
 function accountCreditCopy(account: CodexAccountSummary, copy: Copy): { label: string; tone: "positive" | "muted" | "warning" } {
@@ -2175,11 +2168,13 @@ function AccountActivityPanel({
   account,
   copy,
   language,
+  showEmail,
   snapshot,
 }: {
   account: CodexAccountSummary | null;
   copy: Copy;
   language: Language;
+  showEmail: boolean;
   snapshot: AccountSwitcherSnapshot;
 }) {
   const nativeStats = account?.stats ?? null;
@@ -2197,7 +2192,7 @@ function AccountActivityPanel({
           <SectionHeading label={hasNativeActivity ? copy.accountSwitcherTokenActivity : copy.accountSwitcherActivity} />
           <p className="account-panel-subtitle">
             {hasNativeActivity
-              ? `${account?.name || copy.accountSwitcherCurrentAccount} · ${copy.accountSwitcherTokenActivityBody}`
+              ? `${account ? formatAccountDisplayName(account, showEmail) : copy.accountSwitcherCurrentAccount} · ${copy.accountSwitcherTokenActivityBody}`
               : copy.accountSwitcherActivityBody}
           </p>
         </div>
@@ -2249,13 +2244,19 @@ function AccountActivityPanel({
         <p className="account-no-recent">{copy.accountSwitcherNoRecentActivity}</p>
       ) : (
         <div className="account-recent-list">
-          {snapshot.activity.recent.slice(0, 6).map(event => (
-            <div className="account-recent-row" key={`${event.at}-${event.accountId}-${event.kind}`}>
-              <StateDot state="ready" />
-              <span><strong>{event.accountName}</strong><small>{event.kind === "import" ? copy.accountSwitcherImported : copy.accountSwitcherSwitched}</small></span>
-              <time>{formatActivityDate(event.at, language)}</time>
-            </div>
-          ))}
+          {snapshot.activity.recent.slice(0, 6).map(event => {
+            const eventAccount = snapshot.accounts.find(candidate => candidate.id === event.accountId);
+            const eventName = eventAccount
+              ? formatAccountDisplayName(eventAccount, showEmail)
+              : formatAccountDisplayName({ name: event.accountName, email: null }, showEmail);
+            return (
+              <div className="account-recent-row" key={`${event.at}-${event.accountId}-${event.kind}`}>
+                <StateDot state="ready" />
+                <span><strong>{eventName}</strong><small>{event.kind === "import" ? copy.accountSwitcherImported : copy.accountSwitcherSwitched}</small></span>
+                <time>{formatActivityDate(event.at, language)}</time>
+              </div>
+            );
+          })}
         </div>
       )}
     </section>
@@ -2437,6 +2438,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setSkillAttachments = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setSkillAttachments(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const setWallpapers = async (enabled: boolean) => {
     setBusy(true);
     setError(null);
@@ -2556,6 +2568,20 @@ function SettingsSurface({
               || snapshot.state.browserInteractionMode === "manual"
               || snapshot.state.coreSetupComplete !== true}
             onChange={(checked) => void setBiggerContext(checked)}
+          />
+        </SettingRow>
+        <SettingRow
+          body={snapshot.state.browserInteractionMode === "manual"
+            ? copy.manualSkillAttachmentsUnavailable
+            : copy.skillAttachmentsBody}
+          label={copy.skillAttachments}
+        >
+          <Switch
+            checked={snapshot.state.experimentalSkillAttachments}
+            disabled={busy
+              || snapshot.state.browserInteractionMode === "manual"
+              || snapshot.state.coreSetupComplete !== true}
+            onChange={(checked) => void setSkillAttachments(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>

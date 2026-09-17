@@ -85,6 +85,9 @@ test("usage refresh maps native rate windows and token activity without retainin
       generated_at: fetchedAt,
       stats_as_of: fetchedAt,
     },
+    profile: {
+      profile_picture_url: "https://cdn.auth0.com/avatars/jo.png",
+    },
     stats: {
       lifetime_tokens: 1_200_000,
       peak_daily_tokens: 80_000,
@@ -107,6 +110,7 @@ test("usage refresh maps native rate windows and token activity without retainin
   assert.equal(usage.secondaryWindowMinutes, 10_080);
   assert.equal(usage.primaryUsedPercent, 7);
   assert.equal(stats.lifetimeTokens, 1_200_000);
+  assert.equal(stats.avatarUrl, "https://cdn.auth0.com/avatars/jo.png");
   assert.deepEqual(stats.daily, [{ date: "2026-09-15", tokens: 12_000 }]);
   assert.equal(cached.stats.resetCreditsAvailable, 3);
   assert.doesNotMatch(JSON.stringify(cached), /must-not-be-retained/);

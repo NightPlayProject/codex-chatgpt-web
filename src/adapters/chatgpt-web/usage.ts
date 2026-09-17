@@ -1,4 +1,5 @@
 import { estimateTokens } from "../../lib/token-estimate";
+import { skillFileTokens } from "./skill-attachments";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   isChatGptWebZeroRiskBackendModel,
@@ -82,7 +83,7 @@ export function estimateChatGptWebInputTokens(
 export function resolveBiggerContextMultipartParts(
   parsed: CodexParsedRequest,
   capabilities: ChatGptWebCapabilities,
-  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume"> = {},
+  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume" | "experimentalSkillAttachments"> = {},
 ): ChatGptWebMultipartPartCount | undefined {
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
     throw new Error("Bigger Context is unavailable for ChatGPT Zero Risk");
@@ -117,7 +118,10 @@ export function resolveBiggerContextMultipartParts(
       const { browserComposerCharLimit } = resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, capabilities);
       if (browserComposerCharLimit !== undefined && text.length > browserComposerCharLimit) return false;
       const budget = resolveChatGptWebMessageTokenBudget(
-        CHATGPT_WEB_BACKEND_MODEL, effort, capabilities, final ? estimateChatGptWebImageTokens(compiled) : 0,
+        CHATGPT_WEB_BACKEND_MODEL,
+        effort,
+        capabilities,
+        final ? estimateChatGptWebImageTokens(compiled) + skillFileTokens(compiled.skillFiles, parsed.modelId) : 0,
       );
       if (estimateTokens(text, parsed.modelId) > budget) return false;
     }
@@ -136,7 +140,7 @@ export function resolveBiggerContextMultipartParts(
 export function resolveStandardContextMultipartParts(
   parsed: CodexParsedRequest,
   capabilities: ChatGptWebCapabilities,
-  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume"> = {},
+  options: Pick<CompileChatGptWebPromptOptions, "retainedGoalResume" | "experimentalSkillAttachments"> = {},
 ): ChatGptWebMultipartPartCount | undefined {
   if (parsed._compactionRequest
     || isChatGptWebZeroRiskBackendModel(parsed.modelId)
@@ -193,10 +197,15 @@ export function estimateChatGptWebUsage(
   evidence: ChatGptWebRoundEvidence,
   capabilities: ChatGptWebCapabilities,
   experimentalBiggerContext = false,
+  experimentalSkillAttachments = false,
 ): CodexUsage {
   const inputTokens = estimateChatGptWebInputTokens(parsed, capabilities, {
+    experimentalSkillAttachments,
     experimentalMultipartParts: experimentalBiggerContext
-      ? resolveBiggerContextMultipartParts(parsed, capabilities)
+      ? resolveBiggerContextMultipartParts(parsed, capabilities, {
+        retainedGoalResume: true,
+        experimentalSkillAttachments,
+      })
       : undefined,
   });
   const outputTokens = conservativeTextTokens(roundEvidenceText(evidence), parsed.modelId);

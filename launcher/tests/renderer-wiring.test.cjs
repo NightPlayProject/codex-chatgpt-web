@@ -12,6 +12,7 @@ const officialWallpaperSource = fs.readFileSync(path.join(launcherRoot, "electro
 const wallpaperSource = fs.readFileSync(path.join(launcherRoot, "wallpapers", "runtime.js"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
 const accountSwitcherSource = fs.readFileSync(path.join(launcherRoot, "electron", "account-switcher.cjs"), "utf8");
+const launcherHtml = fs.readFileSync(path.join(launcherRoot, "index.html"), "utf8");
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -188,6 +189,18 @@ test("account switching stays in the official Windows Codex session", () => {
   assert.doesNotMatch(appSource, /auth_data/);
 });
 
+test("account avatars and email privacy are wired through the native account surface", () => {
+  assert.match(accountSwitcherSource, /profile\.profile_picture_url/);
+  assert.match(launcherHtml, /img-src 'self' data: https:/);
+  assert.match(appSource, /const refresh = \(refreshUsage = false\) =>/);
+  assert.match(appSource, /refresh\(true\);/);
+  assert.match(appSource, /formatAccountDisplayName\(activeAccount, showEmails\)/);
+  assert.match(appSource, /const displayName = formatAccountDisplayName\(account, showEmail\)/);
+  assert.match(appSource, /showEmail=\{showEmails\}/);
+  assert.match(appSource, /formatAccountDisplayName\(eventAccount, showEmail\)/);
+  assert.doesNotMatch(appSource, /<strong>\{account\.name\}<\/strong>/);
+});
+
 test("native Windows Computer Use setup is explicit, production-scoped, and reloads Codex", () => {
   assert.match(appSource, /copy\.installNativeComputerUse/);
   assert.match(appSource, /api!\.setupNativeComputerUse\(\)/);
@@ -314,4 +327,47 @@ test("completed model setup remains a repeatable capability probe", () => {
     electronMain,
     /!setupState\.coreSetupComplete[\s\S]*?smokePassedThisSession[\s\S]*?smokePassedForCurrentVersion\(setupState\)/,
   );
+});
+
+test("catalog verification reports a failed request instead of requesting another restart, then recovers", async () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function startCatalogVerificationMonitor(");
+  const end = electronMain.indexOf("\nfunction ", start + 1);
+  const source = electronMain.slice(start, end);
+  const state = { coreSetupComplete: true, codexCatalogVerified: false, codexRestartRequired: true, language: "en" };
+  const operations = [];
+  const events = [];
+  let tick;
+  let payload = { pid: 10, successful_model_catalog_requests: 0, model_catalog_requests: 0, last_model_catalog_result: null };
+  vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", {
+    catalogVerificationInFlight: false, catalogVerificationTimer: null, lastOperation: null,
+    stopCatalogVerificationMonitor() {},
+    runtimeSupervisor: { readConfig: () => ({}), proxyHealthPayload: async () => payload },
+    stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+    setInterval: callback => { tick = callback; return { unref() {} }; },
+    logger: { info: (...args) => events.push(args), warn: (...args) => events.push(args), debug() {} },
+    send() {}, publishOperation: op => operations.push(op),
+    nativeCopyFor: () => ({ catalogFailure: "Catalog failed (HTTP {status}; {reason})." }),
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(operations.length, 0);
+  assert.equal(state.codexRestartRequired, true);
+  payload = { ...payload, model_catalog_requests: 1, last_model_catalog_result: {
+    request: 1, at: "2026-09-16T10:00:00Z", status: 502, failure: { stage: "transport", code: "UnsupportedProxyProtocol" },
+  } };
+  await tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.codexCatalogVerified, false);
+  assert.equal(state.codexRestartRequired, false);
+  assert.equal(operations[0]?.status, "failed");
+  assert.match(operations[0].message, /502.*UnsupportedProxyProtocol/);
+  await tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(operations.length, 1, "polling must not repeat the same failure");
+  payload = { ...payload, successful_model_catalog_requests: 1, last_successful_model_catalog_request_at: "2026-09-16T10:01:00Z" };
+  await tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.codexCatalogVerified, true);
+  assert.equal(state.codexRestartRequired, false);
+  assert.ok(events.some(([event]) => event === "codex.model_catalog_verified"));
 });

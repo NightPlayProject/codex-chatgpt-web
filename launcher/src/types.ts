@@ -16,6 +16,7 @@ export interface LauncherState {
   savedChats: Array<{ url: string; title: string; conversationKey: string | null; updatedAt: string }>;
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
+  experimentalSkillAttachments: boolean;
   zeroRiskProEnabled: boolean;
   codexWallpapersEnabled: boolean;
   codexWallpapersRestartRequired: boolean;
@@ -273,6 +274,7 @@ export interface LauncherApi {
   setMcpStep(step: number): Promise<LauncherState>;
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
   setBiggerContext(enabled: boolean): Promise<LauncherState>;
+  setSkillAttachments(enabled: boolean): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
   setWallpapersEnabled(enabled: boolean): Promise<LauncherState>;
   accounts(options?: { refreshUsage?: boolean }): Promise<AccountSwitcherSnapshot>;

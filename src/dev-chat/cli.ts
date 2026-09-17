@@ -355,6 +355,9 @@ export async function runDevCommand(args: string[]): Promise<void> {
     if (biggerContext && standardContext) {
       throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
     }
+    const skillAttachments = takeFlag(args, "--skill-attachments");
+    const inlineSkills = takeFlag(args, "--inline-skills");
+    if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
     if (args.length > 0) throw new Error(`Unknown DEV setup arguments: ${args.join(" ")}`);
     const result = await setupDevProfile({
       mode: full ? "full" : "browser-only",
@@ -365,6 +368,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
         ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
         : {}),
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
+      ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
       ...(tunnelId ? { tunnelId } : {}),
       ...(runtimeKeyFile ? { runtimeKeyFile } : {}),
     });

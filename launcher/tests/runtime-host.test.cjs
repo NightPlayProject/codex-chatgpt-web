@@ -352,6 +352,20 @@ test("Bigger Context updates the isolated DEV config without installing a Codex 
   });
 });
 
+test("skill file experiment uses the setup transaction in production and DEV, and rejects manual mode", async () => {
+  const production = hostFor({ mode: "full", browserInteractionMode: "automatic" });
+  assert.equal((await production.host.setSkillAttachments(true)).enabled, true);
+  assert.equal(production.invocation().args.includes("--skill-attachments"), true);
+  assert.equal(production.invocation().args.includes("--restart-service"), true);
+  const dev = devHostFor({ mode: "full", browserInteractionMode: "automatic" });
+  assert.equal((await dev.host.setSkillAttachments(false)).enabled, false);
+  assert.equal(dev.invocation().args.includes("--inline-skills"), true);
+  assert.equal(dev.invocation().args.includes("--replace-codex-route"), false);
+  const manual = hostFor({ mode: "full", browserInteractionMode: "manual" }, "manual");
+  await assert.rejects(() => manual.host.setSkillAttachments(true), /Zero Risk/);
+  assert.equal(manual.invocation(), undefined);
+});
+
 test("Zero Risk Pro transaction installs or removes only its explicit model profile", async () => {
   const config = {
     mode: "full",

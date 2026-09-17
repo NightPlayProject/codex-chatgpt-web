@@ -604,6 +604,9 @@ function mapStatsPayload(payload, fetchedAt) {
       profile.avatar_url
         || profile.avatarUrl
         || profile.picture
+        || profile.profile_picture_url
+        || profile.profilePictureUrl
+        || profile.picture_url
         || payload?.avatar_url
         || payload?.avatarUrl
         || payload?.picture,

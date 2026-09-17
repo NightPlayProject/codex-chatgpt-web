@@ -37,6 +37,8 @@ export type CodexMessage =
 
 export interface CodexUserMessage {
   role: "user";
+  /** Native Responses provenance for selected-skill instructions; never inferred from message text. */
+  origin?: "codex_skill";
   content: string | CodexContentPart[];
   timestamp: number;
   /** Exact raw Responses input position for transport-only provenance binding. */
@@ -319,5 +321,7 @@ export interface CodexProviderConfig {
     autoApproveToolCalls?: boolean;
     /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
     experimentalBiggerContext?: boolean;
+    /** Transport native Codex selected-skill instructions as authenticated text-file attachments. */
+    experimentalSkillAttachments?: boolean;
   };
 }

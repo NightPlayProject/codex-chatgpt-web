@@ -147,7 +147,10 @@ export class ChatGptThreadEnvironmentStore {
     private readonly sqliteHome?: string,
   ) {}
 
-  resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
+  resolve(
+    parsed: CodexParsedRequest,
+    options: { allowCurrentFilesystemRolloutRecovery?: boolean } = {},
+  ): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
     try {
       const environment = extractChatGptTurnEnvironment(parsed);
@@ -162,7 +165,10 @@ export class ChatGptThreadEnvironmentStore {
       const currentContinuation = currentCompaction || currentGoal;
       const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentFilesystemContext && !currentContinuation && !historicalMessages) throw error;
+      const blockedCurrentFilesystemFallback = hasCurrentFilesystemContext
+        && !currentContinuation
+        && !historicalMessages;
+      if (blockedCurrentFilesystemFallback && !options.allowCurrentFilesystemRolloutRecovery) throw error;
       const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -187,6 +193,11 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
+      // A steering replacement may arrive in a native wire shape that the strict XML adjacency
+      // parser cannot bind even though the exact current Codex rollout still proves the workspace.
+      // Only callers with independently proven steering may enter that recovery path; if rollout
+      // authentication cannot resolve the current turn, preserve the normal fail-closed behavior.
+      if (blockedCurrentFilesystemFallback) throw error;
       const sameThread = this.get(identity.threadId);
       // Historical replay may retain an old filesystem envelope after Codex stops emitting it on
       // every follow-up. When this request carries no current filesystem update, an already-

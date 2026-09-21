@@ -1242,6 +1242,61 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(cancelled).toEqual(["old"]);
   });
 
+  test("proven same-turn steering cancels stale browser work before replacement startup", () => {
+    const sessions = new ChatGptTurnSessions();
+    let cancellations = 0;
+    sessions.getOrCreate("old", () => ({
+      mode: "read-only" as const,
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => { cancellations += 1; },
+    }), "old-trace", "shared-owner", "turn_shared", "thread_shared", "old-instruction");
+
+    expect(sessions.preemptSupersededOwnerTurn(
+      "shared-owner",
+      "turn_shared",
+      { current: "steered-instruction", predecessors: new Set(["old-instruction"]) },
+      "replacement",
+    )).toBe(1);
+    expect(cancellations).toBe(1);
+    expect(sessions.find("old")?.supersededError).toMatchObject({
+      code: "client_cancelled",
+      retryable: false,
+    });
+  });
+
+  test("recognizes queued same-turn steering after the previous browser session settled", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const prior = await sessions.getOrCreateAfterOwnerRetirement(
+      "old",
+      "shared-owner",
+      () => ({
+        mode: "read-only" as const,
+        browser: Promise.resolve("done"),
+        physicalSettlement: Promise.resolve(),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      }),
+      "old-trace",
+      undefined,
+      "turn_shared",
+      "thread_shared",
+      { current: "old-instruction", predecessors: new Set() },
+    );
+    expect(sessions.retire("old", prior)).toBe(true);
+    await sessions.waitForRetirement("old");
+
+    expect(sessions.preemptSupersededOwnerTurn(
+      "shared-owner",
+      "turn_shared",
+      { current: "queued-steering", predecessors: new Set(["old-instruction"]) },
+      "replacement",
+    )).toBe(1);
+  });
+
   test("retires a failed session so the next native retry starts a new browser turn", async () => {
     const sessions = new ChatGptTurnSessions();
     let starts = 0;
@@ -4245,6 +4300,79 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(starts).toBe(0);
     } finally {
       worker.run = originalRun;
+    }
+  });
+
+  test("steering cancels stale browser work before a replacement can fail workspace preflight", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://steering-preflight-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let browserStarts = 0;
+    worker.run = async () => { browserStarts++; throw new Error("replacement must fail before browser startup"); };
+
+    const initial = rawWireRequest(environmentXml);
+    const namespace = chatGptWebExecutionNamespace(provider);
+    const initialIdentity = extractChatGptTurnIdentity(initial);
+    const ownerKey = `${namespace}:${chatGptThreadOwnershipKey(initial)}`;
+    const initialKey = `${namespace}:${chatGptTurnExecutionKey(initial)}`;
+    let cancellations = 0;
+    let settleOwner!: () => void;
+    const ownerSettlement = new Promise<void>(resolve => { settleOwner = resolve; });
+    chatGptTurnSessions.getOrCreate(
+      initialKey,
+      () => ({
+        mode: "read-only" as const,
+        browser: new Promise<string>(() => {}),
+        physicalSettlement: ownerSettlement,
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => { cancellations += 1; settleOwner(); },
+      }),
+      "steering-preflight-old",
+      ownerKey,
+      initialIdentity.turnId,
+      initialIdentity.threadId,
+      chatGptInstructionLineage(initial).current,
+    );
+
+    const replacement = structuredClone(initial);
+    const raw = replacement._rawBody as { input: Array<Record<string, unknown>> };
+    raw.input[0]!.content = [{ type: "input_text", text: "Context omitted by native steering replay" }];
+    raw.input.push({
+      type: "message",
+      role: "user",
+      id: "msg_steer",
+      content: [{ type: "input_text", text: "Stop the old work and follow this steering instead" }],
+      internal_chat_message_metadata_passthrough: { turn_id: initialIdentity.turnId },
+    });
+    replacement.context.messages.push({
+      role: "user",
+      content: "Stop the old work and follow this steering instead",
+      timestamp: 3,
+    });
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        replacement,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(cancellations).toBe(1);
+      expect(browserStarts).toBe(0);
+      expect(events.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_trusted_environment_missing",
+        status: 409,
+      });
+    } finally {
+      settleOwner();
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
     }
   });
 

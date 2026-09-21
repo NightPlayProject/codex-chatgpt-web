@@ -803,6 +803,43 @@ export class ChatGptTurnSessions {
     return matches.length;
   }
 
+  /**
+   * Deliver same-turn steering cancellation before the replacement reaches browser startup.
+   *
+   * Environment validation can reject the replacement itself. The older browser instruction must
+   * still stop once native history proves that the new instruction descends from it; otherwise the
+   * Codex stream can report the replacement failure while ChatGPT keeps executing stale work.
+   */
+  preemptSupersededOwnerTurn(
+    ownerKey: string,
+    nativeTurnId: string,
+    instruction: ChatGptInstructionLineage,
+    keepKey: string,
+  ): number {
+    const tracked = this.ownerInstructions.get(ownerKey);
+    let settledPredecessor = false;
+    if (tracked?.nativeTurnId === nativeTurnId && tracked.current !== instruction.current) {
+      if (!instruction.predecessors.has(tracked.current)) throw chatGptTurnSupersededError();
+      settledPredecessor = true;
+    }
+    const matches = [...this.entries].filter(([key, session]) => (
+      key !== keepKey
+      && session.ownerKey === ownerKey
+      && session.nativeTurnId === nativeTurnId
+      && session.isActive()
+      && session.instruction !== undefined
+      && instruction.current !== session.instruction
+    ));
+    for (const [key, session] of matches) {
+      if (!instruction.predecessors.has(session.instruction!)) throw chatGptTurnSupersededError();
+      const reason = chatGptTurnSupersededError();
+      session.supersededError = reason;
+      this.forgetConversationHead(session);
+      this.beginRetirement(key, session, reason);
+    }
+    return Math.max(matches.length, settledPredecessor ? 1 : 0);
+  }
+
   clear(): number {
     const cancelled = this.entries.size;
     for (const [key, session] of this.entries) this.beginRetirement(key, session);

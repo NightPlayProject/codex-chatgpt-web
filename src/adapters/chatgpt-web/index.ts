@@ -925,6 +925,28 @@ export function createChatGptWebAdapter(
         const mode = manualRequest
           ? { localTools: true }
           : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
+        const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
+        const ownerKey = `${executionNamespace}:${chatGptThreadOwnershipKey(parsed)}`;
+        const nativeIdentity = extractChatGptTurnIdentity(parsed);
+        const nativeTurnId = nativeIdentity.turnId;
+        if (!nativeTurnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser ownership");
+        const instructionLineage = chatGptInstructionLineage(parsed);
+        let allowCurrentFilesystemRolloutRecovery = false;
+        if (!parsed._compactionRequest) {
+          const abortedTurnIds = new Set(priorChatGptAbortedTurnIds(parsed));
+          if (abortedTurnIds.size) {
+            chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
+            allowCurrentFilesystemRolloutRecovery = true;
+          }
+          if (chatGptTurnSessions.preemptSupersededOwnerTurn(
+            ownerKey,
+            nativeTurnId,
+            instructionLineage,
+            executionKey,
+          ) > 0) {
+            allowCurrentFilesystemRolloutRecovery = true;
+          }
+        }
         const structuredOutputValidator = parsed._compactionRequest
           ? undefined
           : createChatGptStructuredOutputValidator(parsed.options.outputFormat);
@@ -957,7 +979,7 @@ export function createChatGptWebAdapter(
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
         if (mode.localTools) {
           try {
-            environment = environmentStore.resolve(parsed);
+            environment = environmentStore.resolve(parsed, { allowCurrentFilesystemRolloutRecovery });
           } catch (error) {
             const identity = extractChatGptTurnIdentity(parsed);
             console.warn(
@@ -1251,15 +1273,6 @@ export function createChatGptWebAdapter(
           const responseExecutionKey = `${executionNamespace}:${chatGptCompactionSourceExecutionKey(parsed)}`;
           await chatGptTurnSessions.retireAndWait(responseExecutionKey, incoming.abortSignal);
         }
-        const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
-        const ownerKey = `${executionNamespace}:${chatGptThreadOwnershipKey(parsed)}`;
-        const nativeIdentity = extractChatGptTurnIdentity(parsed);
-        const nativeTurnId = nativeIdentity.turnId;
-        if (!nativeTurnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser ownership");
-        const abortedTurnIds = manualRequest ? new Set(priorChatGptAbortedTurnIds(parsed)) : undefined;
-        if (abortedTurnIds?.size) {
-          chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
-        }
         const traceId = chatGptWebTraceId(provider, parsed);
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
@@ -1269,7 +1282,7 @@ export function createChatGptWebAdapter(
           incoming.abortSignal,
           nativeTurnId,
           nativeIdentity.threadId,
-          chatGptInstructionLineage(parsed),
+          instructionLineage,
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {

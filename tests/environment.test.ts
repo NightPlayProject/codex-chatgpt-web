@@ -1133,6 +1133,59 @@ describe("trusted Codex task environment continuity", () => {
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
   });
 
+  test("proven steering may recover the exact current rollout when contextual user items break environment adjacency", () => {
+    const { codexHome, request } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    body.input = [
+      {
+        type: "message",
+        role: "user",
+        id: "msg_old_abort",
+        content: [{ type: "input_text", text: "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>" }],
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_environment",
+        content: [{ type: "input_text", text: environmentXml }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["environments.environment_context"],
+        },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_plugins",
+        content: [{ type: "input_text", text: "<recommended_plugins>none</recommended_plugins>" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["plugins.recommendations"],
+        },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_instruction",
+        content: [{ type: "input_text", text: "Continue with the revised instruction" }],
+        internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId, content_item_kinds: ["user.text"] },
+      },
+    ];
+    request.context.messages = [{ role: "user", content: "Continue with the revised instruction", timestamp: 1 }];
+
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(() => store.resolve(request)).toThrow("missing cwd");
+    expect(store.resolve(request, { allowCurrentFilesystemRolloutRecovery: true })).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+  });
+
   test("a resumed root cannot borrow a child rollout or an earlier turn's authority", () => {
     const { codexHome, request, rolloutPath } = resumedRootFixture();
     writeFileSync(rolloutPath, [JSON.stringify(childSessionMeta()), JSON.stringify(childTurnContext())].join("\n") + "\n");

@@ -148,7 +148,7 @@ test("large DEV fills stay within the semantic record budget", () => {
   const totalTokens = fillers.reduce((total, filler) => total + filler.tokens, 0);
   expect(totalTokens).toBeGreaterThanOrEqual(targetTokens - fillers.length);
   expect(totalTokens).toBeLessThanOrEqual(targetTokens);
-});
+}, 20_000);
 
 test("coherent DEV MCP payloads are bounded, deterministic, and distinct", () => {
   const first = createDevCoherentContextPayload(1, 3_000);

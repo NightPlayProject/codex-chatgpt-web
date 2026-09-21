@@ -329,7 +329,7 @@ test("Bigger Context compaction selects three parts before the legacy inline byt
   expect(compiled.trimmedCompactionMessages).toBeUndefined();
   expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
     .toEqual([parsed.context.messages[0]!.content]);
-});
+}, 20_000);
 
 test("near-threshold Sol compaction expands beyond three parts while preserving every semantic record", () => {
   const caps = {

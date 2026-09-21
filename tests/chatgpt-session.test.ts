@@ -211,8 +211,14 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean } = {}) {
+function reasoningPicker(options: {
+  max?: string;
+  delay?: number;
+  missing?: boolean;
+  proRow?: "enabled" | "disabled" | "missing";
+} = {}) {
   let value = 0;
+  let proClicked = false;
   const keys: string[] = [];
   const hidden = {
     filter() { return this; }, last() { return this; }, getByText() { return this; },
@@ -245,7 +251,18 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   };
   const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const proRow = {
+    filter() { return this; },
+    first() { return this; },
+    count: async () => options.proRow && options.proRow !== "missing" ? 1 : 0,
+    getAttribute: async (name: string) => name === "aria-disabled" && options.proRow === "disabled" ? "true" : null,
+    click: async () => { proClicked = true; },
+  };
+  const menu = {
+    filter() { return this; }, last() { return this; }, isVisible: async () => true,
+    locator: () => modelRows,
+    getByRole: () => proRow,
+  };
   const page = {
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
@@ -255,7 +272,7 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
     },
     keyboard: { press: async () => {} },
   };
-  return { page, composer, keys, value: () => value };
+  return { page, composer, keys, value: () => value, proClicked: () => proClicked };
 }
 
 test.each([0, 50])("capabilities wait for the visible container and read its hidden semantic input (delay=%s)", async delay => {
@@ -273,6 +290,13 @@ test("the authoritative three-step range is non-Pro; a malformed range fails clo
   await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "bad" }).page as never)).rejects.toThrow("model controls are unavailable");
 });
 
+test("an enabled Pro picker row keeps Pro available when the slider has only four positions", async () => {
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", proRow: "enabled" }).page as never))
+    .resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: true });
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", proRow: "disabled" }).page as never))
+    .resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: false });
+});
+
 test("Pro selection changes the hidden slider through its visible owner, never through model rows", async () => {
   const fixture = reasoningPicker({ delay: 50 });
   const select = (ChatGptBrowserWorker.prototype as unknown as {
@@ -281,4 +305,14 @@ test("Pro selection changes the hidden slider through its visible owner, never t
   await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
   expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
   expect(fixture.value()).toBe(4);
+});
+
+test("Pro selection uses the enabled Pro picker row when it is no longer the fifth slider position", async () => {
+  const fixture = reasoningPicker({ max: "3", proRow: "enabled" });
+  const select = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(...args: unknown[]): Promise<unknown>;
+  }).selectModelAndEffort;
+  await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+  expect(fixture.keys).toEqual([]);
+  expect(fixture.proClicked()).toBe(true);
 });

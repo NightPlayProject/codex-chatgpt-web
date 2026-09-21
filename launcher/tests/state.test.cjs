@@ -112,6 +112,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       onboardingComplete: "yes",
       autoStart: "yes",
       bridgeEnabled: false,
+      codexRouterEnabled: true,
       browserSmokePassed: "yes",
       browserSmokeVersion: { invalid: true },
       sidebarOpen: "yes",

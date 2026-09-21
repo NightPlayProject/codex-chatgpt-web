@@ -7,10 +7,12 @@ import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptCompactionHandoffAccepted, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
+  LATEST_USER_PROMPT_MARKER,
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
   cancelStructuredCompactionNativeTurn,
   cancelStructuredCompactionTrace,
+  canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
   requestRetainedCompactionHandoff,
   runStructuredCompactionOnce,
@@ -94,6 +96,42 @@ function controlBinding(instruction: string): { token: string; handoffId: string
   if (!token || !handoffId) throw new Error(`Missing compaction control binding: ${instruction}`);
   return { token, handoffId };
 }
+
+test("structured compaction bounds a large latest-user appendix without losing source integrity", () => {
+  const compact = request(true);
+  const largePrompt = `BEGIN-${"x".repeat(100_000)}-END`;
+  const source = (compact._rawBody as { input: Array<{
+    content: Array<{ type: string; text: string }>;
+  }> }).input[0]!;
+  source.content = [{ type: "input_text", text: largePrompt }];
+
+  const handoff = canonicalizeCompactionHandoff(compact, "Bounded checkpoint");
+  const appendix = handoff.slice(handoff.lastIndexOf(`${LATEST_USER_PROMPT_MARKER}\n`)
+    + LATEST_USER_PROMPT_MARKER.length + 1);
+  const descriptor = JSON.parse(appendix) as {
+    truncated: boolean;
+    chars: number;
+    sha256: string;
+    head: string;
+    tail: string;
+  };
+
+  expect(descriptor.truncated).toBeTrue();
+  expect(descriptor.chars).toBe(largePrompt.length);
+  expect(descriptor.sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(descriptor.head).toStartWith("BEGIN-");
+  expect(descriptor.tail).toEndWith("-END");
+  expect(descriptor.head.length + descriptor.tail.length).toBe(16_384);
+  expect(handoff.length).toBeLessThan(17_000);
+});
+
+test("structured compaction preserves the exact latest-user appendix for ordinary prompts", () => {
+  const compact = request(true);
+  const handoff = canonicalizeCompactionHandoff(compact, "Ordinary checkpoint");
+  expect(handoff).toEndWith(
+    `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify("Continue with the next step")}`,
+  );
+});
 
 test("one browser conversation spans native turns and rotates only at compaction", () => {
   const before = request(false);
@@ -1589,6 +1627,88 @@ test("structured compact rebuilds canonical context when its retained browser di
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after retained browser loss"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a disappeared retained source falls back when its replay key is already owned", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stale-retained-owned-replay-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://stale-retained-owned-replay-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const sourceRequest = request(false);
+  const compactRequest = request(true);
+  const compactSourceMessage = (compactRequest._rawBody as { input: Array<{
+    content: Array<{ type: string; text: string }>;
+  }> }).input[0]!;
+  compactSourceMessage.content = [{
+    type: "input_text",
+    text: "Provider-normalized current task revision",
+  }];
+  const namespace = chatGptWebExecutionNamespace(provider);
+  const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  const compactedSourceKey = `${namespace}:${chatGptCompactionSourceExecutionKey(compactRequest)}`;
+  expect(compactedSourceKey).not.toBe(sourceKey);
+  const conversationKey = chatGptConversationKey(sourceRequest, namespace)!;
+  const source = chatGptTurnSessions.getOrCreate(sourceKey, () => ({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey,
+    cancel() {},
+  }));
+  await source.browserOutcome;
+  const replayOwner = chatGptTurnSessions.getOrCreate(compactedSourceKey, () => ({
+    mode: "read-only",
+    browser: Promise.resolve("already-owned replay"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() {},
+  }), undefined, "existing-replay-owner", "existing-replay-turn", "other-thread");
+  await replayOwner.browserOutcome;
+
+  let browserStarts = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    browserStarts += 1;
+    if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
+    const prepared = await turn.prepare();
+    expect(prepared.text).toContain("Original task");
+    prepared.release();
+    return "Fallback checkpoint after replay ownership collision";
+  };
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(
+      compactRequest,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    expect(browserStarts).toBe(2);
+    expect(events.some(event => event.type === "text_delta"
+      && event.text.includes("Fallback checkpoint after replay ownership collision"))).toBeTrue();
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
+    expect(chatGptTurnSessions.find(compactedSourceKey)).toBe(replayOwner);
+    expect(chatGptTurnSessions.findConversationHead(conversationKey)).toBeUndefined();
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();

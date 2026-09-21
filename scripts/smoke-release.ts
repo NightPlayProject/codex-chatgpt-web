@@ -99,7 +99,10 @@ try {
   }
   if (!health?.ok) throw new Error("relocated daemon did not become healthy");
   const payload = await health.json() as Record<string, unknown>;
-  if (payload.service !== "codex-chatgpt-web" || payload.mode !== "browser-only") {
+  if (payload.service !== "codex-chatgpt-web"
+    || payload.mode !== "browser-only"
+    || payload.responses_transport !== "http-sse"
+    || payload.websocket_negotiation !== "http-426-expected") {
     throw new Error(`unexpected health payload: ${JSON.stringify(payload)}`);
   }
 
@@ -110,7 +113,9 @@ try {
     throw new Error(`native model passthrough did not fail closed without Codex auth: ${JSON.stringify(unauthenticatedModelsBody)}`);
   }
   const websocketNegotiation = await fetch(`http://127.0.0.1:${port}/v1/responses`);
-  if (websocketNegotiation.status !== 426) {
+  if (websocketNegotiation.status !== 426
+    || websocketNegotiation.headers.get("x-codex-responses-transport") !== "http-sse"
+    || websocketNegotiation.headers.get("cache-control") !== "no-store") {
     throw new Error(`Responses WebSocket negotiation did not select Codex HTTP/SSE fallback: HTTP ${websocketNegotiation.status}`);
   }
   const invalid = await fetch(`http://127.0.0.1:${port}/v1/responses`, {

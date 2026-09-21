@@ -108,14 +108,16 @@ async function readRequiredFile(filePath, description) {
 }
 
 async function loadWallpaperRuntime(assetsRoot) {
-  const [runtime, appearanceCSS, modalCSS] = await Promise.all([
+  const [runtime, appearanceCSS, modalCSS, metalSendBundle] = await Promise.all([
     readRequiredFile(path.join(assetsRoot, "runtime.js"), "runtime"),
     readRequiredFile(path.join(assetsRoot, "appearance.css"), "appearance CSS"),
     readRequiredFile(path.join(assetsRoot, "modal.css"), "modal CSS"),
+    readRequiredFile(path.join(assetsRoot, "metal-send.bundle.js"), "Metal send-button bundle"),
   ]);
-  // runtime.js is intentionally a page-side IIFE. The only value passed into it is serialized
-  // CSS; it has no filesystem, process, or network access in the official Codex renderer.
-  return `${runtime.trim()}\n(${JSON.stringify({ appearanceCSS, modalCSS })});`;
+  // Both bundles are executed only inside the official Codex renderer. The Metal bundle contains
+  // its React/WebGL renderer and exposes one narrow page-side mount API; runtime.js remains the
+  // owner of target discovery, lifecycle, and the Wallpapers on/off state.
+  return `${metalSendBundle.trim()}\n${runtime.trim()}\n(${JSON.stringify({ appearanceCSS, modalCSS })});`;
 }
 
 function wallpaperError(message, code) {

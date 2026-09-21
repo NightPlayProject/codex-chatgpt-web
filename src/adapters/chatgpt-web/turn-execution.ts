@@ -40,6 +40,13 @@ export type ChatGptBrowserOutcome =
   | { type: "final"; answer: string }
   | { type: "error"; error: Error };
 
+export class ChatGptPreservedExecutionKeyConflictError extends Error {
+  constructor() {
+    super("The compacted ChatGPT response execution key is already owned by another session");
+    this.name = "ChatGptPreservedExecutionKeyConflictError";
+  }
+}
+
 export interface ChatGptTraceEvent {
   kind: "reasoning" | "commentary";
   text: string;
@@ -718,7 +725,7 @@ export class ChatGptTurnSessions {
     if (target && target !== preserved?.session
       && (target.isActive()
         || (!matches.some(([, session]) => session === target) && !sameNativeThreadHandoff))) {
-      throw new Error("The compacted ChatGPT response execution key is already owned by another session");
+      throw new ChatGptPreservedExecutionKeyConflictError();
     }
     this.conversationHeads.delete(conversationKey);
     for (const [key, session] of matches) {
@@ -998,6 +1005,7 @@ export class ChatGptTurnSessions {
     }
     return retirement;
   }
+
 }
 
 export const chatGptTurnSessions = new ChatGptTurnSessions();

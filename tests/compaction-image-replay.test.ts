@@ -24,7 +24,7 @@ function compiledImages(input: unknown[]) {
   return compileChatGptWebPrompt(parsed, capabilities);
 }
 
-test("v2 continuation does not re-upload images that predate the latest compaction checkpoint", () => {
+test("v2 continuation replaces pre-checkpoint browser history instead of replaying it", () => {
   const compiled = compiledImages([
     userImage("old visual evidence", "old-v2-image"),
     { type: "compaction", encrypted_content: encodeCompactionSummary("Old visual evidence was summarized.") },
@@ -34,7 +34,8 @@ test("v2 continuation does not re-upload images that predate the latest compacti
   expect(compiled.images.map(image => image.imageUrl)).toEqual([
     "data:image/png;base64,new-v2-image",
   ]);
-  expect(compiled.text).toContain("pre-compaction image not reattached");
+  expect(compiled.text).not.toContain("old visual evidence");
+  expect(compiled.text).not.toContain("pre-compaction image not reattached");
   expect(compiled.text).toContain("Old visual evidence was summarized.");
 });
 
@@ -79,10 +80,11 @@ test("a repeated compaction uploads only images added since the previous checkpo
   expect(compiled.images.map(image => image.imageUrl)).toEqual([
     "data:image/png;base64,new-repeat-image",
   ]);
-  expect(compiled.text).toContain("pre-compaction image not reattached");
+  expect(compiled.text).not.toContain("already summarized image");
+  expect(compiled.text).not.toContain("pre-compaction image not reattached");
 });
 
-test("pre-compaction tool-result images are summarized instead of being re-uploaded", () => {
+test("pre-compaction tool-result history is replaced by the v2 checkpoint", () => {
   const compiled = compiledImages([
     { type: "function_call", call_id: "call_old_image", name: "view_image", arguments: "{}" },
     {
@@ -95,8 +97,9 @@ test("pre-compaction tool-result images are summarized instead of being re-uploa
   ]);
 
   expect(compiled.images).toHaveLength(0);
-  expect(compiled.text).toContain("pre-compaction image not reattached");
+  expect(compiled.text).not.toContain("pre-compaction image not reattached");
   expect(compiled.text).not.toContain("old-tool-image");
+  expect(compiled.text).toContain("The tool image was summarized.");
 });
 
 test("pre-compaction one-pixel sentinels stay non-semantic instead of becoming omission notes", () => {

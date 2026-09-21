@@ -93,8 +93,8 @@ describe("native /models augmentation", () => {
     config.experimentalBiggerContext = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
-    expect(pro.context_window).toBe(384_000);
-    expect(pro.auto_compact_token_limit).toBe(285_000);
+    expect(pro.context_window).toBe(1_500_000);
+    expect(pro.auto_compact_token_limit).toBe(1_200_000);
   });
 
   test("keeps native Sol selectable in the bounded Compatibility V1 registry", () => {
@@ -178,9 +178,9 @@ describe("native /models augmentation", () => {
       effectiveContextWindowPercent: model.effective_context_window_percent,
       autoCompactTokenLimit: model.auto_compact_token_limit,
     }))).toEqual([
-      { contextWindow: 50_000, effectiveContextWindowPercent: 64, autoCompactTokenLimit: 32_000 },
-      { contextWindow: 100_000, effectiveContextWindowPercent: 80, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 100_000, effectiveContextWindowPercent: 70, autoCompactTokenLimit: 70_000 },
+      { contextWindow: 500_000, effectiveContextWindowPercent: 100, autoCompactTokenLimit: 400_000 },
+      { contextWindow: 500_000, effectiveContextWindowPercent: 100, autoCompactTokenLimit: 400_000 },
+      { contextWindow: 500_000, effectiveContextWindowPercent: 100, autoCompactTokenLimit: 400_000 },
     ]);
   });
 

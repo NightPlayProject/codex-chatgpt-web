@@ -16,7 +16,7 @@
     return p;
   }
   const readPrefs=()=>{try{return sanitize(JSON.parse(localStorage.getItem(KEY)||'{}'));}catch{return sanitize();}};
-  let prefs=readPrefs(),current=null,seq=0,disposed=false,filter='all',lastFocus=null;
+  let prefs=readPrefs(),current=null,seq=0,disposed=false,filter='all',lastFocus=null,metalSend=null,metalSendTarget=null,metalSendFrame=0;
   const items=new Map(),chunks=new Map(),urls=new Set();
   const surface=document.createElement('style');surface.id='cw-surfaces';document.head.append(surface);
   const host=document.createElement('div');host.id='cw-picker';host.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:1000';
@@ -43,7 +43,53 @@
     const p=palette(items.get(prefs.selected));
     surface.textContent=options.appearanceCSS+`html.cw-active{--cw-accent:${p.accent};--cw-surface:${p.surface};--cw-sidebar:${p.sidebar};--cw-sidebar-opacity:${prefs.sidebarOpacity}%;--cw-composer-opacity:${prefs.composerOpacity}%;--cw-card-opacity:${prefs.cardOpacity}%;--cw-sidebar-radius:${prefs.sidebarRadius}px;--cw-composer-radius:${prefs.composerRadius}px;--cw-settings-radius:${prefs.settingsRadius}px;}`;
     if(current){current.hidden=!active;current.style.objectFit=prefs.fit;current.style.filter=`brightness(${prefs.brightness/100})`;if(current.tagName==='VIDEO'){if(!active||document.hidden||prefs.motion==='pause'||(prefs.motion==='system'&&reduced.matches))current.pause();else current.play().catch(()=>notice('The video is ready. Open Wallpapers to resume playback.'));}}
+    syncMetalSend(active);
     renderControls();
+  }
+
+  const stopSelectors=['button[data-testid="stop-button"]','button[data-testid*="stop" i]','button[aria-label="Stop generating" i]','button[aria-label="Stop" i]','button[aria-label^="Stop " i]','button[aria-label*="cancel" i]'];
+  const sendSelectors=['button[data-testid="send-button"]','button[data-testid*="send" i]','button[aria-label="Send prompt" i]','button[aria-label="Send" i]','button[aria-label^="Send " i]','button[type="submit"]'];
+  const sendRoots=()=>[...document.querySelectorAll('form[data-type="unified-composer"],[data-composer-surface-variant],[data-composer-layout]')].filter(isVisible);
+  function findMetalActionButton(){
+    const roots=sendRoots();
+    for(let i=roots.length-1;i>=0;i--){
+      for(const selector of stopSelectors){
+        const candidates=[...roots[i].querySelectorAll(selector)].filter(isVisible);
+        if(candidates.length)return candidates[candidates.length-1];
+      }
+      for(const selector of sendSelectors){
+        const candidates=[...roots[i].querySelectorAll(selector)].filter(isVisible).filter(button=>!/stop|cancel|voice|dictat/i.test(`${button.getAttribute('aria-label')||''} ${button.getAttribute('data-testid')||''}`));
+        if(candidates.length)return candidates[candidates.length-1];
+      }
+    }
+    return null;
+  }
+  function findMetalReflectionTargets(target){
+    const root=target.closest('form[data-type="unified-composer"],[data-composer-surface-variant],[data-composer-layout]')||sendRoots().find(node=>node.contains(target));
+    if(!root)return [];
+    const anchor=target.getBoundingClientRect();
+    const edgeDistance=rect=>{
+      const dx=Math.max(rect.left-anchor.right,anchor.left-rect.right,0);
+      const dy=Math.max(rect.top-anchor.bottom,anchor.top-rect.bottom,0);
+      return Math.hypot(dx,dy);
+    };
+    return [...root.querySelectorAll('button')]
+      .filter(button=>button!==target&&isVisible(button)&&!button.contains(target)&&!target.contains(button))
+      .filter(button=>!/send|stop|cancel/i.test(`${button.getAttribute('aria-label')||''} ${button.getAttribute('data-testid')||''}`))
+      .map(button=>({button,distance:edgeDistance(button.getBoundingClientRect())}))
+      .filter(item=>item.distance<=320)
+      .sort((a,b)=>a.distance-b.distance)
+      .slice(0,8)
+      .map(item=>item.button);
+  }
+  function disposeMetalSend(){metalSend?.dispose?.();metalSend=null;metalSendTarget=null;}
+  function syncMetalSend(active=prefs.enabled&&!!current){
+    if(!active||disposed||!window.__CODEX_WALLPAPERS_METAL_SEND__?.supported?.()){disposeMetalSend();return;}
+    const target=findMetalActionButton();if(!target){disposeMetalSend();return;}
+    const paused=document.hidden||prefs.motion==='pause'||(prefs.motion==='system'&&reduced.matches);
+    const reflectionTargets=findMetalReflectionTargets(target);
+    if(target!==metalSendTarget){disposeMetalSend();metalSend=window.__CODEX_WALLPAPERS_METAL_SEND__.mount(target,{preset:'chromatic',strength:.94,paused,reflectionTargets});metalSendTarget=metalSend?.supported?target:null;}
+    else metalSend?.update?.({paused,reflectionTargets});
   }
   function updateDetails(){const item=items.get(prefs.selected);q('preview').hidden=!item;if(item){q('preview').src=item.thumbnail;q('current').textContent=item.title;q('dimensions').textContent=`${item.width} × ${item.height} · ${item.kind==='video'?'Video':'Image'}`;}else{q('current').textContent='No wallpaper selected';q('dimensions').textContent='';}for(const b of q('grid').children)b.setAttribute('aria-pressed',String(b.dataset.id===prefs.selected));}
   function updateFilter(){let visible=0;for(const b of q('grid').children){const i=items.get(b.dataset.id);b.hidden=!((filter==='all'||i.kind===filter)&&i.title.toLocaleLowerCase().includes(q('search').value.toLocaleLowerCase()));if(!b.hidden)visible++;}q('empty').hidden=items.size>0;q('no-results').hidden=visible>0||items.size===0;}
@@ -163,10 +209,10 @@
     for(const [old,handler] of menuHandlers)if(!old.isConnected){old.removeEventListener('keydown',handler,true);menuHandlers.delete(old);}
     if(!menuHandlers.has(menu)){const handler=e=>{if(!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;const rows=menuRows(menu).filter(row=>row.getAttribute('aria-disabled')!=='true'),i=rows.indexOf(document.activeElement);if(i<0||!rows.length)return;e.preventDefault();e.stopImmediatePropagation();rows[e.key==='Home'?0:e.key==='End'?rows.length-1:(i+(e.key==='ArrowDown'?1:-1)+rows.length)%rows.length].focus();};menuHandlers.set(menu,handler);menu.addEventListener('keydown',handler,true);}
   }
-  let menuFrame=0;const observer=new MutationObserver(()=>{if(!menuFrame)menuFrame=requestAnimationFrame(()=>{menuFrame=0;if(!disposed)insertMenu();});});observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-labelledby','aria-controls','aria-expanded','aria-label','aria-hidden','data-state']});insertMenu();
+  let menuFrame=0;const observer=new MutationObserver(()=>{if(!menuFrame)menuFrame=requestAnimationFrame(()=>{menuFrame=0;if(!disposed)insertMenu();});if(!metalSendFrame)metalSendFrame=requestAnimationFrame(()=>{metalSendFrame=0;if(!disposed)syncMetalSend();});});observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-labelledby','aria-controls','aria-expanded','aria-label','aria-hidden','data-state','disabled','data-testid']});insertMenu();
   const visibility=()=>appearance();document.addEventListener('visibilitychange',visibility);reduced.addEventListener('change',visibility);
   const storage=e=>{if(e.key!==KEY)return;const next=readPrefs(),previous=prefs;prefs=next;if(items.has(next.selected)&&current?.src!==items.get(next.selected).url)select(next.selected,{persist:false}).catch(()=>{if(prefs===next){prefs=previous;appearance();updateDetails();}});else{appearance();updateDetails();}};window.addEventListener('storage',storage);
-  function dispose(){disposed=true;seq++;window.__CW_USAGE__?.dispose();observer.disconnect();cancelAnimationFrame(menuFrame);for(const [menu,handler] of menuHandlers)menu.removeEventListener('keydown',handler,true);menuHandlers.clear();document.removeEventListener('visibilitychange',visibility);reduced.removeEventListener('change',visibility);window.removeEventListener('storage',storage);current?.pause?.();current?.remove();host.remove();surface.remove();document.documentElement.classList.remove('cw-active');document.querySelectorAll('[data-cw-menu]').forEach(e=>e.remove());for(const url of urls)URL.revokeObjectURL(url);items.clear();chunks.clear();delete window.__CODEX_WALLPAPERS_PUBLIC__;}
-  const api={append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}return api.status();}};
+  function dispose(){disposed=true;seq++;window.__CW_USAGE__?.dispose();observer.disconnect();cancelAnimationFrame(menuFrame);cancelAnimationFrame(metalSendFrame);disposeMetalSend();for(const [menu,handler] of menuHandlers)menu.removeEventListener('keydown',handler,true);menuHandlers.clear();document.removeEventListener('visibilitychange',visibility);reduced.removeEventListener('change',visibility);window.removeEventListener('storage',storage);current?.pause?.();current?.remove();host.remove();surface.remove();document.documentElement.classList.remove('cw-active');document.querySelectorAll('[data-cw-menu]').forEach(e=>e.remove());for(const url of urls)URL.revokeObjectURL(url);items.clear();chunks.clear();delete window.__CODEX_WALLPAPERS_PUBLIC__;}
+  const api={append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),metalSend:!!metalSendTarget,settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}syncMetalSend();return api.status();}};
   window.__CODEX_WALLPAPERS_PUBLIC__=api;renderControls();return 'installed';
 })

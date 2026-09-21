@@ -68,7 +68,14 @@ export function compactionItemToText(encryptedContent: string | undefined): stri
  */
 
 /** codex-rs compact.rs COMPACT_USER_MESSAGE_MAX_TOKENS = 20k tokens (~4 chars/token). */
-const COMPACT_V1_RETAINED_CHAR_BUDGET = 20_000 * 4;
+export const COMPACT_V1_RETAINED_TEXT_TOKEN_BUDGET = 20_000;
+
+export interface CompactV1OutputOptions {
+  /** Keep the newest structured image history independently of the retained text budget. */
+  maxImages?: number;
+  /** Override codex-rs's 20k recent-user-text budget for a narrower routed browser envelope. */
+  retainedTextTokenBudget?: number;
+}
 
 type CompactMessageItem = Record<string, unknown>;
 
@@ -193,10 +200,12 @@ function imageBlock(block: CompactContentBlock): boolean {
 export function buildCompactV1Output(
   userMessages: CompactMessageItem[],
   summary: string,
-  maxImages = 10,
+  options: CompactV1OutputOptions = {},
 ): CompactMessageItem[] {
+  const maxImages = options.maxImages ?? 10;
+  const retainedTextTokenBudget = options.retainedTextTokenBudget ?? COMPACT_V1_RETAINED_TEXT_TOKEN_BUDGET;
   const selected: CompactMessageItem[] = [];
-  let remaining = COMPACT_V1_RETAINED_CHAR_BUDGET;
+  let remaining = Math.max(0, Math.floor(retainedTextTokenBudget)) * 4;
   let retainedImages = 0;
   for (let i = userMessages.length - 1; i >= 0 && (remaining > 0 || retainedImages < maxImages); i--) {
     const message = structuredClone(userMessages[i]!);

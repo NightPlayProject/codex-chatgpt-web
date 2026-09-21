@@ -257,6 +257,30 @@ test("Bigger Context uses the minimum transport and reserves three stages for co
     .toContain("acknowledged_parts: 1/2");
 });
 
+test("multipart transport accepts up to eight parts and rejects counts outside the supported range", () => {
+  const compiled = compileChatGptWebPrompt(
+    request("high"),
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    undefined,
+    { experimentalMultipartParts: 8 },
+  );
+  expect(compiled.multipart?.parts).toHaveLength(8);
+  const transactionId = "ctx_0123456789abcdef0123456789abcdef";
+  expect(formatChatGptWebMultipartStage(compiled.multipart!.parts[0]!, transactionId, 1, 8).acknowledgement)
+    .toContain("1/8");
+  expect(formatChatGptWebMultipartCommit(compiled.multipart!, transactionId))
+    .toContain("acknowledged_parts: 7/8");
+
+  expect(() => compileChatGptWebPrompt(
+    request("high"),
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    undefined,
+    { experimentalMultipartParts: 9 as never },
+  )).toThrow("between 2 and 8 multipart stages");
+  expect(() => formatChatGptWebMultipartStage(compiled.multipart!.parts[0]!, transactionId, 1, 9))
+    .toThrow("multipart stage index is invalid");
+});
+
 test("multipart commit binds execution to the provenance-validated current user record", () => {
   const threadId = "thread_multipart_selector";
   const currentTurnId = "turn_multipart_current";
@@ -310,6 +334,48 @@ test("multipart commit binds execution to the provenance-validated current user 
   ))).toEqual([oldText, [{ type: "text", text: "Historical answer" }], currentText, "runtime only"]);
 });
 
+test("inline prompt binds execution to the provenance-validated current user record", () => {
+  const currentTurnId = "turn_inline_current";
+  const oldText = "Reply with exactly OLD_INLINE_RESULT";
+  const currentText = "Reply with exactly CURRENT_INLINE_RESULT";
+  const parsed = parseRequest({
+    model: CHATGPT_WEB_MODEL_ID,
+    stream: true,
+    input: [
+      {
+        type: "message", role: "user", id: "msg_inline_old",
+        content: [{ type: "input_text", text: oldText }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_inline_old", content_item_kinds: ["user.text"] },
+      },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Historical answer" }] },
+      {
+        type: "message", role: "user", id: "msg_inline_current",
+        content: [{ type: "input_text", text: currentText }],
+        internal_chat_message_metadata_passthrough: { turn_id: currentTurnId, content_item_kinds: ["user.text"] },
+      },
+      {
+        type: "message", role: "user", id: "msg_inline_runtime",
+        content: [{ type: "input_text", text: "runtime only" }],
+        internal_chat_message_metadata_passthrough: { turn_id: currentTurnId, content_item_kinds: ["plugins.recommendations"] },
+      },
+    ],
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_inline_selector", turn_id: currentTurnId }),
+    },
+  });
+  const compiled = compileChatGptWebPrompt(
+    parsed,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+  );
+
+  expect(compiled.multipart).toBeUndefined();
+  expect(compiled.text).toContain("<codex_active_request>");
+  expect(compiled.text).toContain("active_request_message_index: 2");
+  expect(compiled.text).toContain("The provenance-validated current task is message_index 2.");
+  expect(compiled.text).toContain(oldText);
+  expect(compiled.text).toContain(currentText);
+});
+
 test("multipart active selector uses native item identity when historical and current text are identical", () => {
   const text = "same visible request";
   const currentTurnId = "turn_duplicate_current";
@@ -340,6 +406,75 @@ test("multipart active selector uses native item identity when historical and cu
     { experimentalMultipartParts: 2 },
   );
   expect(compiled.multipart!.activeRequestMessageIndex).toBe(1);
+});
+
+test("multipart active selector follows the remote v2 checkpoint that replaces the current source revision", () => {
+  const currentTurnId = "turn_post_compaction_current";
+  const sourceText = "Continue the same task after compaction";
+  const summaryText = "The current task is still in progress and should continue from the preserved checkpoint.";
+  const body = {
+    model: CHATGPT_WEB_MODEL_ID,
+    stream: true,
+    input: [
+      {
+        type: "message", role: "user", id: "msg_post_compaction_source",
+        content: [{ type: "input_text", text: sourceText }],
+        internal_chat_message_metadata_passthrough: { turn_id: currentTurnId, content_item_kinds: ["user.text"] },
+      },
+      { type: "compaction", encrypted_content: encodeCompactionSummary(summaryText) },
+    ],
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_post_compaction", turn_id: currentTurnId }),
+    },
+  };
+  const parsed = parseRequest(body);
+  expect(parsed.context.messages).toHaveLength(1);
+  expect(parsed.context.messages[0]).toMatchObject({ role: "user" });
+  expect((parsed.context.messages[0] as { _sourceInputIndex?: number })._sourceInputIndex).toBe(1);
+
+  const compiled = compileChatGptWebPrompt(
+    parsed,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    undefined,
+    { experimentalMultipartParts: 2 },
+  );
+  const flattened = compiled.multipart!.parts.flatMap(part => JSON.parse(part).records) as Array<Record<string, unknown>>;
+  expect(compiled.multipart!.activeRequestMessageIndex).toBe(0);
+  expect(JSON.stringify(flattened)).toContain(summaryText);
+  expect(JSON.stringify(flattened)).not.toContain(sourceText);
+  expect(formatChatGptWebMultipartCommit(compiled.multipart!, `ctx_${"d".repeat(32)}`))
+    .toContain("active_request_message_index: 0");
+});
+
+test("inline active selector follows the remote v2 checkpoint that replaces the current source revision", () => {
+  const currentTurnId = "turn_post_compaction_inline_current";
+  const sourceText = "Continue the same inline task after compaction";
+  const summaryText = "The compacted inline task is still in progress and should continue from this checkpoint.";
+  const parsed = parseRequest({
+    model: CHATGPT_WEB_MODEL_ID,
+    stream: true,
+    input: [
+      {
+        type: "message", role: "user", id: "msg_post_compaction_inline_source",
+        content: [{ type: "input_text", text: sourceText }],
+        internal_chat_message_metadata_passthrough: { turn_id: currentTurnId, content_item_kinds: ["user.text"] },
+      },
+      { type: "compaction", encrypted_content: encodeCompactionSummary(summaryText) },
+    ],
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_post_compaction_inline", turn_id: currentTurnId }),
+    },
+  });
+  const compiled = compileChatGptWebPrompt(
+    parsed,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+  );
+
+  expect(compiled.multipart).toBeUndefined();
+  expect(compiled.text).toContain(summaryText);
+  expect(compiled.text).not.toContain(sourceText);
+  expect(compiled.text).toContain("<codex_active_request>");
+  expect(compiled.text).toContain("active_request_message_index: 0");
 });
 
 test("multipart active selector cannot be stolen by later same-turn contextual user input without item ids", () => {

@@ -23,12 +23,12 @@ import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds, MissingTrustedCodexEnvironmentError } from "./environment";
-import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
+import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebRateLimitController, chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
+import { ChatGptPreservedExecutionKeyConflictError, ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { CHATGPT_STANDARD_RELIABLE_INLINE_CHAR_LIMIT, estimateChatGptWebUsage, resolveBiggerContextMultipartParts, resolveStandardContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
@@ -394,6 +394,25 @@ export function createChatGptWebAdapter(
       ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
       : undefined,
   );
+  const solCheckpointStore = new ChatGptLunaCheckpointStore(
+    provider.chatgptWeb?.solCheckpointStatePath
+      ? resolve(expandUserPath(provider.chatgptWeb.solCheckpointStatePath))
+      : undefined,
+    Date.now,
+    "Sol",
+  );
+  const rollingCheckpointStore = (input: CodexParsedRequest): ChatGptLunaCheckpointStore | undefined => (
+    input.modelId === CHATGPT_WEB_LUNA_MODEL_ID
+      ? lunaCheckpointStore
+      : input.modelId === CHATGPT_WEB_MODEL_ID
+        ? solCheckpointStore
+        : undefined
+  );
+  // Luna's rolling checkpoint is its canonical context-management strategy, so usage follows the
+  // checkpointed input. Sol is different: its checkpoint only bounds the retained browser
+  // transport while native Codex canonical history must keep growing toward the advertised
+  // auto-compaction threshold. Reporting Sol's checkpointed input here would keep
+  // last_token_usage permanently small and suppress native /responses/compact forever.
   const currentUsageInput = (parsed: CodexParsedRequest): CodexParsedRequest => (
     parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
       ? lunaCheckpointStore.apply(parsed).parsed
@@ -419,11 +438,15 @@ export function createChatGptWebAdapter(
       ? { localTools: true }
       : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
-    const captureLunaCheckpoint = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
+    const checkpointStore = rollingCheckpointStore(parsed);
+    const captureLunaCheckpoint = checkpointStore !== undefined
       && !parsed._compactionRequest
       && Boolean(identity.threadId && identity.turnId);
-    const checkpointInput = captureLunaCheckpoint
-      ? lunaCheckpointStore.apply(parsed)
+    const applyCheckpointForTransport = checkpointStore !== undefined
+      && (captureLunaCheckpoint
+        || (parsed.modelId === CHATGPT_WEB_MODEL_ID && parsed._compactionRequest));
+    const checkpointInput = applyCheckpointForTransport
+      ? checkpointStore!.apply(parsed)
       : { parsed, applied: false };
     const conversationKey = !parsed._compactionRequest
       && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
@@ -459,15 +482,16 @@ export function createChatGptWebAdapter(
       };
     };
     if (captureLunaCheckpoint) {
+      const checkpointModel = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID ? "Luna" : "Sol";
       console.info(
-        `[chatgpt-web] Luna rolling checkpoint applied=${checkpointInput.applied}${checkpointInput.reason ? ` reason=${checkpointInput.reason}` : ""}`,
+        `[chatgpt-web] ${checkpointModel} rolling checkpoint applied=${checkpointInput.applied}${checkpointInput.reason ? ` reason=${checkpointInput.reason}` : ""}`,
       );
     }
     let capturedCheckpoint: CapturedChatGptLunaCheckpoint | undefined;
     let checkpointCaptureError: Error | undefined;
     const captureCheckpoint = (captured: CapturedChatGptLunaCheckpoint): void => {
       if (capturedCheckpoint) {
-        checkpointCaptureError = new Error("ChatGPT Luna emitted more than one rolling checkpoint");
+        checkpointCaptureError = new Error("ChatGPT Web emitted more than one rolling checkpoint");
         return;
       }
       capturedCheckpoint = captured;
@@ -475,7 +499,7 @@ export function createChatGptWebAdapter(
     const finalizeCheckpoint = (browser: Promise<string>): Promise<string> => browser.then(answer => {
       if (!captureLunaCheckpoint) return answer;
       if (checkpointCaptureError) throw checkpointCaptureError;
-      if (capturedCheckpoint) lunaCheckpointStore.commit(parsed, capturedCheckpoint, answer);
+      if (capturedCheckpoint) checkpointStore!.commit(parsed, capturedCheckpoint, answer);
       return answer;
     });
     const browserAbort = new AbortController();
@@ -1148,24 +1172,39 @@ export function createChatGptWebAdapter(
                     const retainedKey = source?.conversationKey();
                     if (!retainedKey) throw error;
                     let handoffError = error instanceof Error ? error : new Error(String(error));
+                    const sourceUnavailable = handoffError instanceof ChatGptWebAdapterError
+                      && handoffError.code === "compaction_source_unavailable";
                     try {
                       // Operator cancellation ends the logical compaction, but cancel-all must not
                       // acknowledge until the retained browser/helper owner has physically retired.
-                      await (preserveFinalResponse
-                        ? chatGptTurnSessions.retireConversationPreservingFinalResponse(
-                          retainedKey,
-                          source!,
-                          compactedSourceExecutionKey,
-                        )
-                        : chatGptTurnSessions.retireConversationAndWait(retainedKey));
+                      if (preserveFinalResponse) {
+                        try {
+                          await chatGptTurnSessions.retireConversationPreservingFinalResponse(
+                            retainedKey,
+                            source!,
+                            compactedSourceExecutionKey,
+                          );
+                        } catch (retirementError) {
+                          // A stale retained browser can disappear after another same request path
+                          // already claimed the replay key. Do not replace that owner. The fresh
+                          // canonical compaction fallback no longer needs this stale epoch, so
+                          // retire it without preservation and continue recovery.
+                          if (!sourceUnavailable
+                            || !(retirementError instanceof ChatGptPreservedExecutionKeyConflictError)) {
+                            throw retirementError;
+                          }
+                          await chatGptTurnSessions.retireConversationAndWait(retainedKey);
+                        }
+                      } else {
+                        await chatGptTurnSessions.retireConversationAndWait(retainedKey);
+                      }
                     } catch (retirementError) {
                       handoffError = new AggregateError(
                         [handoffError, retirementError instanceof Error ? retirementError : new Error(String(retirementError))],
                         "Structured compaction failed and its retained conversation could not be retired",
                       );
                     }
-                    if (handoffError instanceof ChatGptWebAdapterError
-                      && handoffError.code === "compaction_source_unavailable") {
+                    if (sourceUnavailable && handoffError === error) {
                       return await runFreshCompactionFallback("source_disappeared_before_handoff");
                     }
                     throw handoffError;

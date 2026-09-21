@@ -35,6 +35,8 @@ type InputBlock =
 
 const PRE_COMPACTION_IMAGE_NOTE =
   "[pre-compaction image not reattached; rely on the compaction summary for retained visual context]";
+/** Keep only a small exact source as native-goal history; larger sources are represented by the checkpoint. */
+const REMOTE_V2_GOAL_LINEAGE_MAX_CHARS = 2_000 * 4;
 
 function inputBlocksText(blocks: unknown[] | string | undefined): string {
   if (typeof blocks === "string") return blocks;
@@ -76,6 +78,63 @@ function latestCompactionBoundaryIndex(input: readonly unknown[]): number {
     }
   }
   return boundary;
+}
+
+/**
+ * Remote v2 compaction keeps the source items on the native wire next to a special compaction
+ * item, but that item semantically replaces the earlier model history. Routed providers cannot
+ * send the special item to ChatGPT directly, so replay only its decoded checkpoint plus items that
+ * follow it. Keep the raw request untouched: revision/continuation authorization still hashes the
+ * exact native source there.
+ *
+ * V1 is intentionally different: its replacement history already contains a deliberately bounded
+ * set of recent user messages followed by a readable summary message, so those retained messages
+ * must remain visible to the routed model.
+ */
+function latestRemoteV2CompactionBoundaryIndex(input: readonly unknown[]): number {
+  let boundary = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    if (item.type === "compaction" || item.type === "compaction_summary") {
+      boundary = index;
+      continue;
+    }
+    if (item.type === "context_compaction" && typeof item.encrypted_content === "string") {
+      boundary = index;
+    }
+  }
+  return boundary;
+}
+
+function remoteV2GoalLineageInputIndex(input: readonly unknown[], boundary: number): number {
+  if (boundary < 0 || !input.slice(boundary + 1).some(isNativeGoalContextItem)) return -1;
+  for (let index = boundary - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    const effectiveType = typeof item.type === "string"
+      ? item.type
+      : "role" in item
+        ? "message"
+        : undefined;
+    if (effectiveType !== "message" || item.role !== "user" || isNativeGoalContextItem(item)) continue;
+    const metadata = isObj(item.internal_chat_message_metadata_passthrough)
+      ? item.internal_chat_message_metadata_passthrough
+      : undefined;
+    const kinds = metadata?.content_item_kinds;
+    if (Array.isArray(kinds) && kinds.length > 0
+      && !kinds.some(kind => kind === "user.text")) continue;
+    const text = inputBlocksText(item.content as unknown[] | string | undefined);
+    // The helper is a type predicate because most callers pass unknown input. Here `text` is
+    // already known to be a string, so pass it as unknown to avoid narrowing the false branch to
+    // `never` while preserving the same runtime check.
+    if (isReadableCompactionSummaryText(text as unknown)) continue;
+    // The newest real human source is the authorization lineage. Never fall back to an older,
+    // smaller prompt when this source is large; its exact identity remains in _rawBody and the
+    // checkpoint is the browser-safe semantic representation.
+    return text.length <= REMOTE_V2_GOAL_LINEAGE_MAX_CHARS ? index : -1;
+  }
+  return -1;
 }
 
 function inputContentParts(
@@ -533,6 +592,11 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
     const compactionBoundaryIndex = latestCompactionBoundaryIndex(data.input);
+    const remoteV2CompactionBoundaryIndex = latestRemoteV2CompactionBoundaryIndex(data.input);
+    const remoteV2GoalLineageIndex = remoteV2GoalLineageInputIndex(
+      rawInput ?? data.input,
+      remoteV2CompactionBoundaryIndex,
+    );
     for (let itemIndex = 0; itemIndex < data.input.length; itemIndex += 1) {
       const item = data.input[itemIndex]!;
       // A completed compaction checkpoint semantically replaces the earlier visual history. Keep
@@ -540,6 +604,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       // their images into each fresh ChatGPT Temporary Chat. Only images introduced after the most
       // recent checkpoint are new browser attachments.
       const omitHistoricalImages = compactionBoundaryIndex >= 0 && itemIndex < compactionBoundaryIndex;
+      const omitRemoteV2History = remoteV2CompactionBoundaryIndex >= 0
+        && itemIndex < remoteV2CompactionBoundaryIndex
+        && itemIndex !== remoteV2GoalLineageIndex;
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
@@ -559,6 +626,20 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         continue;
       }
 
+      if (omitRemoteV2History) {
+        // Deferred tool declarations are capability state rather than conversation history. Keep
+        // them available after compaction, but do not replay the old tool-search transcript.
+        if (effectiveType === "tool_search_output") {
+          const out = item as { tools?: unknown };
+          loadedToolSpecs.push(...markToolSpecSource(
+            toolSpecsFromWireContainer(out.tools),
+            "tool_search_output",
+          ));
+        }
+        pendingReasoning.length = 0;
+        continue;
+      }
+
       if (effectiveType === "compaction" || effectiveType === "compaction_summary" || effectiveType === "context_compaction") {
         // A stored summary from a previous compaction. Decode our ocx1 envelope into plain text so
         // the routed model keeps the compacted context; real OpenAI-encrypted blobs degrade to a note.
@@ -568,11 +649,11 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         const encrypted = (item as { encrypted_content?: unknown }).encrypted_content;
         if (effectiveType === "context_compaction" && typeof encrypted !== "string") continue;
         pendingReasoning.length = 0;
-        messages.push({
+        messages.push(attachNativeMessageSource<CodexUserMessage>({
           role: "user",
           content: compactionItemToText(typeof encrypted === "string" ? encrypted : undefined),
           timestamp: now,
-        });
+        }, rawInput?.[itemIndex] ?? item, itemIndex));
         continue;
       }
 

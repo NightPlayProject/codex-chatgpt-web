@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
@@ -16,6 +16,7 @@ import { bindCompactionContinuationStore, ChatGptCompactionContinuationStore, re
 import { bindGoalContinuationStore, ChatGptGoalContinuationStore } from "../src/adapters/chatgpt-web/goal-continuation";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { ChatGptLunaCheckpointStore, hashChatGptLunaAnswer } from "../src/adapters/chatgpt-web/rolling-checkpoint";
 import {
   CODEX_ACTIVE_COMPACTION_REQUEST_MARKER,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
@@ -1686,6 +1687,284 @@ describe("ChatGPT outer-native harness v4", () => {
       }
       expect(browserStarts).toBe(1);
       expect(existsSync(checkpointPath)).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a missing optional Sol checkpoint completes once without repeating the browser turn", async () => {
+    const checkpointPath = join(tempRoot, `missing-sol-checkpoint-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-missing-checkpoint-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeTrue();
+        const answer = "Sol completed the requested task.";
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    const request = rawWireRequest(environmentXml);
+    request.options.reasoning = "high";
+    const adapter = createChatGptWebAdapter(provider);
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(request, { headers: new Headers() }, event => events.push(event));
+        expect(events.filter(event => event.type === "text_delta" && event.phase === "final_answer")).toEqual([{
+          type: "text_delta",
+          text: "Sol completed the requested task.",
+          phase: "final_answer",
+        }]);
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+        expect(events.some(event => event.type === "error")).toBeFalse();
+      }
+      expect(browserStarts).toBe(1);
+      expect(existsSync(checkpointPath)).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a Sol compaction request applies an exact-parent checkpoint without capturing or mutating it", async () => {
+    const checkpointPath = join(tempRoot, `sol-compaction-checkpoint-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-compaction-checkpoint-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const threadId = "thread_test_123";
+    const sourceTurnId = "turn_sol_compaction_source";
+    const currentTurnId = "turn_test_123";
+    const parentAnswer = "Sol finished the previous retained step.";
+    const priorHistory = `VERY LARGE PRIOR RAW SOL HISTORY ${"x".repeat(40_000)}`;
+    const store = new ChatGptLunaCheckpointStore(checkpointPath, Date.now, "Sol");
+    const source = parseRequest({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: priorHistory }],
+        internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+      }],
+      stream: true,
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: sourceTurnId }),
+      },
+    });
+    store.commit(source, {
+      checkpoint: {
+        version: 2,
+        summary: "Objective:\nContinue the long Sol task.\nPending:\n- Preserve the fresh turn and its tool evidence.",
+      },
+      answerHash: hashChatGptLunaAnswer(parentAnswer),
+    }, parentAnswer);
+    const checkpointBefore = readFileSync(checkpointPath, "utf8");
+
+    const request = parseRequest({
+      model: "gpt-5.6-sol",
+      prompt_cache_key: threadId,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: currentTurnId }),
+      },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: priorHistory }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: parentAnswer }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+          internal_chat_message_metadata_passthrough: { turn_id: currentTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue the current Sol task after compaction" }],
+          internal_chat_message_metadata_passthrough: { turn_id: currentTurnId },
+        },
+        {
+          type: "function_call",
+          call_id: "call_sol_compaction_current",
+          name: "exec_command",
+          arguments: JSON.stringify({ cmd: "git status --short" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_sol_compaction_current",
+          output: "CURRENT SOL TOOL EVIDENCE",
+        },
+      ],
+      stream: true,
+      reasoning: { effort: "high" },
+    });
+    request._compactionRequest = true;
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let preparedText = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeFalsy();
+        preparedText = prepared.text;
+        const answer = `${SUMMARY_PREFIX}\nSol compaction completed.`;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      expect(preparedText).toContain("Compressed Sol task history");
+      expect(preparedText).toContain("Continue the current Sol task after compaction");
+      expect(preparedText).toContain("CURRENT SOL TOOL EVIDENCE");
+      expect(preparedText).not.toContain("VERY LARGE PRIOR RAW SOL HISTORY");
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpointBefore);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a Sol compaction request with the wrong parent fails closed to raw history without checkpoint capture", async () => {
+    const checkpointPath = join(tempRoot, `sol-compaction-mismatch-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-compaction-mismatch-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const sourceTurnId = "turn_sol_compaction_mismatch_source";
+    const parentAnswer = "Stored Sol parent answer.";
+    const store = new ChatGptLunaCheckpointStore(checkpointPath, Date.now, "Sol");
+    const source = parseRequest({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Stored source task" }],
+        internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+      }],
+      stream: true,
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_test_123", turn_id: sourceTurnId }),
+      },
+    });
+    store.commit(source, {
+      checkpoint: { version: 2, summary: "Stored Sol checkpoint summary." },
+      answerHash: hashChatGptLunaAnswer(parentAnswer),
+    }, parentAnswer);
+    const checkpointBefore = readFileSync(checkpointPath, "utf8");
+
+    const request = parseRequest({
+      model: "gpt-5.6-sol",
+      prompt_cache_key: "thread_test_123",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_test_123", turn_id: "turn_test_123" }),
+      },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "RAW HISTORY MUST SURVIVE MISMATCH" }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Different parent answer." }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_test_123" },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue after mismatch" }],
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_test_123" },
+        },
+      ],
+      stream: true,
+      reasoning: { effort: "high" },
+    });
+    request._compactionRequest = true;
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let preparedText = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeFalsy();
+        preparedText = prepared.text;
+        const answer = `${SUMMARY_PREFIX}\nMismatch fallback completed.`;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      expect(preparedText).not.toContain("Compressed Sol task history");
+      expect(preparedText).toContain("RAW HISTORY MUST SURVIVE MISMATCH");
+      expect(preparedText).toContain("Continue after mismatch");
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpointBefore);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     }

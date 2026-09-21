@@ -48,10 +48,13 @@ export interface CompileChatGptWebPromptOptions {
 }
 
 export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
-export type ChatGptWebMultipartPartCount = 2 | typeof CHATGPT_BIGGER_CONTEXT_PARTS;
-export type ChatGptWebMultipartParts =
-  | readonly [string, string]
-  | readonly [string, string, string];
+export const CHATGPT_MAX_MULTIPART_PARTS = 8 as const;
+export type ChatGptWebMultipartPartCount = 2 | 3 | 4 | 5 | 6 | 7 | typeof CHATGPT_MAX_MULTIPART_PARTS;
+export type ChatGptWebMultipartParts = readonly string[];
+
+export function isChatGptWebMultipartPartCount(value: number): value is ChatGptWebMultipartPartCount {
+  return Number.isInteger(value) && value >= 2 && value <= CHATGPT_MAX_MULTIPART_PARTS;
+}
 
 export interface ChatGptWebMultipartPrompt {
   parts: ChatGptWebMultipartParts;
@@ -80,14 +83,14 @@ export function formatChatGptWebMultipartStage(
   payload: string,
   transactionId: string,
   partIndex: number,
-  totalParts: ChatGptWebMultipartPartCount = CHATGPT_BIGGER_CONTEXT_PARTS,
+  totalParts: number = CHATGPT_BIGGER_CONTEXT_PARTS,
 ): ChatGptWebMultipartStage {
   assertMultipartTransactionId(transactionId);
   if (
     !Number.isInteger(partIndex)
     || partIndex < 1
     || partIndex > totalParts
-    || (totalParts !== 2 && totalParts !== CHATGPT_BIGGER_CONTEXT_PARTS)
+    || !isChatGptWebMultipartPartCount(totalParts)
   ) {
     throw new Error("ChatGPT multipart stage index is invalid");
   }
@@ -123,8 +126,8 @@ export function formatChatGptWebMultipartCommit(
 ): string {
   assertMultipartTransactionId(transactionId);
   const totalParts = multipart.parts.length;
-  if (totalParts !== 2 && totalParts !== CHATGPT_BIGGER_CONTEXT_PARTS) {
-    throw new Error("ChatGPT multipart commit requires two or three staged parts");
+  if (!isChatGptWebMultipartPartCount(totalParts)) {
+    throw new Error(`ChatGPT multipart commit requires between 2 and ${CHATGPT_MAX_MULTIPART_PARTS} staged parts`);
   }
   const manifest = multipart.parts.map((payload, index) => (
     `${index + 1}/${totalParts}:${createHash("sha256").update(payload).digest("hex")}`
@@ -138,10 +141,7 @@ export function formatChatGptWebMultipartCommit(
     ]
     : multipart.activeRequestMessageIndex === undefined
       ? []
-      : [
-      `active_request_message_index: ${multipart.activeRequestMessageIndex}`,
-      `The provenance-validated current task is message_index ${multipart.activeRequestMessageIndex}. Execute only that record as the current request. Earlier user or agent_message records are history unless the current request explicitly refers to them.`,
-      ];
+      : activeRequestSelectorLines(multipart.activeRequestMessageIndex);
   return [
     "<codex_multipart_commit>",
     `transaction_id: ${transactionId}`,
@@ -305,25 +305,67 @@ export function withoutSupersededModelSwitchContracts(messages: readonly CodexMe
 function activeRequestMessageIndex(
   parsed: CodexParsedRequest,
   sourceMessages: readonly CodexMessage[],
+  requireBinding = true,
 ): number | undefined {
   if (parsed._compactionRequest) return undefined;
   if (parsed._rawBody !== undefined && extractChatGptTurnIdentity(parsed).turnId !== undefined) {
     const revision = extractChatGptTurnUserRevisionRecord(parsed);
-    const index = sourceMessages.findLastIndex(message =>
+    const directIndex = sourceMessages.findLastIndex(message =>
       (message.role === "user" || message.role === "agentMessage")
       && message._sourceInputIndex === revision.inputIndex
     );
-    if (index < 0) {
+    if (directIndex >= 0) return directIndex;
+
+    // Remote v2 compaction keeps the authoritative source instruction on the native wire before a
+    // replacement compaction item, while parser.ts intentionally omits that pre-checkpoint history
+    // from the browser-visible context. In the immediate post-compaction continuation, the exact
+    // source revision therefore has no direct message record. Bind execution to the decoded
+    // replacement checkpoint only when its native input position is provably later than the
+    // already provenance-validated source revision. This preserves fail-closed behavior for every
+    // other missing/filtered instruction instead of falling back to visible text equality.
+    const rawBody = parsed._rawBody as { input?: unknown };
+    const rawInput = Array.isArray(rawBody?.input) ? rawBody.input : [];
+    let replacementInputIndex = -1;
+    for (let inputIndex = rawInput.length - 1; inputIndex > revision.inputIndex; inputIndex -= 1) {
+      const value = rawInput[inputIndex];
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const item = value as { type?: unknown; encrypted_content?: unknown };
+      if (
+        item.type === "compaction"
+        || item.type === "compaction_summary"
+        || (item.type === "context_compaction" && typeof item.encrypted_content === "string")
+      ) {
+        replacementInputIndex = inputIndex;
+        break;
+      }
+    }
+    if (replacementInputIndex >= 0) {
+      const replacementIndex = sourceMessages.findLastIndex(message =>
+        message.role === "user"
+        && message._sourceInputIndex === replacementInputIndex
+        && isReadableCompactionSummaryText(plainMessageText(message))
+      );
+      if (replacementIndex >= 0) return replacementIndex;
+    }
+
+    if (requireBinding) {
       throw new ChatGptWebAdapterError(
         "ChatGPT multipart transport could not bind the provenance-validated current request to its context record.",
         { status: 400, errorType: "invalid_request_error", code: "multipart_active_request_unbound", retryable: false },
       );
     }
-    return index;
+    return undefined;
   }
   // Synthetic/dev callers can lack native turn metadata even when they were parsed from a public
   // Responses body. Production native turns always take the exact raw-input provenance branch.
   return sourceMessages.findLastIndex(message => message.role === "user" || message.role === "agentMessage");
+}
+
+function activeRequestSelectorLines(index: number): string[] {
+  return [
+    `active_request_message_index: ${index}`,
+    `The provenance-validated current task is message_index ${index}. Execute only that record as the current request. Earlier user or agent_message records are history unless the current request explicitly refers to them.`,
+  ];
 }
 
 function messageEnvelope(
@@ -444,8 +486,7 @@ function partitionMultipartContext(
     total_parts: totalParts,
     records: group,
   })));
-  if (totalParts === 2) return [payloads[0]!, payloads[1]!];
-  return [payloads[0]!, payloads[1]!, payloads[2]!];
+  return payloads;
 }
 
 export function chatGptReadOnlyContextWarning(
@@ -495,8 +536,8 @@ export function compileChatGptWebPrompt(
       throw new Error("ChatGPT Zero Risk does not support rolling or multipart browser transport");
     }
   }
-  if (multipartParts !== undefined && multipartParts !== 2 && multipartParts !== CHATGPT_BIGGER_CONTEXT_PARTS) {
-    throw new Error("Bigger Context requires two or three multipart stages");
+  if (multipartParts !== undefined && !isChatGptWebMultipartPartCount(multipartParts)) {
+    throw new Error(`Bigger Context requires between 2 and ${CHATGPT_MAX_MULTIPART_PARTS} multipart stages`);
   }
   if (multipartEnabled && parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error("Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget");
@@ -504,8 +545,10 @@ export function compileChatGptWebPrompt(
   if (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && parsed._compactionRequest) {
     throw new Error("ChatGPT Luna uses rolling checkpoints and does not accept a separate compaction turn");
   }
-  if (captureLunaCheckpoint && (parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID || parsed._compactionRequest)) {
-    throw new Error("Rolling checkpoints are supported only for normal ChatGPT Luna turns");
+  if (captureLunaCheckpoint
+    && ((parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID && parsed.modelId !== CHATGPT_WEB_MODEL_ID)
+      || parsed._compactionRequest)) {
+    throw new Error("Rolling checkpoints are supported only for normal automatic ChatGPT Web turns");
   }
   if (mode.localTools && !turnToken) {
     throw new Error(manualControl
@@ -639,7 +682,7 @@ export function compileChatGptWebPrompt(
       ])];
   const checkpointContract = captureLunaCheckpoint
     ? [
-      "After the complete user-facing answer, append one private rolling task checkpoint for the next Luna turn.",
+      `After the complete user-facing answer, append one private rolling task checkpoint for the next ${parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID ? "Luna" : "Sol"} turn.`,
       `Append the exact marker ${CHATGPT_LUNA_CHECKPOINT_MARKER} on its own line, followed by one compact plain-text checkpoint and nothing else. Do not write JSON and do not use a Markdown code fence.`,
       "User-facing format constraints such as 'reply only with' apply only before the private marker and never permit an empty checkpoint. Immediately follow every marker with Objective: and all required sections; use a concise '- None.' only for a genuinely empty section.",
       "Use the headings Objective:, State:, Evidence:, Decisions:, and Pending:. Put each heading on its own line and use concise dash bullets under the list headings.",
@@ -743,9 +786,7 @@ export function compileChatGptWebPrompt(
         version: 1, part_index: index + 1, total_parts: multipartParts, records: [],
       });
       const multipart: ChatGptWebMultipartPrompt = {
-        parts: multipartParts === 2
-          ? [emptyPart(0), emptyPart(1)]
-          : [emptyPart(0), emptyPart(1), emptyPart(2)],
+        parts: Array.from({ length: multipartParts! }, (_, index) => emptyPart(index)),
         commit: [
           ...sharedContract,
           ...skillContract,
@@ -790,6 +831,9 @@ export function compileChatGptWebPrompt(
       return { text: multipart.commit, images, ...attachments, multipart };
     }
     const envelopeJson = withoutRetiredTurnHandles(JSON.stringify({ version: 3, system, messages }));
+    const inlineActiveRequestIndex = !parsed._compactionRequest && !nativeGoalActive
+      ? activeRequestMessageIndex(parsed, sourceMessages, false)
+      : undefined;
     const text = [
       ...sharedContract,
       ...skillContract,
@@ -802,6 +846,11 @@ export function compileChatGptWebPrompt(
       "<codex_context_json>",
       envelopeJson,
       "</codex_context_json>",
+      ...(inlineActiveRequestIndex !== undefined && inlineActiveRequestIndex >= 0 ? [
+        "<codex_active_request>",
+        ...activeRequestSelectorLines(inlineActiveRequestIndex),
+        "</codex_active_request>",
+      ] : []),
       ...(omittedMessages > 0 ? [
         "<codex_transport_resume>",
         `${omittedMessages} earlier history items were omitted to fit this compaction request; the supplied history is incomplete.`,

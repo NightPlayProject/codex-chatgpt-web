@@ -37,6 +37,7 @@ import {
   estimateCompiledChatGptWebMessageTokens,
 } from "./input-tokens";
 import {
+  CHATGPT_MAX_MULTIPART_PARTS,
   CHATGPT_MAX_INPUT_IMAGES,
   formatChatGptWebMultipartCommit,
   formatChatGptWebMultipartStage,
@@ -58,6 +59,7 @@ import {
   CHATGPT_TEMPORARY_CHAT_URL,
   CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
+  chatGptAvailableProMenuItem,
   detectChatGptAccountCapabilities,
   parseChatGptEffortSliderState,
 } from "../../chatgpt-session";
@@ -122,6 +124,15 @@ export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
  * the bounded staged-send budget.
  */
 export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
+/**
+ * A staged part can expose a real assistant turn (or a visible Stop control) while ChatGPT is still
+ * ingesting the large inert payload. The DOM grace above is intentionally strict for a genuinely
+ * missing response, but it must not also be the hard wall for an acknowledgement that is visibly
+ * making progress. Live Bigger Context acceptance reproduced exactly that failure: stage 1 was
+ * accepted, then the outer 180-second stage timer aborted the acknowledgement wait. Keep missing
+ * DOM detection at three minutes, while allowing an already-started acknowledgement up to ten.
+ */
+export const CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS = 10 * 60_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
@@ -891,14 +902,16 @@ export function assertChatGptWebInputWithinLimits(
     && promptChars !== undefined
     && promptChars > browserComposerCharLimit
   ) {
+    const overBy = promptChars - browserComposerCharLimit;
     throw new ChatGptWebAdapterError(
-      `This prompt contains ${promptChars.toLocaleString("en-US")} inline characters, which exceeds the measured ${browserComposerCharLimit.toLocaleString("en-US")}-character ChatGPT composer boundary for this account and effort. Run /compact, then retry this Web model.`,
+      `This prompt contains ${promptChars.toLocaleString("en-US")} inline characters, which exceeds the measured ${browserComposerCharLimit.toLocaleString("en-US")}-character ChatGPT composer boundary for this account and effort by ${overBy.toLocaleString("en-US")} characters. The bridge rejected it during preflight before opening a browser turn. Reduce the current request or run /compact when retained history is the cause, then retry this Web model.`,
       { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
     );
   }
   if (browserMessageTokenLimit !== undefined && estimatedMessageTokens > browserMessageTokenLimit) {
+    const overBy = estimatedMessageTokens - browserMessageTokenLimit;
     throw new ChatGptWebAdapterError(
-      `This prompt requires ${estimatedMessageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT browser message boundary for this account and effort. The model context window is ${contextWindow.toLocaleString("en-US")} tokens; run /compact to reduce the next browser message without changing that model window.`,
+      `This prompt requires ${estimatedMessageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT browser message boundary for this account and effort by ${overBy.toLocaleString("en-US")} tokens. The bridge rejected it during preflight before opening a browser turn. The model context window is ${contextWindow.toLocaleString("en-US")} tokens; reduce the current request or run /compact when retained history is the cause, then retry this Web model.`,
       { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
     );
   }
@@ -909,8 +922,9 @@ export function assertChatGptWebInputWithinLimits(
     experimentalBiggerContext,
   );
   if (estimatedInputTokens < contextWindow) return;
+  const overBy = estimatedInputTokens - contextWindow + 1;
   throw new ChatGptWebAdapterError(
-    `This task is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds the ${contextWindow.toLocaleString("en-US")}-token context window for this ChatGPT Web model. Switch to a model with a larger context window, run /compact, then retry this Web model.`,
+    `This task is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which does not fit the ${contextWindow.toLocaleString("en-US")}-token context window for this ChatGPT Web model. Reduce the estimated input by at least ${overBy.toLocaleString("en-US")} token${overBy === 1 ? "" : "s"}. The bridge rejected it during preflight before opening a browser turn; switch to a model with a larger context window, reduce the current request, or run /compact when retained history is the cause, then retry.`,
     { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
   );
 }
@@ -922,7 +936,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
   maxMessageChars: number,
-  partCount: 2 | 3,
+  partCount: number,
   transport?: {
     stagingEffort: ChatGptWebModelMode["effort"];
     maxStageMessageTokens: number;
@@ -933,6 +947,12 @@ export function assertChatGptWebMultipartInputWithinLimits(
   },
   experimentalBiggerContext = false,
 ): void {
+  if (!Number.isInteger(partCount) || partCount < 2 || partCount > CHATGPT_MAX_MULTIPART_PARTS) {
+    throw new ChatGptWebAdapterError(
+      `Bigger Context multipart count must be between 2 and ${CHATGPT_MAX_MULTIPART_PARTS}.`,
+      { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
+    );
+  }
   if (modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new ChatGptWebAdapterError(
       "Bigger Context is unavailable for Luna because every later browser request includes the accumulated transcript inside the same 28,000-token transport budget.",
@@ -960,21 +980,24 @@ export function assertChatGptWebMultipartInputWithinLimits(
       capabilities,
     );
     if (browserComposerCharLimit !== undefined && messageChars > browserComposerCharLimit) {
+      const overBy = messageChars - browserComposerCharLimit;
       throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} contains ${messageChars.toLocaleString("en-US")} characters, which exceeds the measured ${browserComposerCharLimit.toLocaleString("en-US")}-character ChatGPT composer boundary. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
+        `A Bigger Context ${label} contains ${messageChars.toLocaleString("en-US")} characters, which exceeds the measured ${browserComposerCharLimit.toLocaleString("en-US")}-character ChatGPT composer boundary by ${overBy.toLocaleString("en-US")} characters. The bridge rejected it during preflight and will not split an individual Codex message or JSON record; reduce that record or compact retained history before retrying.`,
         { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
       );
     }
     if (browserMessageTokenLimit !== undefined && messageTokens > browserMessageTokenLimit) {
+      const overBy = messageTokens - browserMessageTokenLimit;
       throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT message boundary. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
+        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT message boundary by ${overBy.toLocaleString("en-US")} tokens. The bridge rejected it during preflight and will not split an individual Codex message or JSON record; reduce that record or compact retained history before retrying.`,
         { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
       );
     }
     const messageBudget = resolveChatGptWebMessageTokenBudget(modelId, messageEffort, capabilities, imageTokens);
     if (messageTokens > messageBudget) {
+      const overBy = messageTokens - messageBudget;
       throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds its ${messageBudget.toLocaleString("en-US")}-token input budget after reserving space for ChatGPT and attachments. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
+        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds its ${messageBudget.toLocaleString("en-US")}-token input budget after reserving space for ChatGPT and attachments by ${overBy.toLocaleString("en-US")} tokens. The bridge rejected it during preflight and will not split an individual Codex message or JSON record; reduce that record or compact retained history before retrying.`,
         { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
       );
     }
@@ -1004,9 +1027,10 @@ export function assertChatGptWebMultipartInputWithinLimits(
   );
   const experimentalContextWindow = baseContextWindow * partCount;
   if (estimatedInputTokens < experimentalContextWindow) return;
-  const partLabel = partCount === 2 ? "two-part" : "three-part";
+  const partLabel = `${partCount}-part`;
+  const overBy = estimatedInputTokens - experimentalContextWindow + 1;
   throw new ChatGptWebAdapterError(
-    `This Bigger Context transaction is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds its experimental ${experimentalContextWindow.toLocaleString("en-US")}-token ${partLabel} ceiling. Run /compact, then retry.`,
+    `This Bigger Context transaction is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which does not fit its experimental ${experimentalContextWindow.toLocaleString("en-US")}-token ${partLabel} ceiling. Reduce the estimated input by at least ${overBy.toLocaleString("en-US")} token${overBy === 1 ? "" : "s"}. The bridge rejected it during preflight; reduce the current request or run /compact when retained history is the cause, then retry.`,
     { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
   );
 }
@@ -1073,8 +1097,9 @@ export const browserStageTimeouts = {
   // A Bigger Context stage posts a much larger payload onto a conversation that already holds the
   // earlier parts. This budget covers ChatGPT accepting the submission, not just the click.
   multipartStageSend: 180_000,
-  // Staging asks for one transaction-bound acknowledgement, not an open-ended model answer.
-  multipartStageAcknowledgement: CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
+  // The inner DOM-health checks still use the shorter missing-response grace. This larger outer
+  // budget only helps when ChatGPT has actually started the acknowledgement and remains busy.
+  multipartStageAcknowledgement: CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS,
 } as const;
 
 /**
@@ -1459,6 +1484,7 @@ export function chatGptReboundTurnIdentity(
 
 export class ChatGptCompletionTracker {
   private candidate?: { signature: string; since: number };
+  private actionlessCandidate?: { signature: string; since: number };
   private lastToolBatchRevision = 0;
   private postToolAnswerBaselineText?: string;
   private missingPostToolAnswerSince?: number;
@@ -1466,6 +1492,7 @@ export class ChatGptCompletionTracker {
   constructor(
     private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS,
     private readonly missingPostToolAnswerMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
+    private readonly actionlessStableMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
   ) {}
 
   needsToolBatchObservation(revision: number): boolean {
@@ -1483,6 +1510,7 @@ export class ChatGptCompletionTracker {
     this.lastToolBatchRevision = revision;
     this.missingPostToolAnswerSince = undefined;
     this.candidate = undefined;
+    this.actionlessCandidate = undefined;
     return true;
   }
 
@@ -1498,12 +1526,15 @@ export class ChatGptCompletionTracker {
     // while its own tool calls were still in flight.
     if (state.externalToolCallsInFlight) {
       this.candidate = undefined;
+      this.actionlessCandidate = undefined;
       this.missingPostToolAnswerSince = undefined;
       return false;
     }
     if (this.postToolAnswerBaselineText === state.currentText) {
       this.candidate = undefined;
-      if (!chatGptTurnIsComplete(state)) {
+      this.actionlessCandidate = undefined;
+      const terminalShape = state.responsePresent && !state.running && state.currentText.length > 0;
+      if (!terminalShape) {
         this.missingPostToolAnswerSince = undefined;
         return false;
       }
@@ -1514,15 +1545,31 @@ export class ChatGptCompletionTracker {
       return false;
     }
     this.missingPostToolAnswerSince = undefined;
-    if (!chatGptTurnIsComplete(state)) {
-      this.candidate = undefined;
+    if (chatGptTurnIsComplete(state)) {
+      this.actionlessCandidate = undefined;
+      if (this.candidate?.signature !== signature) {
+        this.candidate = { signature, since: now };
+        return false;
+      }
+      return now - this.candidate.since >= this.stableMs;
+    }
+    this.candidate = undefined;
+    const actionlessTerminalShape = state.responsePresent
+      && !state.running
+      && state.currentText.length > 0
+      && !state.completionActionVisible;
+    if (!actionlessTerminalShape) {
+      this.actionlessCandidate = undefined;
       return false;
     }
-    if (this.candidate?.signature !== signature) {
-      this.candidate = { signature, since: now };
+    if (this.actionlessCandidate?.signature !== signature) {
+      this.actionlessCandidate = { signature, since: now };
       return false;
     }
-    return now - this.candidate.since >= this.stableMs;
+    if (now - this.actionlessCandidate.since < this.actionlessStableMs) {
+      return false;
+    }
+    return true;
   }
 }
 
@@ -1530,12 +1577,10 @@ export class ChatGptTurnDomHealthTracker {
   private sawResponse = false;
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
-  private missingCompletionAction?: { text: string; since: number };
 
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
     private readonly emptyCompletionMs = CHATGPT_EMPTY_RESPONSE_GRACE_MS,
-    private readonly missingCompletionActionMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
   ) {}
 
   /**
@@ -1563,7 +1608,6 @@ export class ChatGptTurnDomHealthTracker {
       // no window may accrue while the model is provably working.
       this.missingResponseSince = undefined;
       this.emptyCompletionSince = undefined;
-      this.missingCompletionAction = undefined;
       return undefined;
     }
     if (state.responsePresent || (this.sawResponse && state.running)) {
@@ -1590,17 +1634,6 @@ export class ChatGptTurnDomHealthTracker {
       }
     }
 
-    const missingCompletionAction = state.responsePresent
-      && !state.running
-      && state.currentText.length > 0
-      && !state.completionActionVisible;
-    if (!missingCompletionAction) {
-      this.missingCompletionAction = undefined;
-    } else if (this.missingCompletionAction?.text !== state.currentText) {
-      this.missingCompletionAction = { text: state.currentText, since: now };
-    } else if (now - this.missingCompletionAction.since >= this.missingCompletionActionMs) {
-      return "ChatGPT stopped generating but did not expose its completed-turn action; the ChatGPT DOM may have changed";
-    }
     return undefined;
   }
 }
@@ -2507,6 +2540,14 @@ export class ChatGptBrowserWorker {
     }
     const targetValue = sliderState.min + uiEffortIndex;
     if (targetValue > sliderState.max) {
+      if (uiEffortIndex === 4) {
+        const proMenuItem = await chatGptAvailableProMenuItem(activation.menu);
+        if (proMenuItem) {
+          await proMenuItem.click({ timeout: 5_000 });
+          await settleChatGptUi();
+          return mode;
+        }
+      }
       const detail = uiEffortIndex === 4 ? await chatGptUnavailableProDetail(activation.menu) : undefined;
       const proUsageLimitHint = uiEffortIndex === 4 && sliderState.min === 0 && sliderState.max === 3
         ? " If you have made many Pro requests recently, ChatGPT may have temporarily hidden Pro because you reached its usage limit."
@@ -4436,8 +4477,10 @@ export class ChatGptBrowserWorker {
     if ((turn.captureLunaCheckpoint === true) !== (turn.onLunaCheckpoint !== undefined)) {
       throw new Error("ChatGPT Luna checkpoint capture requires exactly one checkpoint callback");
     }
-    if (turn.captureLunaCheckpoint && turn.modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
-      throw new Error("Private rolling checkpoint capture is valid only for ChatGPT Luna");
+    if (turn.captureLunaCheckpoint
+      && turn.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
+      && turn.modelId !== CHATGPT_WEB_MODEL_ID) {
+      throw new Error("Private rolling checkpoint capture is valid only for automatic ChatGPT Sol or Luna");
     }
     const browserCapabilities = turn.nativeConnector
       ? { ...turn.capabilities, localToolsEnabled: true }
@@ -5077,6 +5120,7 @@ export class ChatGptBrowserWorker {
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
           }
           if (textDelta) emitMarkdownDelta(textDelta);
+          checkpointStream?.observeRawResponse(snapshot.visibleText);
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
@@ -5095,6 +5139,11 @@ export class ChatGptBrowserWorker {
           });
           if (!completionReady) completionFenceRevision = undefined;
           if (completionReady) {
+            if (!snapshot.completionActionVisible) {
+              console.warn(
+                `[chatgpt-web] browser turn ${turn.traceId} accepting stable completed response without the standard completion action`,
+              );
+            }
             if (turn.completionFence) {
               if (completionFenceRevision === undefined) {
                 const revision = await turn.completionFence.begin();
@@ -5134,6 +5183,7 @@ export class ChatGptBrowserWorker {
             }
             if (final.delta) emitMarkdownDelta(final.delta);
             if (checkpointStream) {
+              checkpointStream.observeRawResponse(snapshot.visibleText);
               const completed = checkpointStream.finishOptional(snapshot.visibleText);
               if (completed.visibleRemainder) turn.onTextDelta(completed.visibleRemainder);
               if (completed.captured) turn.onLunaCheckpoint!(completed.captured);

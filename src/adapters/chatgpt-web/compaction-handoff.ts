@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { parseDataUrl } from "../image";
 import type {
   CodexContentPart,
@@ -18,6 +19,8 @@ import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broke
 import type { ChatGptTurnSession } from "./turn-execution";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
+const LATEST_USER_PROMPT_INLINE_CHAR_LIMIT = 16_384;
+const LATEST_USER_PROMPT_EXCERPT_CHAR_LIMIT = LATEST_USER_PROMPT_INLINE_CHAR_LIMIT / 2;
 
 function brokerContent(content: string | CodexContentPart[]): unknown[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
@@ -94,6 +97,20 @@ function userPromptText(content: unknown): string | undefined {
   return text || undefined;
 }
 
+function latestUserPromptAppendix(latestUserPrompt: string): string {
+  if (latestUserPrompt.length <= LATEST_USER_PROMPT_INLINE_CHAR_LIMIT) {
+    return `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify(latestUserPrompt)}`;
+  }
+  const descriptor = {
+    truncated: true,
+    chars: latestUserPrompt.length,
+    sha256: createHash("sha256").update(latestUserPrompt, "utf8").digest("hex"),
+    head: latestUserPrompt.slice(0, LATEST_USER_PROMPT_EXCERPT_CHAR_LIMIT),
+    tail: latestUserPrompt.slice(-LATEST_USER_PROMPT_EXCERPT_CHAR_LIMIT),
+  };
+  return `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify(descriptor)}`;
+}
+
 export function canonicalizeCompactionHandoff(
   parsed: CodexParsedRequest,
   summary: string,
@@ -104,7 +121,13 @@ export function canonicalizeCompactionHandoff(
   if (latestUserPrompt === undefined) {
     throw new Error("ChatGPT compaction source has no canonical latest user prompt");
   }
-  const appendix = `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify(latestUserPrompt)}`;
+  // Native Codex retains the source revision separately from the transparent compaction item, and
+  // the continuation store independently binds that exact source by hash. Duplicating an
+  // arbitrarily large source prompt inside the checkpoint can therefore make a successful compact
+  // immediately exceed the next native context window. Keep ordinary prompts byte-for-byte for
+  // compatibility, but represent large revisions with bounded semantic excerpts plus exact
+  // integrity metadata.
+  const appendix = latestUserPromptAppendix(latestUserPrompt);
   const markerOffset = normalized.lastIndexOf(`\n${LATEST_USER_PROMPT_MARKER}\n`);
   if (markerOffset < 0) return `${normalized}\n\n${appendix}`;
   if (normalized.slice(markerOffset + 1).trimEnd() !== appendix) {

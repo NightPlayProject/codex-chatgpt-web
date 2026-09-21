@@ -214,7 +214,11 @@ context, and service tiers are otherwise unchanged.
 
 The built-in provider attempts a Responses WebSocket prewarm. The local route explicitly returns
 HTTP `426`, which is Codex's native capability-negotiation signal for an immediate, session-sticky
-switch to its HTTP/SSE transport. No model or provider fallback occurs.
+switch to its HTTP/SSE transport. The response and `/healthz` both identify `http-sse` explicitly so
+diagnostics can distinguish this expected negotiation from an actual transport failure. No model or
+provider fallback occurs. Current Codex releases mark the legacy `responses_websockets` feature
+switches as removed; avoiding the prewarm would therefore require changing the model-provider route,
+which this bridge intentionally does not do just to suppress a harmless negotiation response.
 
 Setup never restarts an already loaded daemon implicitly. A requested stop, restart, replacement,
 or uninstall first calls a private authenticated drain endpoint. The daemon rejects new turns and

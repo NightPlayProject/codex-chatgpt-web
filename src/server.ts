@@ -38,6 +38,7 @@ import {
   type CodexModelContextOverride,
 } from "./codex-integration";
 import {
+  CHATGPT_WEB_HIGH_RELIABLE_COMPACT_RETAINED_TEXT_TOKEN_BUDGET,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
@@ -61,9 +62,39 @@ import { join } from "node:path";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
+export function chatGptWebCompactV1RetainedTextTokenBudget(
+  route: ChatGptWebModelRoute,
+  config: Pick<AppConfig, "proAvailable" | "experimentalBiggerContext">,
+): number | undefined {
+  return route.slug === "chatgpt-web/high"
+    && !config.proAvailable
+    && !config.experimentalBiggerContext
+    ? CHATGPT_WEB_HIGH_RELIABLE_COMPACT_RETAINED_TEXT_TOKEN_BUDGET
+    : undefined;
+}
+
+function routedCompactV1Output(
+  input: unknown,
+  summary: string,
+  route: ChatGptWebModelRoute,
+  config: Pick<AppConfig, "proAvailable" | "experimentalBiggerContext">,
+): Record<string, unknown>[] {
+  const retainedTextTokenBudget = chatGptWebCompactV1RetainedTextTokenBudget(route, config);
+  return buildCompactV1Output(
+    extractCompactUserMessages(input),
+    summary,
+    retainedTextTokenBudget === undefined ? {} : { retainedTextTokenBudget },
+  );
+}
+
 export interface NativeCodexTurnIdentity {
   threadId: string;
   turnId: string;
+}
+
+interface HttpTurnLifecycleObserver {
+  onIdentityBound?: (identity: NativeCodexTurnIdentity, endpoint: HttpTrackedEndpoint) => void;
+  onClientDetached?: (identity: NativeCodexTurnIdentity, endpoint: HttpTrackedEndpoint) => void;
 }
 
 export interface HttpStreamFailureEvidence {
@@ -139,10 +170,21 @@ export class HttpTurnCounter {
     return `${identity.threadId}\u0000${identity.turnId}`;
   }
 
-  constructor(private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure) {}
+  constructor(
+    private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure,
+    private readonly lifecycleObserver: HttpTurnLifecycleObserver = {},
+  ) {}
 
   count(): number {
     return this.active.size;
+  }
+
+  hasConnectedTurn(identity: NativeCodexTurnIdentity): boolean {
+    return [...this.active.values()].some(turn => (
+      !turn.abort.signal.aborted
+      && turn.identity?.threadId === identity.threadId
+      && turn.identity.turnId === identity.turnId
+    ));
   }
 
   async cancelAll(reason: unknown = new Error("Active HTTP turns cancelled")): Promise<number> {
@@ -209,6 +251,7 @@ export class HttpTurnCounter {
     } = { abort, done, finish, pendingInterrupts: new Map() };
     this.active.set(id, tracked);
     let released = false;
+    let clientDetached = clientSignal?.aborted === true;
     let clientAbortListener: (() => void) | undefined;
     let streamAbortListener: (() => void) | undefined;
     const release = () => {
@@ -222,7 +265,11 @@ export class HttpTurnCounter {
       if (streamAbortListener) abort.signal.removeEventListener("abort", streamAbortListener);
       finish();
     };
-    clientAbortListener = () => abort.abort(clientSignal?.reason);
+    clientAbortListener = () => {
+      clientDetached = true;
+      if (tracked.identity) this.lifecycleObserver.onClientDetached?.(tracked.identity, endpoint);
+      abort.abort(clientSignal?.reason);
+    };
     if (clientSignal?.aborted) abort.abort(clientSignal.reason);
     else clientSignal?.addEventListener("abort", clientAbortListener, { once: true });
 
@@ -236,6 +283,8 @@ export class HttpTurnCounter {
           throw new Error("An HTTP request cannot change its native Codex turn identity");
         }
         tracked.identity = identity;
+        this.lifecycleObserver.onIdentityBound?.(identity, endpoint);
+        if (clientDetached) this.lifecycleObserver.onClientDetached?.(identity, endpoint);
         const interruptedReason = tracked.pendingInterrupts.get(this.identityKey(identity));
         tracked.pendingInterrupts.clear();
         if (interruptedReason !== undefined && !abort.signal.aborted) abort.abort(interruptedReason);
@@ -568,7 +617,7 @@ export async function responseRequest(
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
     const v1Source = extractChatGptCompactionSourceRevision({
       ...parsed,
-      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
+      _rawBody: { ...body, input: routedCompactV1Output(body.input, summary, route, config) },
     });
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
@@ -803,12 +852,16 @@ export async function compactRequest(
   if (!summary?.trim()) {
     return formatErrorResponse(502, "invalid_response_error", "Compaction turn produced an empty summary");
   }
-  return Response.json({ output: buildCompactV1Output(extractCompactUserMessages(input), summary) });
+  return Response.json({ output: routedCompactV1Output(input, summary, route, config) });
 }
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    nativeTurnReconnectGraceMs?: number;
+  } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
@@ -836,7 +889,65 @@ export function startServer(
   let lastModelCatalogResult: {
     request: number; at: string; status: number; failure?: ModelCatalogFailure;
   } | null = null;
-  const httpTurns = new HttpTurnCounter();
+  const nativeTurnReconnectGraceMs = dependencies.nativeTurnReconnectGraceMs ?? 2_000;
+  if (!Number.isFinite(nativeTurnReconnectGraceMs) || nativeTurnReconnectGraceMs < 0) {
+    throw new Error("Native turn reconnect grace must be a non-negative number");
+  }
+  const detachedNativeTurns = new Map<string, ReturnType<typeof setTimeout>>();
+  const nativeTurnKey = (identity: NativeCodexTurnIdentity): string => (
+    `${identity.threadId}\u0000${identity.turnId}`
+  );
+  const clearDetachedNativeTurn = (identity: NativeCodexTurnIdentity): void => {
+    const key = nativeTurnKey(identity);
+    const pending = detachedNativeTurns.get(key);
+    if (!pending) return;
+    clearTimeout(pending);
+    detachedNativeTurns.delete(key);
+  };
+  let httpTurns!: HttpTurnCounter;
+  const scheduleDetachedNativeTurn = (
+    identity: NativeCodexTurnIdentity,
+    endpoint: HttpTrackedEndpoint,
+  ): void => {
+    if (endpoint !== "responses" && endpoint !== "compact") return;
+    clearDetachedNativeTurn(identity);
+    const key = nativeTurnKey(identity);
+    const timer = setTimeout(() => {
+      if (detachedNativeTurns.get(key) !== timer) return;
+      detachedNativeTurns.delete(key);
+      // An exact reconnect reclaimed the same native turn. Its next disconnect will arm a fresh
+      // grace window; never cancel a currently connected observer because an older socket vanished.
+      if (httpTurns.hasConnectedTurn(identity)) return;
+      const reason = new DOMException("Codex turn observer disconnected without reconnect", "AbortError");
+      const browserCancellation = chatGptTurnSessions.cancelNativeTurn(
+        identity.threadId,
+        identity.turnId,
+        reason,
+      );
+      const compactionCancellation = cancelStructuredCompactionNativeTurn(
+        identity.threadId,
+        identity.turnId,
+        reason,
+      );
+      void Promise.allSettled([
+        browserCancellation.settlement,
+        compactionCancellation.settlement,
+      ]).then(results => {
+        for (const result of results) {
+          if (result.status === "rejected") {
+            console.error(
+              `[chatgpt-web] detached native turn cleanup failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+            );
+          }
+        }
+      });
+    }, nativeTurnReconnectGraceMs);
+    detachedNativeTurns.set(key, timer);
+  };
+  httpTurns = new HttpTurnCounter(reportHttpStreamFailure, {
+    onIdentityBound: identity => clearDetachedNativeTurn(identity),
+    onClientDetached: scheduleDetachedNativeTurn,
+  });
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
@@ -859,6 +970,8 @@ export function startServer(
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
+          responses_transport: "http-sse",
+          websocket_negotiation: "http-426-expected",
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
@@ -1062,7 +1175,11 @@ export function startServer(
       if (req.method === "GET" && url.pathname === "/v1/responses") {
         return new Response("Responses WebSocket transport is not enabled on this local route", {
           status: 426,
-          headers: { "content-type": "text/plain; charset=utf-8" },
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "x-codex-responses-transport": "http-sse",
+          },
         });
       }
       if (req.method === "POST" && url.pathname === "/v1/responses") {

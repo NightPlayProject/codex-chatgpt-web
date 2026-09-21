@@ -122,6 +122,8 @@ test("official wallpaper endpoint identity rejects wrong version, browser id, an
 test("official target discovery keeps only page targets inside the Store app surface", async () => {
   const targets = [
     { id: "page_1", type: "page", url: "app://codex/index.html" },
+    { id: "avatar_overlay", type: "page", url: "app://-/index.html?initialRoute=%2Favatar-overlay" },
+    { id: "detached_window", type: "page", url: "app://-/detached-window.html?initialRoute=%2Fdetached-window" },
     { id: "external", type: "page", url: "https://chatgpt.com/" },
     { id: "frame_1", type: "iframe", url: "app://codex/frame.html" },
     { id: "bad id", type: "page", url: "app://codex/bad.html" },
@@ -133,6 +135,8 @@ test("official target discovery keeps only page targets inside the Store app sur
   assert.deepEqual(result, [makeTarget("page_1")]);
   assert.equal(officialAppTarget(targets[0], 9333), true);
   assert.equal(officialAppTarget(targets[1], 9333), false);
+  assert.equal(officialAppTarget(targets[2], 9333), false);
+  assert.equal(officialAppTarget(targets[3], 9333), false);
 });
 
 test("enabling while the official Store app is already open waits for a user restart and never launches or kills it", async () => {

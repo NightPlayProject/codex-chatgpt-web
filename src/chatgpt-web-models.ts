@@ -51,6 +51,16 @@ export const CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT = 70_000;
  * metadata can take effect. The last observed successful multipart continuation was ~70.7k.
  */
 export const CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT = 72_000;
+/**
+ * Remote compaction v1 normally preserves up to 20k tokens of recent raw user text in addition to
+ * the generated checkpoint. A live Plus High compact at the 400k native threshold produced an
+ * 87,149-token next browser turn with that default, immediately tripping the 72k reliability
+ * guard. The checkpoint is the canonical condensed history and compaction authority separately
+ * hashes the exact source revision, so Standard Context Plus High only needs a small raw-text tail.
+ * Keeping 2k tokens leaves roughly 18k tokens more headroom than the codex-rs default while still
+ * retaining the newest part of the user's request verbatim.
+ */
+export const CHATGPT_WEB_HIGH_RELIABLE_COMPACT_RETAINED_TEXT_TOKEN_BUDGET = 2_000;
 /** Preserve the previously validated Plus reasoning visible-message envelope. */
 export const CHATGPT_WEB_MEDIUM_HIGH_MESSAGE_TOKEN_LIMIT = 81_807;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
@@ -89,6 +99,9 @@ export const CHATGPT_WEB_PRO_MODEL_COMPOSER_CHAR_LIMIT = 1_635_000;
  * history out of later browser requests without asking Codex to compact its canonical history.
  */
 export const CHATGPT_WEB_LUNA_CONTEXT_WINDOW = 1_050_000;
+/** Local experiment: canonical Sol history can grow while rolling checkpoints bound browser turns. */
+export const CHATGPT_WEB_SOL_CONTEXT_WINDOW = 500_000;
+export const CHATGPT_WEB_SOL_AUTO_COMPACT_TOKEN_LIMIT = 400_000;
 export const CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER = 3;
 
 export interface ChatGptWebContextLimits {
@@ -122,6 +135,20 @@ function contextLimits(
   };
 }
 
+function solContextLimits(
+  contextWindow: number,
+  autoCompactTokenLimit: number,
+): ChatGptWebContextLimits {
+  return {
+    contextWindow,
+    // Codex applies effective_context_window_percent to the usable hard window, not only to the
+    // UI indicator. Keep Sol's full model window available so the lower auto-compaction limit has
+    // real headroom instead of colliding with the same effective hard ceiling.
+    effectiveContextWindowPercent: 100,
+    autoCompactTokenLimit,
+  };
+}
+
 /** Resolve the product limit for the selected visible ChatGPT mode. */
 export function resolveChatGptWebContextLimits(
   backendModel: ChatGptWebBackendModel,
@@ -151,36 +178,47 @@ export function resolveChatGptWebContextLimits(
   }
 
   let limits: ChatGptWebContextLimits;
-  if (capabilities.proAvailable) {
-    const contextWindow = effort === "low"
-      ? CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW
-      : effort === "max"
-        ? CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW
-        : CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW;
-    const autoCompactTokenLimit = effort === "max"
-      ? CHATGPT_WEB_PRO_MODEL_AUTO_COMPACT_TOKEN_LIMIT
-      : CHATGPT_WEB_PRO_STANDARD_AUTO_COMPACT_TOKEN_LIMIT;
-    limits = contextLimits(contextWindow, autoCompactTokenLimit);
-  } else if (effort === "low") {
-    limits = contextLimits(
-      CHATGPT_WEB_INSTANT_CONTEXT_WINDOW,
-      CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT,
-    );
-  } else if (effort === "medium" || effort === "high" || (effort === "xhigh" && capabilities.extraHighAvailable)) {
-    limits = contextLimits(
-      CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW,
-      effort === "high"
-        ? CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT
-        : CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT,
-    );
-  } else {
+  if (
+    !capabilities.proAvailable
+    && effort !== "low"
+    && effort !== "medium"
+    && effort !== "high"
+    && !(effort === "xhigh" && capabilities.extraHighAvailable)
+  ) {
     throw new Error(`ChatGPT Plus context limit is not defined for unavailable effort: ${effort}`);
   }
+  limits = solContextLimits(
+    CHATGPT_WEB_SOL_CONTEXT_WINDOW,
+    CHATGPT_WEB_SOL_AUTO_COMPACT_TOKEN_LIMIT,
+  );
   if (!capabilities.experimentalBiggerContext) return limits;
-  return contextLimits(
+  return solContextLimits(
     limits.contextWindow * CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
     limits.autoCompactTokenLimit * CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
   );
+}
+
+/**
+ * Resolve the retained browser-input threshold used to start Bigger Context multipart staging.
+ * This deliberately stays independent from the native Codex compaction threshold: a 400k native
+ * history may be healthy while any one visible ChatGPT submission still needs the smaller,
+ * empirically validated transport envelope.
+ */
+export function resolveChatGptWebBrowserStagingTokenLimit(
+  backendModel: ChatGptWebBackendModel,
+  effort: ChatGptWebAdapterEffort,
+  capabilities: ChatGptWebAccountCapabilities,
+): number | undefined {
+  if (isChatGptWebZeroRiskBackendModel(backendModel) || backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+    return undefined;
+  }
+  if (capabilities.proAvailable) return CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT;
+  if (effort === "low") return CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT;
+  if (effort === "high") return CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT;
+  if (effort === "medium" || (effort === "xhigh" && capabilities.extraHighAvailable)) {
+    return CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT;
+  }
+  throw new Error(`ChatGPT Plus browser staging limit is not defined for unavailable effort: ${effort}`);
 }
 
 /** Resolve limits of one visible ChatGPT composer message, independently of model context. */

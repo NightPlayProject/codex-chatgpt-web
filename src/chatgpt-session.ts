@@ -63,6 +63,13 @@ export async function chatGptEffortMenuForControl(page: Page, control: Locator):
   return page.locator(CHATGPT_EFFORT_MENU_SELECTOR).filter({ visible: true }).last();
 }
 
+export async function chatGptAvailableProMenuItem(menu: Locator): Promise<Locator | undefined> {
+  const rows = menu.getByRole("menuitemradio", { name: "Pro", exact: true }).filter({ visible: true });
+  if (await rows.count() !== 1) return undefined;
+  const row = rows.first();
+  return await row.getAttribute("aria-disabled").catch(() => null) === "true" ? undefined : row;
+}
+
 async function visibleEffortSurface(
   page: Page,
   control: Locator,
@@ -236,10 +243,16 @@ export async function detectChatGptAccountCapabilities(
         { cause: new Error("ChatGPT effort slider exposed an invalid ARIA range") },
       );
     }
+    const optionCount = state.max - state.min + 1;
+    const proMenuItem = await chatGptAvailableProMenuItem(menu);
     return {
       solAvailable: true,
-      extraHighAvailable: state.max - state.min + 1 >= 4,
-      proAvailable: state.max - state.min + 1 >= 5,
+      extraHighAvailable: optionCount >= 4,
+      // Current ChatGPT renders Pro as its own picker row on some accounts,
+      // while older variants exposed it as the fifth slider position. Accept
+      // either authoritative UI shape so a real Pro subscription does not get
+      // hidden merely because the effort slider changed shape.
+      proAvailable: proMenuItem !== undefined || optionCount >= 5,
     };
   } finally {
     await page.keyboard.press("Escape").catch(() => {});

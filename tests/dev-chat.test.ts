@@ -17,7 +17,9 @@ import { defaultDevChatModel, DEV_CHAT_TOOLS, DevChatDriver } from "../src/dev-c
 import {
   createDevCoherentContextPayload,
   createDevContextFiller,
+  createDevContextFillers,
   DEV_CHAT_MODELS,
+  DEV_SYNTHETIC_FILL_RECORD_TOKEN_BUDGET,
   DevChatStore,
 } from "../src/dev-chat/session";
 import { startDevChatTransport } from "../src/dev-chat/transport";
@@ -138,6 +140,16 @@ test("named DEV state and deterministic context filler persist independently", (
   expect(store.load("compaction-lab")).toMatchObject({ input: [], turns: 0, syntheticFills: 0 });
 });
 
+test("large DEV fills stay within the semantic record budget", () => {
+  const targetTokens = 400_050;
+  const fillers = createDevContextFillers(targetTokens);
+  expect(fillers.length).toBeGreaterThan(1);
+  expect(fillers.every(filler => filler.tokens <= DEV_SYNTHETIC_FILL_RECORD_TOKEN_BUDGET)).toBeTrue();
+  const totalTokens = fillers.reduce((total, filler) => total + filler.tokens, 0);
+  expect(totalTokens).toBeGreaterThanOrEqual(targetTokens - fillers.length);
+  expect(totalTokens).toBeLessThanOrEqual(targetTokens);
+});
+
 test("coherent DEV MCP payloads are bounded, deterministic, and distinct", () => {
   const first = createDevCoherentContextPayload(1, 3_000);
   const repeated = createDevCoherentContextPayload(1, 3_000);
@@ -242,17 +254,17 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
   const store = new DevChatStore(join(root, "chats"));
   const normal = new DevChatDriver(config, store, factory, root);
   const normalState = normal.open("normal-window", "chatgpt-web/high").state;
-  expect(normal.status(normalState).autoCompactTokenLimit).toBe(95_000);
+  expect(normal.status(normalState).autoCompactTokenLimit).toBe(400_000);
 
   const biggerConfig = { ...config, experimentalBiggerContext: true };
   const bigger = new DevChatDriver(biggerConfig, store, factory, root, { biggerContext: true });
   const biggerState = bigger.open("bigger-window", "chatgpt-web/high").state;
   const biggerStatus = bigger.status(biggerState);
   expect(biggerStatus).toMatchObject({
-    autoCompactTokenLimit: 285_000,
-    contextWindow: 360_000,
+    autoCompactTokenLimit: 1_200_000,
+    contextWindow: 1_500_000,
   });
-  expect(biggerStatus.percent).toBe(Math.round((biggerStatus.inputTokens / 285_000) * 1_000) / 10);
+  expect(biggerStatus.percent).toBe(Math.round((biggerStatus.inputTokens / 1_200_000) * 1_000) / 10);
   const luna = new DevChatDriver({
     ...biggerConfig,
     solAvailable: false,
@@ -459,14 +471,26 @@ test("synthetic fill crosses the production threshold and triggers the real comp
   const store = new DevChatStore(join(root, "chats"));
   const driver = new DevChatDriver(config, store, factory, root);
   const state = driver.open("auto-compact", "chatgpt-web/light").state;
-  driver.fill(state, 33_000);
-  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(32_000);
+  driver.fill(state, 400_000);
+  expect(state.syntheticFills).toBe(1);
+  expect(state.input.length).toBeGreaterThan(1);
+  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(400_000);
   const events: string[] = [];
   const result = await driver.send(state, "Continue after compacting the synthetic history.", event => events.push(event.type));
   expect(result).toMatchObject({ text: "DEV turn completed after compaction.", compactions: 1 });
   expect(compactRuns).toBe(1);
   expect(events).toContain("compaction_start");
   expect(events).toContain("compaction_done");
+  expect(store.load("auto-compact")?.compactions).toBe(1);
+
+  const afterCompact = driver.status(state);
+  expect(afterCompact.inputTokens).toBeLessThan(400_000);
+
+  const nextEvents: string[] = [];
+  const next = await driver.send(state, "Continue with one ordinary retained turn.", event => nextEvents.push(event.type));
+  expect(next.compactions).toBe(0);
+  expect(compactRuns).toBe(1);
+  expect(nextEvents).not.toContain("compaction_start");
   expect(store.load("auto-compact")?.compactions).toBe(1);
   await driver.close();
 }, 30_000);

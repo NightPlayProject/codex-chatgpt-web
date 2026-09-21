@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -2875,7 +2875,7 @@ test("browser preflight separates model context from one-message transport limit
   const luna = { localToolsEnabled: false, solAvailable: false, proAvailable: false };
 
   try {
-    assertChatGptWebInputWithinLimits(100_000, 81_807, "gpt-5.6-sol", "medium", plus);
+    assertChatGptWebInputWithinLimits(500_000, 81_807, "gpt-5.6-sol", "medium", plus);
     throw new Error("expected context-window preflight to fail");
   } catch (error) {
     expect(error).toMatchObject({
@@ -2888,14 +2888,14 @@ test("browser preflight separates model context from one-message transport limit
     expect(String(error)).toContain("/compact");
   }
 
-  expect(() => assertChatGptWebInputWithinLimits(49_999, 32_807, "gpt-5.6-sol", "low", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(49_999, 32_808, "gpt-5.6-sol", "low", plus)).toThrow(
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 32_807, "gpt-5.6-sol", "low", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 32_808, "gpt-5.6-sol", "low", plus)).toThrow(
     "32,807-token ChatGPT browser message boundary",
   );
-  expect(() => assertChatGptWebInputWithinLimits(50_000, 32_807, "gpt-5.6-sol", "low", plus)).toThrow(
-    "50,000-token context window",
+  expect(() => assertChatGptWebInputWithinLimits(500_000, 32_807, "gpt-5.6-sol", "low", plus)).toThrow(
+    "500,000-token context window",
   );
-  expect(() => assertChatGptWebInputWithinLimits(99_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(71_999, 71_999, "gpt-5.6-sol", "high", plus)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(72_000, 72_000, "gpt-5.6-sol", "high", plus)).toThrow(
     "measured unreliable ChatGPT generation band",
@@ -2906,19 +2906,19 @@ test("browser preflight separates model context from one-message transport limit
   expect(() => assertChatGptWebInputWithinLimits(100_000, 81_807, "gpt-5.6-sol", "high", plus)).toThrow(
     "measured unreliable ChatGPT generation band",
   );
-  expect(() => assertChatGptWebInputWithinLimits(119_999, 103_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(119_999, 103_001, "gpt-5.6-sol", "xhigh", pro)).toThrow(
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 103_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 103_001, "gpt-5.6-sol", "xhigh", pro)).toThrow(
     "103,000-token ChatGPT browser message boundary",
   );
-  expect(() => assertChatGptWebInputWithinLimits(120_000, 103_000, "gpt-5.6-sol", "xhigh", pro)).toThrow(
-    "120,000-token context window",
+  expect(() => assertChatGptWebInputWithinLimits(500_000, 103_000, "gpt-5.6-sol", "xhigh", pro)).toThrow(
+    "500,000-token context window",
   );
-  expect(() => assertChatGptWebInputWithinLimits(127_999, 104_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(127_999, 104_001, "gpt-5.6-sol", "max", pro)).toThrow(
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 104_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(499_999, 104_001, "gpt-5.6-sol", "max", pro)).toThrow(
     "104,000-token ChatGPT browser message boundary",
   );
-  expect(() => assertChatGptWebInputWithinLimits(128_000, 104_000, "gpt-5.6-sol", "max", pro)).toThrow(
-    "128,000-token context window",
+  expect(() => assertChatGptWebInputWithinLimits(500_000, 104_000, "gpt-5.6-sol", "max", pro)).toThrow(
+    "500,000-token context window",
   );
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
@@ -3066,6 +3066,27 @@ test("Standard Context Plus High preflights the observed terminal-error band wit
   )).not.toThrow();
 });
 
+test("Bigger Context preflight accepts two through eight multipart messages only", () => {
+  const capabilities = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    proAvailable: true,
+    experimentalBiggerContext: true,
+  };
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    10_000, 10_000, CHATGPT_WEB_MODEL_ID, "high", capabilities, 40_000, 2, undefined, true,
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    10_000, 10_000, CHATGPT_WEB_MODEL_ID, "high", capabilities, 40_000, 8, undefined, true,
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    10_000, 10_000, CHATGPT_WEB_MODEL_ID, "high", capabilities, 40_000, 1, undefined, true,
+  )).toThrow("between 2 and 8");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    10_000, 10_000, CHATGPT_WEB_MODEL_ID, "high", capabilities, 40_000, 9, undefined, true,
+  )).toThrow("between 2 and 8");
+});
+
 test("Bigger Context preflight expands only the total context ceiling and keeps each message boundary", () => {
   const plus = {
     localToolsEnabled: false,
@@ -3080,7 +3101,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     experimentalBiggerContext: true,
   };
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    359_999,
+    1_499_999,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3091,7 +3112,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    360_000,
+    1_500_000,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3100,9 +3121,9 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     3,
     undefined,
     true,
-  )).toThrow("three-part ceiling");
+  )).toThrow("3-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    239_999,
+    999_999,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3113,7 +3134,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    240_000,
+    1_000_000,
     95_000,
     "gpt-5.6-sol",
     "high",
@@ -3122,9 +3143,9 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     2,
     undefined,
     true,
-  )).toThrow("two-part ceiling");
+  )).toThrow("2-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    299_999,
+    1_499_999,
     80_000,
     "gpt-5.6-sol",
     "high",
@@ -3135,7 +3156,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    300_000,
+    1_500_000,
     80_000,
     "gpt-5.6-sol",
     "high",
@@ -3144,9 +3165,9 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     3,
     undefined,
     true,
-  )).toThrow("300,000-token three-part ceiling");
+  )).toThrow("1,500,000-token 3-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    199_999,
+    999_999,
     80_000,
     "gpt-5.6-sol",
     "high",
@@ -3157,7 +3178,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     true,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    200_000,
+    1_000_000,
     80_000,
     "gpt-5.6-sol",
     "high",
@@ -3166,7 +3187,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     2,
     undefined,
     true,
-  )).toThrow("200,000-token two-part ceiling");
+  )).toThrow("1,000,000-token 2-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     280_000,
     103_001,
@@ -3499,15 +3520,14 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   expect(empty.update(terminal, 1_000)).toBeUndefined();
   expect(empty.update(terminal, 1_500)).toContain("completed without a final answer");
 
-  const missingCompletionAction = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const missingCompletionAction = new ChatGptTurnDomHealthTracker(1_000, 500);
   const completedWithoutMarker = {
     ...terminal,
     currentText: "complete answer",
     completionActionVisible: false,
   };
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("DOM may have changed");
+  expect(missingCompletionAction.update(completedWithoutMarker, 10_000)).toBeUndefined();
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {
@@ -3628,7 +3648,7 @@ test("both response loops check explicit Stopped thinking before acknowledging f
 test("proven MCP progress vetoes every terminal DOM conclusion, not just a missing response", () => {
   // Tool activity remains authoritative when the response DOM is present but its completion action
   // has not appeared yet.
-  const stalled = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const stalled = new ChatGptTurnDomHealthTracker(1_000, 500);
   const answeredWithoutCompletionAction = {
     responsePresent: true,
     running: false,
@@ -3639,12 +3659,12 @@ test("proven MCP progress vetoes every terminal DOM conclusion, not just a missi
   expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 1_000)).toBeUndefined();
   expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 10_000)).toBeUndefined();
 
-  // Once the model genuinely stops, the window starts fresh rather than charging the live stretch.
+  // Once the model genuinely stops, the completion tracker owns the stable-text fallback. DOM
+  // health must not race that recovery path and convert a finished answer into a hard failure.
   expect(stalled.update(answeredWithoutCompletionAction, 10_100)).toBeUndefined();
-  expect(stalled.update(answeredWithoutCompletionAction, 10_849)).toBeUndefined();
-  expect(stalled.update(answeredWithoutCompletionAction, 10_850)).toContain("did not expose its completed-turn action");
+  expect(stalled.update(answeredWithoutCompletionAction, 20_000)).toBeUndefined();
 
-  const empty = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const empty = new ChatGptTurnDomHealthTracker(1_000, 500);
   const completedEmpty = {
     responsePresent: true,
     running: false,
@@ -3655,6 +3675,54 @@ test("proven MCP progress vetoes every terminal DOM conclusion, not just a missi
   expect(empty.update({ ...completedEmpty, externalProgressLive: true }, 9_000)).toBeUndefined();
   expect(empty.update(completedEmpty, 9_100)).toBeUndefined();
   expect(empty.update(completedEmpty, 9_600)).toContain("completed without a final answer");
+});
+
+test("stable terminal text completes when ChatGPT omits the standard completion action", () => {
+  const tracker = new ChatGptCompletionTracker(500, 750, 750);
+  const actionless = {
+    responsePresent: true,
+    running: false,
+    currentText: "complete answer",
+    currentHtml: "<p>complete answer</p>",
+    completionActionVisible: false,
+  };
+
+  expect(tracker.update(actionless, 1_000)).toBeFalse();
+  expect(tracker.update(actionless, 1_749)).toBeFalse();
+  expect(tracker.update(actionless, 1_750)).toBeTrue();
+});
+
+test("actionless completion fallback requires stable content and no in-flight Codex tool", () => {
+  const tracker = new ChatGptCompletionTracker(500, 750, 750);
+  const state = {
+    responsePresent: true,
+    running: false,
+    currentText: "partial answer",
+    currentHtml: "<p>partial answer</p>",
+    completionActionVisible: false,
+  };
+
+  expect(tracker.update(state, 1_000)).toBeFalse();
+  expect(tracker.update({ ...state, externalToolCallsInFlight: true }, 2_000)).toBeFalse();
+  expect(tracker.update(state, 2_100)).toBeFalse();
+  expect(tracker.update({ ...state, currentText: "final answer", currentHtml: "<p>final answer</p>" }, 2_800)).toBeFalse();
+  expect(tracker.update({ ...state, currentText: "final answer", currentHtml: "<p>final answer</p>" }, 3_549)).toBeFalse();
+  expect(tracker.update({ ...state, currentText: "final answer", currentHtml: "<p>final answer</p>" }, 3_550)).toBeTrue();
+});
+
+test("unchanged pre-tool text cannot be accepted by the actionless fallback", () => {
+  const tracker = new ChatGptCompletionTracker(500, 750, 750);
+  const state = {
+    responsePresent: true,
+    running: false,
+    currentText: "answer before tool",
+    currentHtml: "<p>answer before tool</p>",
+    completionActionVisible: false,
+  };
+
+  expect(tracker.observeToolBatch(1, state.currentText)).toBeTrue();
+  expect(tracker.update(state, 1_000)).toBeFalse();
+  expect(() => tracker.update(state, 1_750)).toThrow("without producing a final answer after its last Codex tool call");
 });
 
 test("live external progress still records that a response DOM was observed", () => {
@@ -4043,14 +4111,15 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   expect(heartbeat).toBeLessThan(tryStart);
 });
 
-test("a staged Bigger Context part gets an acknowledgement window sized to its payload", () => {
+test("a staged Bigger Context part distinguishes missing DOM from a slow live acknowledgement", () => {
   // A staged part is much larger than an ordinary prompt and ChatGPT reads it before answering.
   expect(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS).toBeGreaterThan(CHATGPT_RESPONSE_DOM_GRACE_MS);
 
-  // No MCP activity exists while an inert part is being ingested, so the response and send budgets
-  // bound the same exchange.
+  // Missing response DOM is still rejected on the same bounded ingestion window as Send. Once a
+  // response has actually started, however, the outer stage must not abort it at that same wall.
   expect(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS).toBe(browserStageTimeouts.multipartStageSend);
-  expect(browserStageTimeouts.multipartStageAcknowledgement).toBe(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS);
+  expect(CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS).toBeGreaterThan(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS);
+  expect(browserStageTimeouts.multipartStageAcknowledgement).toBe(CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS);
 
 });
 

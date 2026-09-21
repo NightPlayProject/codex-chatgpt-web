@@ -14,6 +14,7 @@ import {
   CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
   CHATGPT_WEB_MODEL_ROUTES,
   requireChatGptWebModelRoute,
+  resolveChatGptWebBrowserStagingTokenLimit,
   resolveChatGptWebContextLimits,
   resolveChatGptWebTransportLimits,
 } from "../src/chatgpt-web-models";
@@ -126,20 +127,23 @@ describe("fixed ChatGPT Web model routes", () => {
 
   test("publishes larger Sol context windows while preserving the measured Plus message ceiling", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
-      contextWindow: 50_000,
-      effectiveContextWindowPercent: 64,
-      autoCompactTokenLimit: 32_000,
+      contextWindow: 500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 400_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toEqual({
-      contextWindow: 100_000,
-      effectiveContextWindowPercent: 80,
-      autoCompactTokenLimit: 80_000,
+      contextWindow: 500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 400_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toEqual({
-      contextWindow: 100_000,
-      effectiveContextWindowPercent: 70,
-      autoCompactTokenLimit: 70_000,
+      contextWindow: 500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 400_000,
     });
+    expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toBe(32_000);
+    expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toBe(80_000);
+    expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toBe(70_000);
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
       browserMessageTokenLimit: 32_807,
       browserComposerCharLimit: 211_256,
@@ -154,22 +158,25 @@ describe("fixed ChatGPT Web model routes", () => {
 
   test("publishes larger Pro context windows independently of measured message boundaries", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", pro)).toEqual({
-      contextWindow: 120_000,
-      effectiveContextWindowPercent: 79,
-      autoCompactTokenLimit: 95_000,
+      contextWindow: 500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 400_000,
     });
     for (const effort of ["medium", "high", "xhigh"] as const) {
       expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toEqual({
-        contextWindow: 120_000,
-        effectiveContextWindowPercent: 79,
-        autoCompactTokenLimit: 95_000,
+        contextWindow: 500_000,
+        effectiveContextWindowPercent: 100,
+        autoCompactTokenLimit: 400_000,
       });
     }
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", pro)).toEqual({
-      contextWindow: 128_000,
-      effectiveContextWindowPercent: 74,
-      autoCompactTokenLimit: 95_000,
+      contextWindow: 500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 400_000,
     });
+    for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toBe(95_000);
+    }
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", pro)).toEqual({
       browserMessageTokenLimit: 103_000,
       browserComposerCharLimit: 545_000,
@@ -202,9 +209,9 @@ describe("fixed ChatGPT Web model routes", () => {
       ...pro,
       experimentalBiggerContext: true,
     })).toEqual({
-      contextWindow: 384_000,
-      effectiveContextWindowPercent: 74,
-      autoCompactTokenLimit: 285_000,
+      contextWindow: 1_500_000,
+      effectiveContextWindowPercent: 100,
+      autoCompactTokenLimit: 1_200_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
       solAvailable: false,

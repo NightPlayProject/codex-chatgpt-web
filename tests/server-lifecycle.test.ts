@@ -9,7 +9,15 @@ import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/a
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import {
+  chatGptWebCompactV1RetainedTextTokenBudget,
+  compactRequest,
+  HttpTurnCounter,
+  responseRequest,
+  routeChatGptWebRequest,
+  startServer,
+} from "../src/server";
+import { requireChatGptWebModelRoute } from "../src/chatgpt-web-models";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -489,6 +497,172 @@ test("authenticated Interrupt hook endpoint releases the exact routed Web turn",
     expect(browserAborted).toBeTrue();
     await response;
   } finally {
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("Standard Context Plus High compaction keeps a browser-safe raw user tail", () => {
+  const plus = defaultConfig("browser-only");
+  const high = requireChatGptWebModelRoute("chatgpt-web/high", plus);
+  expect(chatGptWebCompactV1RetainedTextTokenBudget(high, plus)).toBe(2_000);
+
+  expect(chatGptWebCompactV1RetainedTextTokenBudget(high, { ...plus, proAvailable: true })).toBeUndefined();
+  expect(chatGptWebCompactV1RetainedTextTokenBudget(high, { ...plus, experimentalBiggerContext: true })).toBeUndefined();
+  const medium = requireChatGptWebModelRoute("chatgpt-web/medium", plus);
+  expect(chatGptWebCompactV1RetainedTextTokenBudget(medium, plus)).toBeUndefined();
+});
+
+test("a detached native Responses observer retires its browser owner after the reconnect grace", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_detached_fallback";
+  const turnId = "turn_detached_fallback";
+  let browserAborted = false;
+  let rejectBrowser!: (error: Error) => void;
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("detached-fallback-browser", () => ({
+    mode: "read-only",
+    browser,
+    physicalSettlement: browser.then(() => undefined, () => undefined),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => {
+      browserAborted = true;
+      rejectBrowser(reason ?? new Error("detached native turn retired"));
+    },
+  }), "detached-fallback-trace", "detached-fallback-owner", turnId, threadId);
+  const server = startServer(config, {
+    nativeTurnReconnectGraceMs: 20,
+    adapterFactory: () => ({
+      name: "detached-fallback-test",
+      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
+        incoming.abortSignal!.addEventListener("abort", () => reject(incoming.abortSignal!.reason), { once: true });
+      }),
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const disconnect = new AbortController();
+  const response = fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    signal: disconnect.signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt-web/high",
+      stream: true,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "wait for disconnect fallback" }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    }),
+  }).catch(() => undefined);
+
+  try {
+    const activeDeadline = Date.now() + 1_000;
+    let activeHttpTurns = 0;
+    while (Date.now() < activeDeadline && activeHttpTurns !== 1) {
+      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
+      if (activeHttpTurns !== 1) await Bun.sleep(5);
+    }
+    expect(activeHttpTurns).toBe(1);
+    disconnect.abort();
+    await response;
+
+    const releasedDeadline = Date.now() + 1_000;
+    let activeBrowserTurns = 1;
+    while (Date.now() < releasedDeadline && activeBrowserTurns !== 0) {
+      activeBrowserTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_browser_turns: number }).active_browser_turns;
+      if (activeBrowserTurns !== 0) await Bun.sleep(5);
+    }
+    expect(activeBrowserTurns).toBe(0);
+    expect(browserAborted).toBeTrue();
+  } finally {
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+  }
+});
+
+test("an exact native reconnect cancels detached-turn fallback cleanup", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_detached_reconnect";
+  const turnId = "turn_detached_reconnect";
+  let browserAborted = false;
+  let rejectBrowser!: (error: Error) => void;
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("detached-reconnect-browser", () => ({
+    mode: "read-only",
+    browser,
+    physicalSettlement: browser.then(() => undefined, () => undefined),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => {
+      browserAborted = true;
+      rejectBrowser(reason ?? new Error("detached native turn retired"));
+    },
+  }), "detached-reconnect-trace", "detached-reconnect-owner", turnId, threadId);
+  const server = startServer(config, {
+    nativeTurnReconnectGraceMs: 80,
+    adapterFactory: () => ({
+      name: "detached-reconnect-test",
+      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
+        incoming.abortSignal!.addEventListener("abort", () => reject(incoming.abortSignal!.reason), { once: true });
+      }),
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "chatgpt-web/high",
+    stream: true,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "reconnect this exact native round" }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }],
+  });
+  const firstAbort = new AbortController();
+  const first = fetch(`${endpoint}/v1/responses`, {
+    method: "POST", signal: firstAbort.signal, headers: { "content-type": "application/json" }, body,
+  }).catch(() => undefined);
+  const secondAbort = new AbortController();
+  let second: Promise<Response | undefined> | undefined;
+
+  try {
+    const firstDeadline = Date.now() + 1_000;
+    let activeHttpTurns = 0;
+    while (Date.now() < firstDeadline && activeHttpTurns !== 1) {
+      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
+      if (activeHttpTurns !== 1) await Bun.sleep(5);
+    }
+    expect(activeHttpTurns).toBe(1);
+    firstAbort.abort();
+    await first;
+
+    second = fetch(`${endpoint}/v1/responses`, {
+      method: "POST", signal: secondAbort.signal, headers: { "content-type": "application/json" }, body,
+    }).catch(() => undefined);
+    const reconnectDeadline = Date.now() + 1_000;
+    activeHttpTurns = 0;
+    while (Date.now() < reconnectDeadline && activeHttpTurns !== 1) {
+      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
+      if (activeHttpTurns !== 1) await Bun.sleep(5);
+    }
+    expect(activeHttpTurns).toBe(1);
+    await Bun.sleep(120);
+    expect(browserAborted).toBeFalse();
+    expect((await (await fetch(`${endpoint}/healthz`)).json() as { active_browser_turns: number }).active_browser_turns).toBe(1);
+  } finally {
+    secondAbort.abort();
+    await second;
     chatGptTurnSessions.clear();
     await server.stop(true);
   }

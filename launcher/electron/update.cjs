@@ -23,12 +23,23 @@ function parseVersion(value) {
 }
 
 function compareVersions(left, right) {
-  const a = parseVersion(left);
-  const b = parseVersion(right);
+  const normalize = (value) => {
+    const parsed = parseVersion(value);
+    if (!parsed) return null;
+    // Releases before v5.0.8 used 5.0.7xxx as a build train (for example 5.0.7030).
+    // Treat those as v5.0.7 build revisions so the public v5.0.8 release upgrades them.
+    if (parsed.major === 5 && parsed.minor === 0 && parsed.patch >= 7000 && parsed.patch < 8000) {
+      return { ...parsed, patch: 7, legacyBuild: parsed.patch - 7000 };
+    }
+    return { ...parsed, legacyBuild: 0 };
+  };
+  const a = normalize(left);
+  const b = normalize(right);
   if (!a || !b) throw new Error(`Invalid release version comparison: ${left} / ${right}`);
   for (const key of ["major", "minor", "patch"]) {
     if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
   }
+  if (a.legacyBuild !== b.legacyBuild) return a.legacyBuild > b.legacyBuild ? 1 : -1;
   if (a.prerelease === b.prerelease) return 0;
   if (a.prerelease === null) return 1;
   if (b.prerelease === null) return -1;

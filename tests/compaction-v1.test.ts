@@ -82,3 +82,20 @@ test("v1 compaction drops persisted one-pixel image sentinels", () => {
   expect(JSON.stringify(output)).not.toContain(placeholder);
   expect(JSON.stringify(output)).toContain("data:image/png;base64,real-image");
 });
+
+test("v1 compaction can narrow retained raw text without clipping the checkpoint summary", () => {
+  const text = Array.from({ length: 30_000 }, (_, index) => String(index % 10)).join("");
+  const output = buildCompactV1Output(extractCompactUserMessages([{
+    type: "message",
+    role: "user",
+    id: "large-user",
+    content: [{ type: "input_text", text }],
+  }]), "checkpoint survives intact", { retainedTextTokenBudget: 2_000 });
+
+  const retained = output[0] as { content: Array<{ type: string; text?: string }> };
+  expect(retained.content).toEqual([{
+    type: "input_text",
+    text: text.slice(-8_000),
+  }]);
+  expect(JSON.stringify(output.at(-1))).toContain("checkpoint survives intact");
+});

@@ -207,7 +207,7 @@ async function waitForOfficialEndpoint(identity, port, {
 }
 
 function officialAppTarget(target, port) {
-  return Boolean(target
+  if (!(target
     && target.type === "page"
     && typeof target.url === "string"
     && target.url.startsWith("app://")
@@ -215,7 +215,23 @@ function officialAppTarget(target, port) {
     && TARGET_ID_RE.test(target.id)
     && Number.isInteger(port)
     && port >= 1024
-    && port <= 65535);
+    && port <= 65535)) {
+    return false;
+  }
+
+  // The official desktop app exposes auxiliary Electron pages over the same
+  // DevTools endpoint as the main Codex surface. Those pages (for example the
+  // avatar overlay and detached window) intentionally do not contain the main
+  // ChatGPT shell, so trying to install Wallpapers into them can only time out
+  // and produces a repeated target_failed warning on every refresh.
+  try {
+    const url = new URL(target.url);
+    if (!url.pathname.endsWith("/index.html")) return false;
+    if (url.searchParams.get("initialRoute") === "/avatar-overlay") return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function discoverOfficialTargets(endpoint, fetchImpl = globalThis.fetch) {

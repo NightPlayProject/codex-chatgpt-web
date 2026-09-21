@@ -7,6 +7,7 @@ const path = require("node:path");
 const domino = require("@mixmark-io/domino");
 const {
   createWallpaperManager,
+  loadWallpaperRuntime,
   readWallpaperLibrary,
   safeLibraryPath,
 } = require("../electron/wallpapers.cjs");
@@ -30,7 +31,7 @@ class FakeContents {
 
   async executeJavaScript(script) {
     this.calls.push(script);
-    if (script.trimStart().startsWith("// Executed once per Codex window")) {
+    if (script.includes("// Executed once per Codex window")) {
       this.installed = true;
       return "installed";
     }
@@ -59,7 +60,7 @@ class DelayedShellContents extends FakeContents {
   }
 
   async executeJavaScript(script, ...args) {
-    if (script.trimStart().startsWith("// Executed once per Codex window")) {
+    if (script.includes("// Executed once per Codex window")) {
       return super.executeJavaScript(script, ...args);
     }
     if (isShellReadyScript(script)) {
@@ -221,6 +222,28 @@ test("Codex Wallpapers runtime accepts the current ChatGPT shell shape", () => {
     '<main id="main"><form data-type="unified-composer"><div id="prompt-textarea"></div></form></main>',
   );
   assert.ok(window.__CODEX_WALLPAPERS_PUBLIC__, "expected the runtime to initialize on the current ChatGPT shell");
+});
+
+test("Codex Wallpapers ships the Metal send-button renderer before the page runtime", async () => {
+  const script = await loadWallpaperRuntime(path.join(__dirname, "../wallpapers"));
+  const metal = script.indexOf("__CODEX_WALLPAPERS_METAL_SEND__");
+  const runtime = script.indexOf("// Executed once per Codex window");
+  assert.ok(metal >= 0, "expected the bundled metal-fx page renderer");
+  assert.ok(runtime > metal, "expected Metal to initialize before the wallpaper controller");
+  assert.match(script, /cwMetalSend/);
+  assert.match(script, /data-cw-metal-send-target/);
+  assert.match(script, /reflectionTargets/);
+  assert.match(script, /button\[data-testid=\\?"send-button\\?"\]/);
+  assert.match(script, /button\[data-testid=\\?"stop-button\\?"\]/);
+  assert.match(script, /Stop generating/);
+});
+
+test("Metal send renderer is pinned to the native button box instead of an inline baseline", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../wallpapers/metal-send.tsx"), "utf8");
+  assert.match(source, /position:\s*"absolute"/);
+  assert.match(source, /inset:\s*0/);
+  assert.match(source, /display:\s*"flex"/);
+  assert.match(source, /"line-height:0"/);
 });
 
 test("Codex Wallpapers validates and transfers the shared content-addressed library", async () => {

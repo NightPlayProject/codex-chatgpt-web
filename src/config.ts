@@ -513,6 +513,22 @@ function parseConfig(value: unknown, path: string): AppConfig {
   const solAvailable = parsed.solAvailable !== false;
   const extraHighAvailable = parsed.extraHighAvailable === true;
   const proAvailable = parsed.proAvailable === true;
+  if (parsed.experimentalSkillAttachments !== undefined && typeof parsed.experimentalSkillAttachments !== "boolean") {
+    throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
+  }
+  const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
+  if (parsed.experimentalFreshConversationPerTurn !== undefined
+    && typeof parsed.experimentalFreshConversationPerTurn !== "boolean") {
+    throw new Error(`Invalid experimentalFreshConversationPerTurn in ${path}`);
+  }
+  const experimentalFreshConversationPerTurn = parsed.experimentalFreshConversationPerTurn === true;
+  if (parsed.useSavedChats !== undefined && typeof parsed.useSavedChats !== "boolean") {
+    throw new Error(`Invalid useSavedChats in ${path}`);
+  }
+  const useSavedChats = parsed.useSavedChats === true;
+  if (browserInteractionMode === "manual" && experimentalSkillAttachments) {
+    throw new Error(`Zero Risk does not support Skills as files in ${path}`);
+  }
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;

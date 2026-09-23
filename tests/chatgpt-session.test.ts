@@ -6,8 +6,32 @@ import {
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   activateChatGptEffortMenu,
+  assertNewChatPage,
+  chatGptNewChatUrl,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
+
+test("saved chats start empty and cannot reuse an arbitrary conversation or a Temporary Chat", async () => {
+  expect(chatGptNewChatUrl()).toBe("https://chatgpt.com/?temporary-chat=true");
+  expect(chatGptNewChatUrl(true)).toBe("https://chatgpt.com/");
+  const prepare = (ChatGptBrowserWorker.prototype as any).prepareChatSurface;
+  for (const saved of [false, true]) {
+    let url = "https://chatgpt.com/c/previous-task";
+    const navigations: string[] = [];
+    const absent: any = { filter: () => absent, last: () => absent, isVisible: async () => false };
+    const composer: any = { count: async () => 1, nth: () => composer, isVisible: async () => true };
+    const page: any = {
+      url: () => url,
+      goto: async (next: string) => { url = next; navigations.push(next); },
+      locator: (selector: string) => selector === CHATGPT_COMPOSER_SELECTOR ? composer : absent,
+    };
+    expect(await prepare.call({ activeComposer: async () => composer }, page, undefined, saved)).toBe(composer);
+    expect(navigations).toEqual([chatGptNewChatUrl(saved)]);
+    await expect(assertNewChatPage(page, !saved)).rejects.toThrow("requested new");
+    url = "https://chatgpt.com/c/previous-task";
+    await expect(assertNewChatPage(page, saved)).rejects.toThrow("requested new");
+  }
+});
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
   const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
@@ -238,6 +262,17 @@ function reasoningPicker(options: {
   const container = {
     filter() { return this; }, last() { return this; },
     locator: () => slider,
+    evaluate: async (read: (element: Element) => unknown) => {
+      const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+      // Captured Plus DOM: the slider root and each tick have data-locked, but only
+      // ticks have data-selected. Its fourth position is a locked Pro upsell.
+      const locks = options.locks ?? Array.from({ length: Number(options.max ?? "4") + 1 }, () => "false");
+      const document = createDocument(`<div data-model-reasoning-effort-slider>
+        <span data-locked="false"><span>${locks.map((lock, index) =>
+          `<span data-selected="${index <= value}"${lock === null ? "" : ` data-locked="${lock}"`}></span>`).join("")}
+        </span></span></div>`);
+      return read(document.querySelector("[data-model-reasoning-effort-slider]")!);
+    },
     isVisible: async () => true,
     waitFor: async ({ state }: { state: string }) => {
       expect(state).toBe("visible");
@@ -246,10 +281,13 @@ function reasoningPicker(options: {
     },
   };
   const control = {
-    last() { return this; }, waitFor: async () => {}, isVisible: async () => true,
-    getAttribute: async (name: string) => name === "aria-expanded" ? "true" : null,
+    first() { return this; }, filter() { return this; }, last() { return this; },
+    count: async () => 1, waitFor: async () => {}, isVisible: async () => true,
+    click: async () => { opened = true; },
+    innerText: async () => opened ? "Thinking effort" : ["Instant", "Medium", "High", "Extra High", "Pro"][value]!,
+    getAttribute: async (name: string) => name === "aria-expanded" ? String(opened) : null,
   };
-  const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
+  const composer = { filter() { return this; }, last() { return this; }, isEditable: async () => true, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
   const proRow = {
     filter() { return this; },
@@ -264,13 +302,17 @@ function reasoningPicker(options: {
     getByRole: () => proRow,
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
       if (selector === CHATGPT_EFFORT_MENU_SELECTOR) return menu;
       if (selector === CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR) return container;
       return hidden;
     },
-    keyboard: { press: async () => {} },
+    keyboard: { press: async () => {
+      opened = false;
+      if (options.loseSelectionOnClose) value = 0;
+    } },
   };
   return { page, composer, keys, value: () => value, proClicked: () => proClicked };
 }

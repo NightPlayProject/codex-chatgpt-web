@@ -1,4 +1,7 @@
-export type Language = "en" | "zh-CN" | "ja";
+import languages from "../electron/languages.json";
+import type { LimitsSnapshot } from "./limits-types";
+
+export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
 export type Surface = "browser" | "setup" | "mcp" | "activity" | "accounts" | "settings";
@@ -234,6 +237,8 @@ export interface AccountSwitcherSnapshot {
 
 export interface LauncherApi {
   snapshot(): Promise<LauncherSnapshot>;
+  getLimits(): Promise<LimitsSnapshot>;
+  setupLimits(): Promise<LimitsSnapshot>;
   setLanguage(language: Language): Promise<LauncherState>;
   openSocial(target: "github" | "x"): Promise<LauncherState>;
   completeOnboarding(language: Language, browserInteractionMode: BrowserInteractionMode): Promise<LauncherState>;

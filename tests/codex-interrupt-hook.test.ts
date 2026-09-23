@@ -162,3 +162,87 @@ test("restores a hook whose end comment moved before unchanged definitions witho
     }
   }
 });
+
+test("keeps foreign TOML tables inserted between the managed hook and its trust state", () => {
+  for (const ending of ["\n", "\r\n", "\r"]) {
+    const original = 'model = "example"\n\n[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "prior-hook"\n'.replaceAll("\n", ending);
+    const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] });
+    const foreign = '\n[marketplaces.claude-plugins-official]\nsource = "unchanged-user-setting"\n\n[mcp_servers.notes]\ncommand = "notes-server"\n\n'.replaceAll("\n", ending);
+    const stateHeader = `[hooks.state.${JSON.stringify(installed.installed.stateKey)}]`;
+    const edited = installed.text.replace(stateHeader, foreign + stateHeader);
+    const outside = installed.text + foreign;
+    expect(Bun.TOML.parse(edited.replace(/\r\n?/g, "\n"))).toEqual(Bun.TOML.parse(outside.replace(/\r\n?/g, "\n")));
+    verifyCodexInterruptHook(edited, installed.installed);
+    const restored = restoreCodexInterruptHook(edited, installed.installed);
+    expect(restored).toBe(original + foreign);
+    const next = installCodexInterruptHook(restored, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/new-runtime"] });
+    verifyCodexInterruptHook(next.text, next.installed);
+    expect(restoreCodexInterruptHook(next.text, next.installed)).toBe(restored);
+    for (const changed of [
+      edited.replace("timeout = 3", "timeout = 2"),
+      edited.replace(installed.installed.trustedHash, "sha256:changed"),
+      edited + `\n[hooks.state.${JSON.stringify(installed.installed.stateKey)}.extra]\nchanged = true\n`,
+      edited + '\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "unexpected-hook"\n',
+    ]) {
+      expect(() => restoreCodexInterruptHook(changed, installed.installed)).toThrow("changed after setup");
+    }
+  }
+});
+
+test("preserves ownership when Codex moves trust state before the hook and normalizes boundary newlines", () => {
+  for (const ending of ["\n", "\r\n", "\r"]) {
+    const original = 'model = "example"\n'.replaceAll("\n", ending);
+    const { text, installed } = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
+      runtimeCommand: ["/opt/runtime"],
+    });
+    const state = `[hooks.state.${JSON.stringify(installed.stateKey)}]${ending}trusted_hash = ${JSON.stringify(installed.trustedHash)}${ending}`;
+    const rewritten = text.replace(state, "").replace("# Managed by codex-chatgpt-web:", state + "# Managed by codex-chatgpt-web:")
+      .replace(`timeout = 3${ending}${ending}`, `timeout = 3${ending}`);
+    const parse = (value: string) => Bun.TOML.parse(value.replace(/\r\n?/g, "\n"));
+    expect(parse(rewritten)).toEqual(parse(text));
+    verifyCodexInterruptHook(rewritten, installed);
+    const restored = restoreCodexInterruptHook(rewritten, installed);
+    expect(parse(restored)).toEqual(parse(original));
+    verifyCodexInterruptHookRestored(restored);
+    for (const modified of [
+      rewritten.replace("timeout = 3", "timeout = 2"),
+      rewritten.replace(JSON.stringify(installed.command), JSON.stringify("other-command")),
+      rewritten.replace(installed.trustedHash, "sha256:changed"),
+      rewritten + state,
+      rewritten + `${ending}[hooks.state.${JSON.stringify(installed.stateKey)}.extra]${ending}enabled = true`,
+    ]) {
+      expect(modified).not.toBe(rewritten);
+      expect(() => verifyCodexInterruptHook(modified, installed)).toThrow("changed after setup");
+    }
+  }
+});
+
+test("accepts a literal-quoted trust-state key while preserving another config path's trust entry", () => {
+  const original = 'model = "example"\n';
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] });
+  // Use the Windows key from #443 without depending on this test host's path resolver.
+  const stateKey = String.raw`D:\AppData\Codex\UserData\config.toml:interrupt:0:0`;
+  const beforeHeader = `[hooks.state.${JSON.stringify(installed.installed.stateKey)}]`;
+  const journalHeader = `[hooks.state.${JSON.stringify(stateKey)}]`;
+  const journal = {
+    ...installed.installed,
+    stateKey,
+    fragment: installed.installed.fragment.replace(beforeHeader, journalHeader),
+  };
+  const alias = `[hooks.state.'C:\\Users\\test\\.codex\\config.toml:interrupt:0:0']\ntrusted_hash = ${JSON.stringify(journal.trustedHash)}\n`;
+  for (const ending of ["\n", "\r\n"]) {
+    const edited = installed.text.replace(beforeHeader, `[hooks.state.'${stateKey}']`)
+      .replace(MANAGED_INTERRUPT_HOOK_END, alias + MANAGED_INTERRUPT_HOOK_END)
+      .replaceAll("\n", ending);
+    verifyCodexInterruptHook(edited, journal);
+    expect(restoreCodexInterruptHook(edited, journal)).toBe((original + alias).replaceAll("\n", ending));
+    for (const changed of [
+      edited.replace("timeout = 3", "timeout = 2"),
+      edited.replace(journal.trustedHash, "sha256:changed"),
+      edited.replace(`[hooks.state.'${stateKey}']`, "[hooks.state.'different-key']"),
+      edited + `\n[hooks.state.'${stateKey}'.extra]\nchanged = true\n`,
+    ]) {
+      expect(() => verifyCodexInterruptHook(changed, journal)).toThrow("changed after setup");
+    }
+  }
+});

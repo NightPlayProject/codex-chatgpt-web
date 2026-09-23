@@ -958,6 +958,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   Object.assign(options, parseTextControls(data.text));
   if (data.prompt_cache_key !== undefined) options.promptCacheKey = data.prompt_cache_key;
 
+  const textCompaction = !compactionRequest && isNativeTextCompaction(body);
   return {
     modelId: data.model,
     ...(data.previous_response_id ? { previousResponseId: data.previous_response_id } : {}),
@@ -966,7 +967,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     options,
     _rawBody: body,
     ...(replayedInputPrefixLength > 0 ? { _replayPrefixLen: replayedInputPrefixLength } : {}),
-    ...(compactionRequest ? { _compactionRequest: true } : {}),
+    ...(compactionRequest || textCompaction ? { _compactionRequest: true } : {}),
+    ...(textCompaction ? { _compactionResponseFormat: "message" as const } : {}),
     ...(opaqueMultiAgentV2Payload ? { _opaqueMultiAgentV2Payload: true } : {}),
   };
 }

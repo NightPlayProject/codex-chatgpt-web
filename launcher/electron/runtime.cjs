@@ -1637,7 +1637,7 @@ class RuntimeHost {
           ...options,
           message: "Validating Codex configuration before changing the runtime",
           successMessage: "Codex configuration is ready for setup",
-          timeoutMs: Math.min(options.timeoutMs || 15_000, 15_000),
+          timeoutMs: options.timeoutMs || CORE_SETUP_TIMEOUT_MS,
         });
       }
       runtimeTransitionStarted = true;
@@ -1701,7 +1701,7 @@ class RuntimeHost {
         ...failures,
       ].join("; ");
       this.publishOperation?.({ name, status: "failed", message });
-      throw new Error(message);
+      throw new Error(message, { cause: error });
     } finally {
       this.lifecycleOperation = null;
     }

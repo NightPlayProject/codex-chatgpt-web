@@ -8,6 +8,7 @@ import type { ChatGptTurnIdentity, ChatGptTurnUserRevision } from "./environment
 interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
+  source: ChatGptTurnUserRevision;
 }
 
 interface PersistedCheckpoint {

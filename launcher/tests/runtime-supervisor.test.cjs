@@ -60,7 +60,7 @@ function launcherConfig(descriptorPath, overrides = {}) {
       ? "\\\\.\\pipe\\codex-chatgpt-web-runtime-supervisor-test"
       : path.join(root, "turn-broker.sock"),
     headed: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
     runtimeCommand: [process.execPath],
@@ -156,6 +156,16 @@ test("launcher runtime ownership cannot cross production and DEV profiles", () =
     validateConfig({ ...production, stallTimeoutSec: 900 }, descriptorPath).stallTimeoutSec,
     900,
   );
+  for (const enabled of [false, true]) {
+    for (const browserInteractionMode of ["automatic", "manual"]) {
+      assert.equal(validateConfig({ ...production, browserInteractionMode,
+        experimentalFreshConversationPerTurn: enabled }, descriptorPath).experimentalFreshConversationPerTurn, enabled);
+    }
+  }
+  for (const invalid of ["true", 1, null]) {
+    assert.throws(() => validateConfig({ ...production,
+      experimentalFreshConversationPerTurn: invalid }, descriptorPath), /invalid experimentalFreshConversationPerTurn/);
+  }
 });
 
 test("DEV runtime supervision ignores launcher version mismatch and starts only the isolated MCP tunnel", async () => {
@@ -250,7 +260,7 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
     brokerSocketPath: "\\\\.\\pipe\\codex-chatgpt-web-runtime-supervisor-test",
     headed: true,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
     runtimeCommand: ["C:\\Users\\Example\\.codex-chatgpt-web\\runtime\\bun.exe"],
@@ -810,6 +820,66 @@ test("launcher adopts a healthy native managed tunnel without spawning a foregro
   }
 });
 
+test("first launcher tunnel startup creates its missing profile and keeps the verified runtime alive", {
+  skip: process.platform === "win32", // Executable manager fixture uses a Unix shebang.
+}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-first-tunnel-"));
+  const health = await localHealthServer(() => 200, pathname => pathname.startsWith("/api/logs")
+    ? JSON.stringify({ events: [] }) : "ok");
+  const profileDir = path.join(root, "profiles");
+  const profile = path.join(profileDir, "first-setup.yaml");
+  const binaryPath = path.join(root, "tunnel-client");
+  const runtimeKeyFile = path.join(root, "runtime.key");
+  const eventPath = path.join(root, "commands.jsonl");
+  fs.writeFileSync(binaryPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const profile = ${JSON.stringify(profile)};
+fs.appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify(args) + "\\n");
+if (args[1] === "connect") {
+  fs.writeFileSync(profile, "native manager profile fixture");
+  console.log("{}");
+} else if (args[1] === "stop") {
+  if (fs.existsSync(profile)) {
+    console.error("refusing a stop after successful startup");
+    process.exitCode = 1;
+  } else {
+    console.error("runtime alias not found");
+    process.exitCode = 1;
+  }
+} else if (args[1] === "cleanup") {
+  console.log(JSON.stringify({ entries: fs.existsSync(profile) ? [{
+    alias: "first-setup", runtime_state: "ready",
+    live_runtime: { base_url: ${JSON.stringify(health.baseUrl)}, system: { pid: ${process.pid} } }
+  }] : [] }));
+} else process.exitCode = 2;
+`, { mode: 0o700 });
+  fs.writeFileSync(runtimeKeyFile, "fixture");
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: root, browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  let monitored = false;
+  const config = { mode: "full", brokerSocketPath: path.join(root, "broker.sock"), tunnel: {
+    binaryPath, runtimeKeyFile, profileDir, profileName: "first-setup", alias: "first-setup",
+    tunnelId: `tunnel_${"a".repeat(32)}`,
+  } };
+  supervisor.startTunnelMonitor = () => { monitored = true; };
+  try {
+    await supervisor.startTunnel(config);
+    const commands = fs.readFileSync(eventPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(commands.map(args => args[1]), ["cleanup", "stop", "connect", "cleanup"]);
+    assert.equal(monitored, true);
+    assert.equal(fs.existsSync(profile), true);
+    assert.equal(supervisor.tunnel?.pid, process.pid);
+    assert.equal((await supervisor.readLocalTunnelHealth()).ready, true);
+  } finally {
+    await health.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const existingReady of [true, false]) {
   test(`a ${existingReady ? "previously running" : "newly connected"} tunnel cannot start monitoring before MCP verification`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-start-proof-"));
@@ -1349,7 +1419,8 @@ test("explicit launcher shutdown cancels active turns before the graceful stop",
   assert.deepEqual(actions, ["cancel-turns", "graceful-stop"]);
 });
 
-test("launcher supervisor requests exact browser trace cancellation", async () => {
+for (const reason of [undefined, "browser_surface_bootstrap_timeout", "helper_heartbeat_expired"])
+test(`launcher supervisor forwards exact trace cancellation: ${reason ?? "user close"}`, async () => {
   const supervisor = new RuntimeSupervisor({
     app: { getVersion: () => "0.2.0", isPackaged: false },
     logger: { info() {}, warn() {}, error() {} },
@@ -1361,7 +1432,7 @@ test("launcher supervisor requests exact browser trace cancellation", async () =
   supervisor.daemon = { exitCode: null, signalCode: null };
   supervisor.control = async (_config, action, options) => {
     assert.equal(action, "cancel-turn");
-    assert.deepEqual(options.body, { traceId: "trace_exact" });
+    assert.deepEqual(options.body, { traceId: "trace_exact", ...(reason ? { reason } : {}) });
     assert.equal(options.timeoutMs, 15_000);
     return {
       status: "ok",
@@ -1371,7 +1442,7 @@ test("launcher supervisor requests exact browser trace cancellation", async () =
     };
   };
 
-  const result = await supervisor.cancelBrowserTurn("trace_exact");
+  const result = await supervisor.cancelBrowserTurn("trace_exact", reason);
   assert.equal(result.trace_id, "trace_exact");
 });
 

@@ -1,3 +1,4 @@
+import languages from "../electron/languages.json";
 import { AnimatePresence, motion } from "motion/react";
 import {
   useCallback,
@@ -12,6 +13,9 @@ import { createPortal } from "react-dom";
 import { formatAccountDisplayName, formatAccountEmail } from "./account-display";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
+import { LimitsSurface } from "./LimitsSurface";
+import { limitsCopyFor } from "./limits-copy";
+import { useLimits } from "./useLimits";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -243,27 +247,16 @@ function Onboarding({
 
           {isLanguage ? (
             <div className="welcome-options" role="radiogroup" aria-label={localized.chooseLanguage}>
-              <WelcomeOption
-                active={selectedLanguage === "en"}
-                detail={localized.english}
-                label={localized.english}
-                marker="EN"
-                onClick={() => setSelectedLanguage("en")}
-              />
-              <WelcomeOption
-                active={selectedLanguage === "zh-CN"}
-                detail={localized.chinese}
-                label={localized.chinese}
-                marker="简"
-                onClick={() => setSelectedLanguage("zh-CN")}
-              />
-              <WelcomeOption
-                active={selectedLanguage === "ja"}
-                detail={localized.japanese}
-                label={localized.japanese}
-                marker="日"
-                onClick={() => setSelectedLanguage("ja")}
-              />
+              {languageOptions.map(option => (
+                <WelcomeOption
+                  key={option.value}
+                  active={selectedLanguage === option.value}
+                  detail={option.label}
+                  label={option.label}
+                  marker={option.marker}
+                  onClick={() => setSelectedLanguage(option.value)}
+                />
+              ))}
             </div>
           ) : isInteraction ? (
             <InteractionModePicker
@@ -383,6 +376,8 @@ function LauncherShell({
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
   const updateVersion = "version" in snapshot.update ? snapshot.update.version : null;
   const selectedManualTab = browser?.tabs.find(tab => tab.active && tab.interactionMode === "manual");
+  const limits = useLimits(api!, snapshot.state.browserInteractionMode === "manual");
+  const limitsCopy = limitsCopyFor(language);
 
   useEffect(() => {
     const unsubscribe = api!.onAccountsState(setAccountSnapshot);
@@ -643,6 +638,17 @@ function LauncherShell({
               </SidebarGroup>
               <SidebarGroup label={copy.runtime}>
                 <SidebarItem active={surface === "activity"} icon="activity" label={copy.activity} onClick={() => navigateSurface("activity")} />
+                <SidebarItem
+                  active={surface === "limits"}
+                  badge={limits.needsAttention ? (
+                    <span role="img" aria-label={limitsCopy.nearLimit} title={limitsCopy.nearLimit}>
+                      <ActionDot tone="optional" />
+                    </span>
+                  ) : null}
+                  icon="logs"
+                  label={limitsCopy.title}
+                  onClick={() => navigateSurface("limits")}
+                />
               </SidebarGroup>
             </nav>
 
@@ -3163,13 +3169,11 @@ function Switch({
   );
 }
 
+const languageOptions = (Object.keys(languages) as Language[]).map(value => ({ value, ...languages[value] }));
+
 function LanguageMenu({ copy, language, onChange }: { copy: Copy; language: Language; onChange: (language: Language) => void }) {
   const [open, setOpen] = useState(false);
-  const options: Array<{ label: string; value: Language }> = [
-    { label: copy.english, value: "en" },
-    { label: copy.chinese, value: "zh-CN" },
-    { label: copy.japanese, value: "ja" },
-  ];
+  const options = languageOptions;
   const selected = options.find((option) => option.value === language) ?? options[0];
 
   return (
@@ -3425,7 +3429,7 @@ function formatTime(value: string, language: Language): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? value
-    : date.toLocaleTimeString(language === "ja" ? "ja-JP" : language === "zh-CN" ? "zh-CN" : "en", {
+    : date.toLocaleTimeString(languages[language].locale, {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",

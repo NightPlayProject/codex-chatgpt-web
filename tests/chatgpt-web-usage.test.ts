@@ -19,7 +19,7 @@ import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compac
 import { parseRequest } from "../src/responses/parser";
 import type { CodexParsedRequest } from "../src/types";
 
-const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
 
 function request(text: string): CodexParsedRequest {
   return {
@@ -220,10 +220,10 @@ test("Sol canonical usage does not turn base64 image bytes into text-context pre
 });
 
 test("multipart selection accounts for whole-record and composer fit before submission", () => {
-  const plus = { ...capabilities, proAvailable: false };
+  const plus = { ...capabilities, extraHighAvailable: false, proAvailable: false };
   for (const [contents, expected] of [
     [["small task"], undefined],
-    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 3],
+    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
     [Array.from({ length: 3 }, () => " ".repeat(450_000)), 2],
   ] as const) {
     const parsed = request("");
@@ -320,11 +320,11 @@ test("v2 compaction replacement does not replay the large source history into th
     .toBeLessThan(CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT);
 });
 
-test("Bigger Context compaction selects three parts before the legacy inline byte budget", () => {
+test("Bigger Context compaction selects six parts before the legacy inline byte budget", () => {
   const parsed = request("x".repeat(160_000));
   parsed._compactionRequest = true;
   const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
-  expect(parts).toBe(3);
+  expect(parts).toBe(6);
   const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
   expect(compiled.trimmedCompactionMessages).toBeUndefined();
   expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
@@ -411,9 +411,9 @@ test("near-threshold Sol compaction expands beyond three parts while preserving 
 
 test("multipart planning leaves room for final attachments and execution instructions without losing history", () => {
   for (const scenario of [
-    { proAvailable: false, images: 3, schema: false },
-    { proAvailable: true, images: 10, schema: false },
-    { proAvailable: false, images: 0, schema: true },
+    { extraHighAvailable: false, proAvailable: false, images: 3, schema: false },
+    { extraHighAvailable: true, proAvailable: true, images: 10, schema: false },
+    { extraHighAvailable: false, proAvailable: false, images: 0, schema: true },
   ]) {
     const caps = { ...capabilities, proAvailable: scenario.proAvailable };
     const parsed = request("");
@@ -426,7 +426,7 @@ test("multipart planning leaves room for final attachments and execution instruc
     if (scenario.schema) parsed.options.outputFormat = {
       type: "json_schema", name: "result", strict: true, schema: { type: "string", description: "schema ".repeat(24_000) },
     };
-    const compiled = compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: 3 });
+    const compiled = compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: 6 });
     const records = compiled.multipart!.parts.flatMap(part => JSON.parse(part).records);
     expect(records.map(record => record.message_index)).toEqual(parsed.context.messages.map((_, index) => index));
     expect(records.slice(0, texts.length).map(record => record.message.content)).toEqual(texts);

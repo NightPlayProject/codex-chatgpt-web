@@ -136,6 +136,16 @@ function hookTextPattern(text: string): string {
     .join("(?:\\r\\n|\\n|\\r)");
 }
 
+function definitionTextPattern(text: string): string {
+  // Native TOML serialization can remove separator blank lines without changing a definition.
+  // Match one canonical form, consuming at most the original separators for exact restoration.
+  const leading = text.match(/^[\r\n]+/)?.[0] ?? "";
+  const trailing = text.match(/[\r\n]+$/)?.[0] ?? "";
+  const separator = (value: string) => `(?:\\r\\n|\\n|\\r){0,${value.match(/\r\n|\n|\r/g)?.length ?? 0}}`;
+  return separator(leading) + hookTextPattern(text.slice(leading.length, text.length - trailing.length))
+    + separator(trailing);
+}
+
 function locateCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): Array<{
   start: number; end: number;
 }> {

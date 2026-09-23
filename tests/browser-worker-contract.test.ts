@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { waitForOperationalChatGptViewport } from "../src/adapters/chatgpt-web/browser-worker";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
@@ -8,6 +9,7 @@ import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_ACKNOWLEDGEMENT_TIMEOUT_MS, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, CHATGPT_REBIND_OPERATIONAL_VIEWPORT_TIMEOUT_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
 import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
@@ -31,6 +33,49 @@ function personalizedTemporaryChatRole(
   };
   return locator;
 }
+
+test("unavailable Pro detail reads only its linked tooltip in any language", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const details = [
+    "Limit reached. Try again after Sep 18, 2026.",
+    "上限に達しました。明日の14:30以降にお試しください。",
+    "已達上限，請於9月18日後再試。",
+    "한도에 도달했습니다. 내일 다시 시도하세요.",
+    "Лимит достигнут. Повторите завтра.",
+  ];
+  const observe = async (detail: string, kind = "owned") => {
+    const window = createWindow('<div id="other" role="tooltip">Unrelated old limit</div><div id="menu"><div role="menuitemradio" aria-disabled="true">Pro</div></div>');
+    const menu = window.document.getElementById("menu");
+    const row = menu.firstElementChild;
+    const tooltip = window.document.createElement("div");
+    tooltip.id = "owned";
+    tooltip.setAttribute("role", kind === "quote" ? "paragraph" : "tooltip");
+    tooltip.textContent = detail;
+    tooltip.hidden = kind === "hidden";
+    window.document.body.appendChild(tooltip);
+    if (kind === "enabled") row.removeAttribute("aria-disabled");
+    let clock = 0;
+    const context = createContext({
+      document: window.document, HTMLElement: window.HTMLElement,
+      Date: { now: () => { clock += 1_001; return clock; } },
+      setTimeout: (callback: () => void) => { callback(); return 0; },
+      getComputedStyle: (element: HTMLElement) => element.style,
+    });
+    const locator = {
+      filter() { return this; },
+      count: async () => kind === "ambiguous" ? 2 : 1,
+      getAttribute: async (name: string) => row.getAttribute(name),
+      hover: async () => { if (kind !== "unlinked") row.setAttribute("aria-describedby", "owned"); },
+      evaluate: async (callback: Function) => runInContext(`(${callback.toString()})`, context)(row),
+    };
+    return chatGptUnavailableProDetail({ getByRole: () => locator } as never);
+  };
+  for (const detail of details) expect(await observe(detail)).toBe(detail);
+  for (const kind of ["quote", "hidden", "enabled", "ambiguous", "unlinked"]) {
+    expect(await observe(details[0]!, kind)).toBeUndefined();
+  }
+  expect(await observe("x".repeat(513))).toBeUndefined();
+});
 
 test("conversation turn identity survives ChatGPT DOM virtualization", () => {
   expect(chatGptNewTurnIdentity(
@@ -126,6 +171,69 @@ test("assistant tracking rebinds only one proven replacement after React detache
   )).toThrow("2 new conversation turns");
 });
 
+test("response caching rechecks CSS visibility without requiring a DOM mutation", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const dom = createWindow();
+  const originalInnerText = Object.getOwnPropertyDescriptor(dom.HTMLElement.prototype, "innerText");
+  Object.defineProperty(dom.HTMLElement.prototype, "innerText", {
+    configurable: true, get() { return this.textContent; },
+  });
+  // Domino collections predate iterable DOM collections; supply that browser API in the fixture.
+  const prototypes = [dom.document.querySelectorAll(".markdown"), dom.document.body.children].map(Object.getPrototypeOf);
+  for (const prototype of prototypes) Object.defineProperty(prototype, Symbol.iterator, {
+    configurable: true, value: Array.prototype[Symbol.iterator],
+  });
+  try {
+    for (const target of ["answer", "copy"]) {
+      const window = createWindow('<article id="old"><button data-testid="copy-turn-action-button">Copy</button></article><article id="turn"><div class="markdown" id="answer">CODEX WEB GPT READY</div><button id="copy" data-testid="copy-turn-action-button">Copy</button></article>');
+      let visible = false;
+      const context = createContext({
+        document: window.document, HTMLElement: window.HTMLElement, Element: window.Element, Node: window.Node,
+        NodeFilter: window.NodeFilter, performance: { timeOrigin: 1 },
+        getComputedStyle: (element: HTMLElement) => ({
+          display: "block", visibility: "visible", opacity: element.id === target && !visible ? "0" : "1",
+        }),
+        MutationObserver: class { observe() {} },
+      });
+      const evaluationErrors: string[] = [];
+      const locator = {
+        evaluate: async (callback: Function, options: unknown) => {
+          try { return runInContext(`(${callback.toString()})`, context)(window.document.getElementById("turn"), options); }
+          catch (error) { evaluationErrors.push((error as Error).stack ?? String(error)); throw error; }
+        },
+        page: () => ({ isClosed: () => false }),
+      };
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+        responseDomSnapshot(locator: unknown, cache: object): Promise<{ visibleText: string; completionActionVisible: boolean }>;
+      };
+      const cache = {} as { fullScans?: number; cacheHits?: number };
+      const first = await worker.responseDomSnapshot(locator, cache);
+      expect(evaluationErrors).toEqual([]);
+      expect(first.completionActionVisible).toBeFalse();
+      expect(first.visibleText).toBe(target === "answer" ? "" : "CODEX WEB GPT READY");
+      await worker.responseDomSnapshot(locator, cache);
+      expect(cache.fullScans).toBe(1);
+      expect(cache.cacheHits).toBe(1);
+      // A stylesheet/animation changes computed opacity; no subtree mutation occurs.
+      visible = true;
+      expect(await worker.responseDomSnapshot(locator, cache)).toMatchObject({
+        visibleText: "CODEX WEB GPT READY", completionActionVisible: true,
+      });
+      expect(cache.fullScans).toBe(2);
+      await worker.responseDomSnapshot(locator, cache);
+      expect(cache.fullScans).toBe(2);
+      expect(cache.cacheHits).toBe(2);
+      visible = false;
+      expect((await worker.responseDomSnapshot(locator, cache)).completionActionVisible).toBeFalse();
+      expect(cache.fullScans).toBe(3);
+    }
+  } finally {
+    for (const prototype of prototypes) delete prototype[Symbol.iterator];
+    if (originalInnerText) Object.defineProperty(dom.HTMLElement.prototype, "innerText", originalInnerText);
+    else delete dom.HTMLElement.prototype.innerText;
+  }
+});
+
 test("a retained MCP conversation reuses its proven connector binding", () => {
   expect(chatGptConnectorAttachmentMode(true, false)).toBe("mention");
   expect(chatGptConnectorAttachmentMode(true, true)).toBe("retained");
@@ -145,7 +253,7 @@ test("browser turns run concurrently up to the five-tab limit", async () => {
   const browserTurn = (traceId: string) => ({
     traceId,
     modelId: "chatgpt-web/high",
-    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     prepare: async () => ({ text: traceId, images: [], release() {} }),
     onTextDelta() {},
   });
@@ -484,7 +592,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     chatgptWeb: {
       localToolsEnabled: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       storageStatePath: `/tmp/issue-285-${Date.now()}-${Math.random()}.json`,
     },
   };
@@ -627,7 +735,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     chatgptWeb: {
       localToolsEnabled: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       storageStatePath: `/tmp/multipart-send-budget-${Date.now()}-${Math.random()}.json`,
     },
   };
@@ -683,11 +791,66 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
   expect(pressOptions?.signal).toBeInstanceOf(AbortSignal);
 });
 
+test("two-part saved chats re-prove unchanged effort after the first message creates the conversation URL", async () => {
+  const root = mkdtempSync(join(tmpdir(), "saved-chat-multipart-"));
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const prepared = { ...compileChatGptWebPrompt({
+    modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "low" },
+    context: { systemPrompt: ["Keep literal paths."], messages: [
+      { role: "user", content: "Read the first file.", timestamp: 1 },
+      { role: "user", content: "Compare it with the second file.", timestamp: 2 },
+    ] },
+  }, capabilities, undefined, { experimentalMultipartParts: 2 }), release() {} };
+  const worker: any = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`,
+    chatgptWeb: { useSavedChats: true, browserDiagnosticsPath: root },
+  });
+  let url = "https://chatgpt.com/";
+  const savedUrl = "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001";
+  const selections: string[] = [];
+  const control = { innerText: async () => "Instant", getAttribute: async () => "false" };
+  const controls: any = { filter: () => controls, count: async () => 1, first: () => control };
+  const composer = { locator: () => ({ locator: () => controls }), isEditable: async () => true };
+  const page = Object.assign(new EventEmitter(), {
+    url: () => url, isClosed: () => false,
+    evaluate: async () => { throw new Error("No real browser in the transport fixture"); },
+  });
+  let sends = 0;
+  const finished = new Error("final send reached with a current effort proof");
+  Object.assign(worker, {
+    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { expect(saved).toBeTrue(); },
+    activeComposer: async () => composer,
+    selectModelAndEffort: async () => {
+      selections.push(url);
+      return { ...resolveChatGptWebMultipartStagingMode(CHATGPT_WEB_MODEL_ID, capabilities, 100, 100),
+        selection: { url, label: "Instant" } };
+    },
+    captureSubmissionBaseline: async () => ({}),
+    attachPrompt: async () => {}, attachPromptWithCompactionRetry: async () => {}, attachFiles: async () => {},
+    waitForNewAssistantTurn: async () => ({}), waitForMultipartAcknowledgement: async () => {},
+    sendAttachedPrompt: async (_page: unknown, _baseline: unknown, _capture: unknown, _signal: unknown,
+      _progress: unknown, lifecycle: { onSendActivated(): Promise<void> }) => {
+      await lifecycle.onSendActivated();
+      if (++sends === 2) throw finished;
+      url = savedUrl;
+      return "user_turn";
+    },
+  });
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "saved_multipart", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
+    }, undefined, page)).rejects.toBe(finished);
+    expect(sends).toBe(2);
+    expect(selections).toEqual(["https://chatgpt.com/", savedUrl]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("submission observation recovery resumes with rebound locators and is strictly bounded", async () => {
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://submission-recovery-${Date.now()}-${Math.random()}`,
-    chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   type Evidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call";
   type Recovery = { page: Page; baseline: unknown };
@@ -762,7 +925,7 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://assistant-recovery-${Date.now()}-${Math.random()}`,
-    chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   type Baseline = {
     initialTurnIdentities: string[];
@@ -878,7 +1041,7 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
       const worker = ChatGptBrowserWorker.forProvider({
         adapter: "chatgpt-web",
         baseUrl: `browser://assistant-expiry-${scenario}-${Math.random()}`,
-        chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+        chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
       }) as unknown as {
         waitForNewAssistantTurn(page: Page, baseline: Baseline, deadline: number | undefined): Promise<{
           identity: string; locator: unknown;
@@ -1052,7 +1215,7 @@ test("large Markdown-rich context uses one plain-text editing command before exa
     activeComposer: async () => composer,
     insertPromptText,
     assertPromptAttached: async (_page: unknown, value: string) => { asserted = value; },
-  }, {}, prompt, false);
+  }, dialogPage("").page, prompt, false);
 
   expect(calls[0]).toEqual(["fill", ""]);
   expect(calls.filter(call => call[0] === "evaluate")).toEqual([["evaluate", prompt]]);
@@ -1194,6 +1357,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: (text: string, options: { exact: boolean }) => {
       expect(text).toBe("Codex Native2");
@@ -1269,6 +1433,7 @@ test("connector selection moves highlight to the exact hidden-viewport row befor
   };
   const selectedComposer = { selected: true };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: () => menuRows,
@@ -1292,6 +1457,7 @@ test("repeated connector verification reuses its selected pill before clearing t
     fill: async () => { fillCalls += 1; },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: () => ({ filter: () => ({}) }),
@@ -1350,6 +1516,7 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => selector.includes("__menu-item")
@@ -1416,6 +1583,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   };
   const selectedComposer = { selected: true };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     reload: async () => { calls.push("reload"); },
     getByText: () => ({ exactConnectorLabel: true }),
@@ -1453,7 +1621,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   const fixture = {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnosticsRoot },
     ensurePage: async () => page,
-    prepareTemporaryChatSurface: async () => {
+    prepareChatSurface: async () => {
       prepared += 1;
       calls.push(`prepare:${prepared}`);
     },
@@ -1513,7 +1681,7 @@ for (const captureScreenshots of [false, true]) test(`connector failure persists
     await expect(verifyConnectorExclusive.call({
       config: { appName: "Codex Native2", browserDiagnosticsPath: diagnosticsRoot },
       ensurePage: async () => page,
-      prepareTemporaryChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
+      prepareChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
         await capture("composer-ready");
       },
       selectConnector: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
@@ -1568,7 +1736,7 @@ test("successful connector verification clears the proven selection before relea
     const result = await verifyConnectorExclusive.call({
       config: { appName: "Codex Native2 DEV", browserDiagnosticsPath: diagnosticsRoot },
       ensurePage: async () => page,
-      prepareTemporaryChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
+      prepareChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
         calls.push("prepare");
         await capture("composer-ready");
       },
@@ -1624,7 +1792,8 @@ test("connector catalog refresh stays fail-closed for absent, legacy, and exact 
   const run = async (visibleRows: string[]) => {
     let now = realDateNow();
     const page = {
-      getByRole: personalizedTemporaryChatRole,
+      url: () => "https://chatgpt.com/?temporary-chat=true",
+    getByRole: personalizedTemporaryChatRole,
       getByText: () => ({ exactConnectorLabel: true }),
       locator: () => ({
         filter: (options: { has?: unknown; visible?: boolean }) => options.visible
@@ -1734,9 +1903,10 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
-    locator: (selector: string) => selector.includes("__menu-item")
+    locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : selector.includes("__menu-item")
       ? { filter: () => appResult, evaluateAll: async () => [] }
       : (() => { throw new Error(`Unexpected locator: ${selector}`); })(),
   };
@@ -1820,6 +1990,7 @@ test("an aborted connector proof clears its mention before the preflight release
     evaluate: async () => { calls.push("cleanup-read"); return ""; },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: () => absent,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => {
@@ -1874,6 +2045,7 @@ test("a lost connector mention cannot be used as evidence to change personalizat
     evaluate: async () => ({ text: "", focused: false }),
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: () => absent,
     getByText: () => ({}),
     locator: (selector: string) => {
@@ -1929,6 +2101,7 @@ test("an aborted real connector selection clears the typed mention before return
     evaluate: async () => { calls.push("cleanup-read"); return composerText.trim(); },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => {
@@ -2026,6 +2199,7 @@ test("an abort after connector activation removes the selected pill before retur
     evaluate: async () => composerText.trim(),
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => selector === "body"
@@ -2086,7 +2260,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
       connectorSelected = false;
       cleanupFinished = true;
     },
-  }, {}, "context", true, undefined, controller.signal);
+  }, dialogPage("").page, "context", true, undefined, controller.signal);
 
   await expect(attachment).rejects.toMatchObject({ name: "AbortError" });
   expect(cleanupFinished).toBeTrue();
@@ -2118,7 +2292,7 @@ test("retained tool turns insert into the connector-bound composer without selec
     selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
     insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
-  }, {}, "retained context", true, undefined, undefined, false, undefined, true);
+  }, dialogPage("").page, "retained context", true, undefined, undefined, false, undefined, true);
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
 });
 
@@ -2219,7 +2393,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
       captureDiagnostic: (checkpoint: string) => Promise<void>,
     ): Promise<{ displayLabel: string; uiEffortIndex: number | null }>;
   }).selectModelAndEffort;
@@ -2231,7 +2405,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
   }, "gpt-5.6-luna", "low", {
     localToolsEnabled: true,
     solAvailable: false,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
   }, async checkpoint => { checkpoints.push(checkpoint); });
 
   expect(mode).toMatchObject({ displayLabel: "Luna", uiEffortIndex: null });
@@ -2247,7 +2421,7 @@ function thinkSlashFixture() {
     waitFor: async () => { if (!state.optionCount) throw new Error("Think command is unavailable"); } };
   const rows = { filter: () => rows, first: () => row, count: async () => state.optionCount };
   const popup = { filter: () => popup, locator: () => rows, count: async () => state.popupCount };
-  const page = { locator: () => popup };
+  const page = { locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : popup };
   const composer = {
     filter: () => composer, first: () => composer, locator: () => composerForm,
     evaluate: async () => ({ text: state.draft.trim(), connectors: [...state.connectors] }),
@@ -2436,15 +2610,18 @@ function dialogPage(text: string, buttonText = "Got it", errorActionVisible = fa
   };
 }
 
-test("the known ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
-  const fixture = dialogPage("Too many requests. You're making requests too quickly.");
+test.each([
+  ["Too many requests. You're making requests too quickly.", "Got it"],
+  ["요청을 너무 빠르게 보내고 있습니다. 잠시 후 다시 시도해 주세요.", "알겠습니다"],
+])("rate-limit dialog stops automatic resubmission: %s", async (message, button) => {
+  const fixture = dialogPage(message, button);
 
   await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
     message: "ChatGPT rate limit: too many requests. Try again in a few minutes.",
   });
   expect(fixture.pressed).toEqual(["Enter"]);
@@ -2465,7 +2642,19 @@ test("submission acceptance reports a rate-limit dialog that appears after Enter
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
+  });
+  expect(fixture.pressed).toEqual(["Enter"]);
+});
+
+test("prompt attachment reports a rate-limit modal before editing the composer", async () => {
+  const fixture = dialogPage("Too many requests. You're making requests too quickly.");
+  const attach = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(page: Page, prompt: string, localTools: boolean): Promise<void>;
+  }).attachPrompt;
+  await expect(attach.call({ activeComposer: async () => { throw new Error("composer was touched"); } },
+    fixture.page, "next context part", false)).rejects.toMatchObject({
+    status: 429, code: "rate_limit_exceeded", retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2478,7 +2667,7 @@ test("the Traditional Chinese ChatGPT rate-limit dialog is acknowledged and retu
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2491,7 +2680,7 @@ test("the Simplified Chinese ChatGPT rate-limit dialog is acknowledged and retur
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2507,7 +2696,7 @@ test("the Japanese ChatGPT rate-limit dialog is acknowledged and returns a struc
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2532,6 +2721,66 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     retryable: true,
   });
   expect(fixture.pressed).toEqual([]);
+});
+
+test("only a size rejection of the current owned browser submission is non-retryable", async () => {
+  const frame = {};
+  const page = Object.assign(new EventEmitter(), { mainFrame: () => frame });
+  const observer = new ChatGptSubmissionRejectionObserver();
+  const makeRequest = (url = "https://chatgpt.com/backend-api/f/conversation", owner = frame) => ({
+    method: () => "POST", url: () => url, frame: () => owner,
+  });
+  let bodyReads = 0;
+  const respond = (request: ReturnType<typeof makeRequest>, code = "message_length_exceeds_limit", status = 413) => {
+    page.emit("response", {
+      request: () => request, status: () => status, headers: () => ({ "content-type": "application/json" }),
+      json: async () => { bodyReads += 1; return { detail: { code } }; },
+    });
+  };
+  const old = makeRequest();
+  page.emit("request", old);
+  observer.begin(page as unknown as Page);
+  respond(old);
+  for (const request of [makeRequest("https://other.example/backend-api/f/conversation"),
+    makeRequest("https://chatgpt.com/backend-api/sentinel"), makeRequest(undefined, {})]) {
+    page.emit("request", request); respond(request);
+  }
+  expect(bodyReads).toBe(0);
+  const successful = makeRequest(); page.emit("request", successful); respond(successful, "message_length_exceeds_limit", 200);
+  const unfamiliar = makeRequest(); page.emit("request", unfamiliar); respond(unfamiliar, "unknown_error");
+  expect(await observer.failure()).toBeUndefined();
+  const current = makeRequest(); page.emit("request", current); respond(current);
+  expect(await observer.failure()).toMatchObject({
+    status: 400, code: "context_length_exceeded", errorType: "invalid_request_error", retryable: false,
+  });
+  observer.begin(page as unknown as Page);
+  expect(await observer.failure()).toBeUndefined();
+  respond(current);
+  expect(await observer.failure()).toBeUndefined();
+  observer.dispose();
+  expect(page.listenerCount("request")).toBe(0);
+  expect(page.listenerCount("response")).toBe(0);
+});
+
+test("effort readback rejects a changed selection or surface before activating Send", async () => {
+  const selection = { url: "https://chatgpt.com/?temporary-chat=true", label: "Alto" };
+  const state = { url: selection.url, label: "Alto", expanded: "false", editable: true, count: 1 };
+  const control = { innerText: async () => state.label, getAttribute: async () => state.expanded };
+  const controls = { filter() { return this; }, count: async () => state.count, first: () => control };
+  const composer = { locator: () => ({ locator: () => controls }), isEditable: async () => state.editable };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { activeComposer: async () => composer }) as {
+    assertSelectedEffort(page: unknown, mode: unknown): Promise<void>;
+  };
+  const page = { url: () => state.url };
+  const mode = { selection };
+  await worker.assertSelectedEffort(page, mode);
+  for (const change of [{ label: "Medio" }, { url: "https://chatgpt.com/" }, { expanded: "true" },
+    { editable: false }, { count: 2 }]) {
+    Object.assign(state, { url: selection.url, label: "Alto", expanded: "false", editable: true, count: 1 }, change);
+    await expect(worker.assertSelectedEffort(page, mode)).rejects.toMatchObject({
+      code: "upstream_server_error", retryable: false,
+    });
+  }
 });
 
 test("the current response error action identifies short and localized failures without clicking Retry", async () => {
@@ -2617,7 +2866,7 @@ test("effort selection stops as soon as ChatGPT reports an expired session", asy
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
     ): Promise<unknown>;
   }).selectModelAndEffort;
 
@@ -2628,7 +2877,7 @@ test("effort selection stops as soon as ChatGPT reports an expired session", asy
   }, "gpt-5.6-sol", "high", {
     localToolsEnabled: true,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
   });
   const result = await Promise.race([
     selection.catch(error => error),
@@ -2683,7 +2932,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
     ): Promise<unknown>;
   }).selectModelAndEffort;
 
@@ -2700,7 +2949,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   }, "gpt-5.6-sol", "high", {
     localToolsEnabled: true,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
   });
   const result = await Promise.race([
     selection.catch(error => error),
@@ -2968,7 +3217,7 @@ test("browser preflight separates model context from one-message transport limit
     "gpt-5.6-sol",
     "medium",
     pro,
-    515_000,
+    500_000,
   )).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(
     111_193,
@@ -2976,7 +3225,7 @@ test("browser preflight separates model context from one-message transport limit
     "gpt-5.6-sol",
     "medium",
     pro,
-    515_001,
+    500_000,
   )).toThrow("103,000-token ChatGPT browser message boundary");
   expect(() => assertChatGptWebInputWithinLimits(
     112_192,
@@ -2994,10 +3243,19 @@ test("browser preflight separates model context from one-message transport limit
     pro,
     520_001,
   )).toThrow("104,000-token ChatGPT browser message boundary");
+  // Live reasoning-mode HTTP 413 failures occur even below the token budget.
+  for (const effort of ["medium", "high", "xhigh"] as const) {
+    expect(() => assertChatGptWebInputWithinLimits(
+      75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 500_000,
+    )).not.toThrow();
+    expect(() => assertChatGptWebInputWithinLimits(
+      75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 520_000,
+    )).toThrow("500,000-character ChatGPT composer boundary");
+  }
 });
 
 test("Bigger Context fits mixed-density whole records within both token and composer limits", () => {
-  const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: false, experimentalBiggerContext: true };
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false, experimentalBiggerContext: true };
   const dense = "a!b@c#d$e%f^g&h*".repeat(3_750);
   const sparse = "x".repeat(dense.length);
   const whitespace = " ".repeat(450_000);
@@ -3016,7 +3274,7 @@ test("Bigger Context fits mixed-density whole records within both token and comp
         systemPrompt: [],
         messages: contents.map((content, index) => ({ role: "user", content, timestamp: index + 1 })),
       },
-    }, capabilities, undefined, { experimentalMultipartParts: 3 });
+    }, capabilities, undefined, { experimentalMultipartParts: 6 });
     const multipart = compiled.multipart!;
     const records = multipart.parts.flatMap(part => JSON.parse(part).records);
     expect(records).toEqual(contents.map((content, message_index) => ({
@@ -3026,7 +3284,7 @@ test("Bigger Context fits mixed-density whole records within both token and comp
 
     const transaction = "ctx_0123456789abcdef0123456789abcdef";
     const stages = multipart.parts.slice(0, -1).map((payload, index) => (
-      formatChatGptWebMultipartStage(payload, transaction, index + 1, 3).text
+      formatChatGptWebMultipartStage(payload, transaction, index + 1, 6).text
     ));
     const final = formatChatGptWebMultipartCommit(multipart, transaction);
     const maxStageMessageTokens = Math.max(...stages.map(text => estimateTokens(text)));
@@ -3039,7 +3297,7 @@ test("Bigger Context fits mixed-density whole records within both token and comp
       estimateCompiledChatGptWebInputTokens(compiled, CHATGPT_WEB_MODEL_ID),
       Math.max(maxStageMessageTokens, finalMessageTokens),
       CHATGPT_WEB_MODEL_ID, "high", capabilities,
-      Math.max(maxStageChars, final.length), 3,
+      Math.max(maxStageChars, final.length), 6,
       { stagingEffort: stagingMode.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens, finalMessageChars: final.length },
       true,
     )).not.toThrow();
@@ -3091,13 +3349,13 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
   const plus = {
     localToolsEnabled: false,
     solAvailable: true,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
     experimentalBiggerContext: true,
   };
   const pro = {
     localToolsEnabled: false,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
     experimentalBiggerContext: true,
   };
   expect(() => assertChatGptWebMultipartInputWithinLimits(
@@ -3128,7 +3386,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "gpt-5.6-sol",
     "high",
     pro,
-    900_000,
+    500_000,
     2,
     undefined,
     true,
@@ -3139,7 +3397,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "gpt-5.6-sol",
     "high",
     pro,
-    900_000,
+    500_000,
     2,
     undefined,
     true,
@@ -3204,7 +3462,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     10_000,
     "gpt-5.6-luna",
     "low",
-    { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+    { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     40_000,
     2,
   )).toThrow("unavailable for Luna");
@@ -3235,7 +3493,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
     );
     const stage = () => resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, tokens, 300_000);
     const final = () => assertChatGptWebMultipartInputWithinLimits(
-      tokens + 10_000, tokens, "gpt-5.6-sol", "high", plus, 300_000, 3,
+      tokens + 10_000, tokens, "gpt-5.6-sol", "high", plus, 300_000, 6,
       { stagingEffort: "medium", maxStageMessageTokens: 500, maxStageChars: 2_000, finalMessageTokens: tokens, finalMessageChars: 300_000 },
       true,
     );
@@ -3251,11 +3509,11 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
     300_000,
   )).toThrow("No ChatGPT effort");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 500_000).effort).toBe("low");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000).effort).toBe("max");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 104_000, 1_200_000).effort).toBe("max");
   expect(() => resolveChatGptWebMultipartStagingMode(
     "gpt-5.6-luna",
-    { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+    { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     10_000,
     20_000,
   )).toThrow("Luna-only");
@@ -3266,7 +3524,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
     "low",
     plus,
     300_000,
-    3,
+    6,
     {
       stagingEffort: "medium",
       maxStageMessageTokens: 30_000,
@@ -3429,6 +3687,50 @@ test("Stopped thinking is an explicit upstream error, not a user cancellation or
   expect(error.message).not.toContain("5 seconds");
 });
 
+test("stopped-thinking detection recognizes localized UI without matching response content", () => {
+  const { createWindow } = require("@mixmark-io/domino") as {
+    createWindow(html: string): { document: Document; NodeFilter: typeof NodeFilter };
+  };
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const source = worker.split("const stoppedThinkingVisible = (() => {")[1]?.split("})();")[0];
+  if (!source) throw new Error("Stopped-thinking predicate is missing");
+  const javascript = new Bun.Transpiler({ loader: "ts" }).transformSync(
+    `function detect(root, options, document, NodeFilter, renderedInDom, overlapsRenderedAnswer, overlapsCommentary) { ${source} }`,
+  );
+  const detect = new Function(`${javascript}; return detect;`)();
+  const stopped = (html: string): boolean => {
+    const window = createWindow(`<article id="old"><button>已停止思考</button></article><article id="current">${html}</article>`);
+    const root = window.document.getElementById("current")!;
+    const overlaps = (selector: string) => (candidate: HTMLElement) => Array.from(root.querySelectorAll(selector))
+      .some(content => content.contains(candidate) || candidate.contains(content));
+    return detect(root, { stoppedThinkingLabels: CHATGPT_STOPPED_THINKING_LABELS }, window.document,
+      window.NodeFilter, (element: HTMLElement) => element.style.display !== "none"
+        && element.style.visibility !== "hidden" && element.style.opacity !== "0",
+      overlaps(".answer"), overlaps(".commentary"));
+  };
+  // Independent observed labels include distinct Simplified/Traditional Chinese and Japanese.
+  for (const label of ["已停止思考", "已中斷思考", "思考を停止しました", "Stopped thinking",
+    "Рассуждение остановлено", "توقّف التفكير", "Réflexion interrompue", "생각 중지됨"]) {
+    expect(stopped(`<div data-streaming-response-status><button>${label}</button></div>`)).toBeTrue();
+    expect(stopped(`<button aria-label="  ${label}  ">Status</button>`)).toBeTrue();
+    for (const html of [
+      `<div class="answer"><p>${label}</p></div>`,
+      `<div class="commentary"><p>${label}</p></div>`,
+      `<pre><code>${label}</code></pre>`,
+      `<blockquote>${label}</blockquote>`,
+      `<div class="answer"><button aria-label="${label}">quoted</button></div>`,
+      `<div style="display:none"><button aria-label="${label}">${label}</button></div>`,
+      `<button style="visibility:hidden">${label}</button>`,
+      `<div style="opacity:0"><button>${label}</button></div>`,
+      `<button>"${label}"</button>`,
+    ]) expect(stopped(html)).toBeFalse();
+  }
+  expect(stopped('<button>Stopped\n  thinking</button>')).toBeTrue();
+  expect(stopped('<div class="answer">Current answer</div>')).toBeFalse();
+  expect(stopped('<button>Thinking</button>')).toBeFalse();
+  expect(stopped('<button>Stop thinking</button>')).toBeFalse();
+});
+
 test("visible DOM trace keeps a complete action phrase instead of a nested count", () => {
   expect(new ChatGptVisibleTraceTracker(0).observe([
     { kind: "status", text: "Searched\n5\nsites" },
@@ -3541,14 +3843,6 @@ test("stalled-turn diagnostics record DOM metrics without response or overlay co
   expect(diagnosticSource).toContain('innerText ?? candidate.textContent ?? ""');
   expect(diagnosticSource).not.toMatch(/\btext:\s*(?:root|candidate)\.innerText/);
   expect(diagnosticSource).not.toMatch(/\bariaLabel:\s*candidate\.getAttribute/);
-});
-
-test("browser completion requires ChatGPT's response-scoped copy action", () => {
-  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  const sessionSource = readFileSync(new URL("../src/chatgpt-session.ts", import.meta.url), "utf8");
-  expect(sessionSource).toContain('button[data-testid="copy-turn-action-button"]');
-  expect(workerSource).toContain("CHATGPT_COMPLETION_ACTION_SELECTOR");
-  expect(workerSource).not.toContain('root.querySelectorAll<HTMLElement>("button")');
 });
 
 test("browser send accepts only new logical turns or generation, not remounted history", () => {
@@ -3959,6 +4253,20 @@ test("embedded chart hydration cannot replace Markdown answer content with rende
     .not.toBe(text("<pre><code>one\ntwo</code></pre>"));
   expect(text("<div>A</div><div>B</div>"))
     .toBe(text("<section><div>A</div><div>B</div></section>"));
+
+  const files = createDocument('<p>Report: <span data-state="closed">'
+    + '<button class="behavior-btn entity-underline" href="https://wrong.example/download" aria-label="Download">'
+    + '<svg><text>File icon</text></svg>report.pdf<span hidden>Hidden</span></button></span> '
+    + '<button class="entity-underline behavior-btn">report.pdf</button>'
+    + '<button>Copy</button><button class="entity-underline">Retry</button>'
+    + '<button class="behavior-btn entity-underline" hidden>hidden.pdf</button>'
+    + '<span aria-hidden="true"><button class="behavior-btn entity-underline">also-hidden.pdf</button></span></p>').body;
+  const originalFiles = files.innerHTML;
+  const projectedFiles = contentFor(files);
+  expect(chatGptHtmlToMarkdown(projectedFiles.innerHTML)).toBe("Report: report.pdf report.pdf");
+  expect(textFor(projectedFiles)).toBe("Report: report.pdf report.pdf");
+  expect(projectedFiles.querySelectorAll("button, a, svg").length).toBe(0);
+  expect(files.innerHTML).toBe(originalFiles);
 });
 
 test("proven MCP progress vetoes completion, not only the health verdicts", () => {
@@ -4148,7 +4456,7 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://suspension-stage-${Date.now()}`,
-    chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   const worker = ChatGptBrowserWorker.forProvider(provider) as unknown as {
     runStage<T>(

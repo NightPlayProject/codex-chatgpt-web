@@ -1,3 +1,4 @@
+const languages = require("./languages.json");
 const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
@@ -64,6 +65,10 @@ const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNEL
 const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
 const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
 
+const launchEnvironment = {
+  CODEX_CHATGPT_WEB_HOME: process.env.CODEX_CHATGPT_WEB_HOME,
+  CODEX_HOME: process.env.CODEX_HOME,
+};
 process.env.CODEX_CHATGPT_WEB_HOME = CORE_HOME;
 process.env.CODEX_HOME = LAUNCHER_PROFILE.codexHome;
 app.setName(LAUNCHER_PROFILE.displayName);
@@ -82,6 +87,7 @@ installProcessDiagnosticGuards({
 let mainWindow = null;
 let mainWindowReadyToShow = false;
 let mainWindowShowRequested = false;
+let startupFailed = false;
 let browserHost = null;
 let runtimeHost = null;
 let browserControl = null;
@@ -98,6 +104,7 @@ let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
 let updateController = null;
+let limitsController = null;
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -234,7 +241,7 @@ function trayImage() {
 }
 
 const NATIVE_COPY = Object.freeze({
-  en: Object.freeze({
+  "en": Object.freeze({
     openLauncher: "Open Codex Web GPT",
     quit: "Quit",
     exportDiagnostics: "Export privacy-safe diagnostics",
@@ -256,7 +263,22 @@ const NATIVE_COPY = Object.freeze({
     removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
     catalogFailure: "Codex 已连接到启动器，但模型列表加载失败（HTTP {status}；{reason}）。请查看“活动”了解详情；若问题持续，请导出安全日志。",
   }),
-  ja: Object.freeze({
+  "zh-TW": Object.freeze({
+    openLauncher: "開啟 Codex Web GPT",
+    quit: "結束",
+    exportDiagnostics: "匯出隱私安全診斷",
+    cancel: "取消",
+    remove: "移除",
+    removeTitle: "移除 Codex Web GPT",
+    removeMessage: "從 Codex 中移除 ChatGPT Web 模型並還原先前的模型路由？",
+    removeDetail: "啟動器中的 ChatGPT 登入設定檔會保留。Codex 需要重新啟動一次。",
+    retry: "重試",
+    startupTitle: "Codex Web GPT 無法啟動",
+    startupDetail: "重試會重新啟動應用程式，不會變更已儲存的設定或 ChatGPT 登入設定檔。",
+    startupCleanupFailed: "啟動清理失敗",
+    catalogFailure: "Codex 已連線到啟動器，但模型清單載入失敗（HTTP {status}；{reason}）。請查看「活動」了解詳情；若問題持續，請匯出安全日誌。",
+  }),
+  "ja": Object.freeze({
     openLauncher: "Codex Web GPT を開く",
     quit: "終了",
     exportDiagnostics: "プライバシー保護済みの診断情報をエクスポート",
@@ -303,7 +325,7 @@ function showMainWindow() {
   // has produced anything to show. Preserve that foreground request until the real window reaches
   // `ready-to-show`; otherwise the already-running `--hidden` instance silently consumes it.
   mainWindowShowRequested = true;
-  if (!mainWindowReadyToShow || !mainWindow || mainWindow.isDestroyed()) return;
+  if ((!mainWindowReadyToShow && !startupFailed) || !mainWindow || mainWindow.isDestroyed()) return;
   mainWindowShowRequested = false;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
@@ -441,8 +463,8 @@ async function loadRenderer(window) {
 }
 
 function validateLanguage(value) {
-  if (value !== "en" && value !== "zh-CN" && value !== "ja") {
-    throw new Error("Language must be en, zh-CN, or ja");
+  if (typeof value !== "string" || !Object.hasOwn(languages, value)) {
+    throw new Error(`Language must be one of: ${Object.keys(languages).join(", ")}`);
   }
   return value;
 }
@@ -466,6 +488,24 @@ function smokePassedForCurrentVersion(state) {
   return state.browserSmokePassed === true && state.browserSmokeVersion === app.getVersion();
 }
 
+function syncFreshConversationPreference(stateStore, config) {
+  const useSavedChats = config?.useSavedChats === true;
+  const enabled = config?.experimentalFreshConversationPerTurn === true;
+  const current = stateStore.read();
+  if (runtimeHost?.currentOperation()) return current;
+  if (current.experimentalFreshConversationPerTurn === enabled && current.useSavedChats === useSavedChats) return current;
+  // Runtime restarts leave browser views alive. Retire completed chats when their
+  // persistence policy changes, including changes made by the CLI.
+  const retainedKeys = new Set([...browserHost.turnTabs.values()]
+    .filter(tab => tab.status === "ready" && tab.conversationKey
+      && (current.useSavedChats !== useSavedChats || tab.interactionMode === "automatic"))
+    .map(tab => tab.conversationKey));
+  for (const key of retainedKeys) releaseRetainedConversation(browserHost, key);
+  const state = stateStore.update({ experimentalFreshConversationPerTurn: enabled, useSavedChats });
+  send("launcher:state-changed", state);
+  return state;
+}
+
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
   const refreshAccountsInBackground = () => {
@@ -483,7 +523,7 @@ function registerIpc({ logger, stateStore }) {
       codexHome: LAUNCHER_PROFILE.codexHome,
       userData: launcherUserData,
     },
-    state: stateStore.read(),
+    state: syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config),
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
     connectorNames: {
@@ -752,6 +792,8 @@ function registerIpc({ logger, stateStore }) {
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
+      useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
       ...(result.mode === "full" ? {
         mcpRuntimeInstalled: true,
         mcpSetupComplete: false,
@@ -793,6 +835,8 @@ function registerIpc({ logger, stateStore }) {
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
+      useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE,
       mcpRuntimeInstalled: true,
@@ -1090,6 +1134,7 @@ async function start() {
     return;
   }
   app.on("second-instance", () => showMainWindow());
+  app.on("activate", () => showMainWindow());
 
   await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });
   let installedRuntimeRoot = null;
@@ -1119,6 +1164,9 @@ async function start() {
   await app.whenReady();
 
   const stateStore = createStateStore(path.join(app.getPath("userData"), "launcher-state.json"));
+  limitsController = new LimitsController(path.join(app.getPath("userData"), "limits.json"), {
+    getInteractionMode: () => stateStore.read().browserInteractionMode,
+  });
   if (IS_DEV_PROFILE && !stateStore.read().onboardingComplete) {
     stateStore.update({
       language: stateStore.read().language || "en",
@@ -1203,6 +1251,11 @@ async function start() {
     browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
     launcherProfile: LAUNCHER_PROFILE.kind,
     publishOperation,
+    onConfigRead: config => {
+      // Setup may read an intermediate config before rollback. The setting IPC commits
+      // its change only after the existing setup transaction has succeeded.
+      if (browserHost && !runtimeHost?.currentOperation()) syncFreshConversationPreference(stateStore, config);
+    },
   });
   runtimeHost = new RuntimeHost({
     app,
@@ -1232,6 +1285,7 @@ async function start() {
     control: browserControl.descriptor(),
     cancelTurn: IS_DEV_PROFILE ? undefined : (traceId, reason) => runtimeSupervisor.cancelBrowserTurn(traceId, reason),
     getConnectorName: () => runtimeHost.browserConnectorName(),
+    getUseSavedChats: () => runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
     logger,
     loginWithPasskey: () => runtimeHost.capturePasskeyLogin(),
@@ -1487,7 +1541,6 @@ async function start() {
     publishOperation({ name: "runtime-start", status: "failed", message });
   });
 
-  app.on("activate", () => showMainWindow());
   app.on("before-quit", (event) => {
     if (exitCommitted) return;
     event.preventDefault();
@@ -1497,13 +1550,48 @@ async function start() {
   process.once("SIGTERM", () => { void requestQuit(); });
 }
 
-void start().catch((error) => {
+void start().catch(async (error) => {
+  startupFailed = true;
   const message = error instanceof Error ? error.message : String(error);
   try {
     fs.appendFileSync(path.join(app.getPath("logs"), "launcher-fatal.log"), `${new Date().toISOString()} ${error?.stack || error}\n`);
   } catch {}
   try {
-    dialog.showErrorBox("Codex Web GPT could not start", message);
-  } catch {}
-  app.exit(1);
+    // Browser bootstrap can fail before the renderer is loaded. Keep the error reachable
+    // through the existing instance, and release browser resources before a user retry.
+    const cleanupErrors = [];
+    try { browserHost?.destroy(); } catch (caught) { cleanupErrors.push(String(caught)); }
+    try { await browserControl?.close(); } catch (caught) { cleanupErrors.push(String(caught)); }
+    if (process.argv.includes("--launcher-smoke-test")) return;
+    await app.whenReady();
+    quitting = true;
+    showMainWindow();
+    const copy = nativeCopyFor(createStateStore(path.join(app.getPath("userData"), "launcher-state.json")).read().language);
+    const options = {
+      type: "error",
+      title: copy.startupTitle,
+      message,
+      detail: [copy.startupDetail,
+        ...cleanupErrors.map(detail => `${copy.startupCleanupFailed}: ${detail}`)].join("\n"),
+      buttons: [copy.retry, copy.quit],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    };
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options);
+    if (result.response === 0) {
+      // Internal child commands use the resolved profile. A fresh launcher must instead
+      // resolve the original launch environment, especially for the isolated DEV profile.
+      for (const [key, value] of Object.entries(launchEnvironment)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--hidden") });
+    }
+  } finally {
+    // A failed dialog or relaunch must not leave a headless single-instance owner behind.
+    app.exit(1);
+  }
 });

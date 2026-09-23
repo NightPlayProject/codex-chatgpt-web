@@ -286,11 +286,17 @@ function baseConfig(
     config.zeroRiskProEnabled = options.zeroRiskProEnabled;
   }
   if (config.browserInteractionMode === "manual") {
+    if (options.experimentalFreshConversationPerTurn === true) {
+      throw new Error("Fresh browser conversations per turn is available only in automatic mode");
+    }
     if (options.refreshAccountCapabilities) {
       throw new Error("Zero Risk cannot refresh account capabilities");
     }
     if (options.forceLogin) {
       throw new Error("Zero Risk uses the launcher's existing ChatGPT session; --login is unavailable");
+    }
+    if (options.experimentalSkillAttachments === true) {
+      throw new Error("Zero Risk does not support Skills as files");
     }
     if (options.experimentalBiggerContext === true) {
       throw new Error("Zero Risk does not support Bigger Context");
@@ -402,7 +408,7 @@ async function bootstrapTunnelProfile(config: AppConfig): Promise<void> {
   try {
     // `runtimes connect` writes the native profile and returns once its managed runtime is healthy.
     // Readiness follows after a successful control-plane poll, so setup proves it separately before
-    // stopping the validation runtime. The launcher supervisor reconnects the committed profile.
+    // stopping the validation runtime and handing the profile to the external service.
     connectTunnel(config);
     const status = await waitForTunnelReady(config);
     if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
@@ -597,9 +603,8 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     const needsProfile = !existsSync(profilePath);
     if (launcherOwned) {
       if (tunnelService.installed || tunnelService.loaded) await uninstallTunnelService();
-      if (needsProfile || refreshTunnelWorker || explicitTunnelChange) {
-        await bootstrapTunnelProfile(config);
-      }
+      // Commit the inputs before acquiring a runtime. The launcher supervisor creates the
+      // profile, proves readiness/MCP health, and cleans up failed startup under one owner.
     } else {
       const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
       if (needsOwnershipMigration || needsProfile) {
@@ -671,17 +676,9 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     config.proAvailable = capabilities.solAvailable && capabilities.proAvailable;
   }
 
-  const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
   await configureTunnel(config, existing, options);
-  let tunnelReady: boolean | null = null;
-  if (config.mode === "full") {
-    const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
-    const needsProfile = !existsSync(profilePath);
-    if (needsProfile || tunnelWorkerRuntimeChanged(existing, config) || explicitTunnelChange) {
-      await bootstrapTunnelProfile(config);
-    }
-    tunnelReady = false;
-  }
+  // DEV uses the same supervisor-owned startup after this configuration is committed.
+  const tunnelReady = config.mode === "full" ? false : null;
   saveConfig(config);
   return {
     mode: config.mode,

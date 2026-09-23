@@ -40,7 +40,7 @@ const PRIMARY_VIEW_BOOTSTRAP_TIMEOUT_MS = 10_000;
 const MAX_BROWSER_VIEW_DIMENSION = 16_384;
 const MAX_BROWSER_TABS = 5;
 const MAX_CANCELLED_TURN_TRACES = 256;
-const MANUAL_SUBMIT_TIMEOUT_MS = 30_000;
+const MANUAL_SUBMIT_TIMEOUT_MS = 60_000;
 const MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS = 120_000;
 const MAX_MANUAL_TERMINAL_SIGNALS = 256;
 const MAX_MANUAL_PROMPT_CHARS = 1_000_000;
@@ -361,6 +361,7 @@ class BrowserHost {
     this.showWindow = showWindow;
     this.clipboard = clipboardApi;
     this.getBrowserInteractionMode = getBrowserInteractionMode;
+    this.getUseSavedChats = getUseSavedChats;
     this.runBrowserHelperOperation = runBrowserHelperOperation;
     this.verifyConnectorWithBrowserHelper = verifyConnectorWithBrowserHelper;
     this.surfaceId = randomBytes(24).toString("base64url");
@@ -542,7 +543,8 @@ class BrowserHost {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity) {
+  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal) {
+    signal?.throwIfAborted();
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
       throw new Error(
@@ -597,9 +599,24 @@ class BrowserHost {
     view.webContents.setZoomFactor(this.state.zoomFactor);
     this.bindShellZoomShortcuts(view.webContents);
     this.bindTurnContents(tab);
+    await this.initializeTurnTab(tab, signal);
+    return tab;
+  }
+
+  async initializeTurnTab(tab, signal) {
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
     try {
-      await loadCommittedBrowserSurface(view.webContents, IDLE_BROWSER_URL);
-      await this.markTurnTabSurface(tab);
+      signal?.throwIfAborted();
+      await Promise.race([(async () => {
+        await loadCommittedBrowserSurface(tab.view.webContents, IDLE_BROWSER_URL);
+        signal?.throwIfAborted();
+        await this.markTurnTabSurface(tab);
+      })(), aborted]);
+      signal?.throwIfAborted();
       tab.initializingSurface = false;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -608,10 +625,13 @@ class BrowserHost {
         traceId: tab.traceId,
         message,
       });
-      this.removeTurnTab(tab, true);
+      // Destroy the exact pending document too: abandoning its promise alone leaves renderer
+      // work running and lets a late ownership mark race a future browser turn.
+      if (this.turnTabs.get(tab.id) === tab) this.removeTurnTab(tab, true);
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
-    return tab;
   }
 
   createManualTurnTab(traceId, helperPid, conversationKey, prompt, manualSubmitTimeoutMs) {
@@ -680,6 +700,7 @@ class BrowserHost {
 
   async initializeManualTurnTab(tab) {
     const contents = tab.view.webContents;
+    const chatUrl = tab.url;
     try {
       await loadCommittedBrowserSurface(contents, IDLE_BROWSER_URL);
     } catch (error) {
@@ -2229,6 +2250,7 @@ class BrowserHost {
       tab.loading = false;
       tab.lastHeartbeatAt = Date.now();
       this.rememberManualCompletion(traceId, helperPid);
+      this.logger.info("browser.manual_turn_completed", { tabId: tab.id, traceId, status: "completed", retained: true });
       this.publishState?.(this.snapshot());
       return { cancelledByUser: false };
     }
@@ -2246,6 +2268,9 @@ class BrowserHost {
       this.signalManualTerminal(tab, status === "aborted" ? "cancelled" : status);
     }
     this.removeTurnTab(tab, false);
+    if (status === "completed") {
+      this.logger.info("browser.manual_turn_completed", { tabId: tab.id, traceId, status: "completed", retained: false });
+    }
     return { cancelledByUser };
   }
 
@@ -2268,6 +2293,7 @@ class BrowserHost {
     requireRetainedConversation = false,
     resumeAnswerDigest,
   ) {
+    signal?.throwIfAborted();
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
@@ -2383,7 +2409,7 @@ class BrowserHost {
       error.code = "retained_conversation_unavailable";
       throw error;
     }
-    const tab = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
+    const tab = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal);
     this.selectedTabId = tab.id;
     if (reveal) this.show();
     else this.syncViewVisibility();
@@ -2796,18 +2822,28 @@ class BrowserHost {
         url = this.view.webContents.getURL();
         result = await probe(this.view.webContents);
       }
-    }
-    if (this.manualOperation === "ChatGPT login"
-      && result.sessionAuthenticated
-      && !result.temporary
-      && !this.view.webContents.isDestroyed()) {
-      await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
-      url = this.view.webContents.getURL();
-      result = await probe(this.view.webContents);
-    }
-    if (result.composer && result.temporary && result.sessionAuthenticated) {
-      if (this.authView && !this.authView.webContents.isDestroyed()) {
-        this.closeAuthView(this.authView, true, false);
+      if (result.composer && result.temporary && result.sessionAuthenticated) {
+        if (this.authView && !this.authView.webContents.isDestroyed()) {
+          this.closeAuthView(this.authView, true, false);
+        }
+        const wasAuthenticated = this.state.authenticated;
+        const availability = this.activeTraceId
+          ? { status: "running", message: "ChatGPT is working" }
+          : this.manualOperation
+            ? {}
+            : { status: "ready", message: "ChatGPT is ready" };
+        this.setState({ ...availability, authenticated: true, url: result.url });
+        if (!wasAuthenticated) this.logger.info("browser.authenticated", { url: result.url });
+      } else if (result.sessionCheckError) {
+        this.setState({ status: "error", message: result.sessionCheckError, authenticated: false, url: result.url || url });
+      } else {
+        const loaded = result.readyState === "complete";
+        this.setState({
+          status: loaded ? "signed-out" : "loading",
+          message: loaded ? "Sign in to ChatGPT" : "Waiting for ChatGPT",
+          authenticated: false,
+          url: result.url || url,
+        });
       }
       const wasAuthenticated = this.state.authenticated;
       const availability = this.activeTraceId
@@ -2952,6 +2988,25 @@ class BrowserHost {
     }
     if (startedIdle) await this.returnToIdle();
     return inspected;
+  }
+
+  async inspectLimitsPlan() {
+    requireAutomaticBrowserInspection(this, "Limits plan detection");
+    return this.withManualOperation("Limits plan detection", async () => {
+      const result = await this.runBrowserHelperOperation({
+        helper: this.helper,
+        descriptorPath: this.descriptorPath,
+        appName: this.connectorName(),
+        operation: "limits",
+        logger: this.logger,
+      });
+      const plan = result?.value;
+      if (!plan || !/^[a-f0-9]{64}$/.test(plan.accountKey)
+        || !["pro_100", "pro_200", "unsupported"].includes(plan.plan)) {
+        throw new Error("Browser helper returned invalid Limits plan evidence");
+      }
+      return plan;
+    });
   }
 
   async withManualOperation(name, action) {

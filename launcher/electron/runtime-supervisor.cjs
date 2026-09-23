@@ -348,6 +348,7 @@ class RuntimeSupervisor {
     launcherProfile = "production",
     publishOperation,
     runtimeInvocationFactory = runtimeInvocation,
+    onConfigRead,
   }) {
     this.app = app;
     this.logger = logger;
@@ -362,6 +363,7 @@ class RuntimeSupervisor {
     this.launcherProfile = launcherProfile;
     this.publishOperation = publishOperation;
     this.runtimeInvocationFactory = runtimeInvocationFactory;
+    this.onConfigRead = onConfigRead;
     this.configPath = path.join(coreHome, "config.json");
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
     this.daemon = null;
@@ -386,12 +388,14 @@ class RuntimeSupervisor {
 
   readConfig() {
     if (!fs.existsSync(this.configPath)) return null;
-    return validateConfig(
+    const config = validateConfig(
       readJson(this.configPath),
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
     );
+    this.onConfigRead?.(config);
+    return config;
   }
 
   readSetupConfig() {
@@ -580,6 +584,8 @@ class RuntimeSupervisor {
     if (!fs.existsSync(tunnel.runtimeKeyFile)) {
       throw new Error(`Tunnel runtime key is missing: ${tunnel.runtimeKeyFile}`);
     }
+    // First-time setup commits only configuration; all native manager commands run here.
+    fs.mkdirSync(tunnel.profileDir, { recursive: true, mode: 0o700 });
   }
 
   async proxyHealthPayload(config, timeoutMs = 2_000) {

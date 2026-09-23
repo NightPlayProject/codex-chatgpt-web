@@ -96,6 +96,7 @@ class BrowserControlServer {
     }
     const isTurn = request.url === "/v1/turn/start"
       || request.url === "/v1/turn/heartbeat"
+      || request.url === "/v1/turn/usage"
       || request.url === "/v1/turn/end";
     const isTurnRelease = request.url === "/v1/turn/release";
     const isSessionInspect = request.url === "/v1/session/inspect";
@@ -291,6 +292,15 @@ class BrowserControlServer {
         writeJson(response, 200, { ok: true, ...release });
         return;
       }
+      if (request.url === "/v1/turn/usage") {
+        if (host.browserInteractionMode() === "manual") throw new Error("Limits tracking is disabled in Zero Risk mode");
+        // The same owner check as a heartbeat prevents another helper from charging this tab.
+        host.heartbeatTurn(body.traceId, body.helperPid);
+        if (!this.limits) throw new Error("Limits tracking is unavailable");
+        const recorded = this.limits.record(body);
+        writeJson(response, 200, { ok: true, recorded });
+        return;
+      }
       if (request.url === "/v1/turn/start") {
         if (host.browserInteractionMode() === "manual") {
           throw new Error("Automatic browser interaction is disabled");
@@ -305,7 +315,7 @@ class BrowserControlServer {
           body.resumeAnswerDigest,
         );
         this.logger.info("browser.turn_started", { traceId: body.traceId });
-        writeJson(response, 200, { ok: true, ...lease });
+        writeJson(response, 200, { ok: true, ...lease, trackUsage: this.limits?.enabled() === true });
         return;
       } else if (request.url === "/v1/turn/heartbeat") {
         host.heartbeatTurn(body.traceId, body.helperPid, body.refreshViewport === true);

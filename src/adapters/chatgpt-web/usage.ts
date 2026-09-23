@@ -1,7 +1,9 @@
+import { skillFileTokens } from "./skill-attachments";
 import { estimateTokens } from "../../lib/token-estimate";
 import { skillFileTokens } from "./skill-attachments";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
+  CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebBrowserStagingTokenLimit,
   resolveChatGptWebContextLimits,
@@ -308,7 +310,8 @@ export function resolveBiggerContextMultipartParts(
       );
       if (estimateTokens(text, parsed.modelId) > budget) return false;
     }
-    return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId) < contextWindow * messages.length;
+    return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId)
+      < contextWindow * Math.min(messages.length, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER);
   };
   const firstFittingMultipart = (minimumParts: ChatGptWebMultipartPartCount): ChatGptWebMultipartPartCount => {
     for (let candidate = minimumParts; candidate <= CHATGPT_MAX_MULTIPART_PARTS; candidate += 1) {

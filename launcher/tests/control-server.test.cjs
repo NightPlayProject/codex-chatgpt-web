@@ -134,6 +134,9 @@ test("browser control server authenticates and owns turn visibility", async () =
       }),
     });
     assert.equal(end.status, 200);
+    const acquisitionSignal = calls[0].pop();
+    assert.ok(acquisitionSignal instanceof AbortSignal);
+    assert.equal(acquisitionSignal.aborted, false);
     assert.deepEqual(calls, [
       [
         "start",
@@ -366,6 +369,7 @@ test("manual-to-automatic transaction exposes capability inspection and preserve
       this.turnTabs.delete(tab.id);
     },
     markOwnedSurface: async () => { ownershipMarks += 1; },
+    writeDescriptor: () => {},
     snapshot: () => ({ activeTabId: "home" }),
   });
   const server = await new BrowserControlServer({

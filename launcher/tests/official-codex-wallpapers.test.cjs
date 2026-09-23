@@ -79,6 +79,7 @@ function makeProviderGateVmContext({
   ariaDisabled = "true",
   providerInsideRoot = true,
   providerIsSelectedControl = !providerInsideRoot,
+  modelText = "ChatGPT Web — GPT-5.6 Sol",
 } = {}) {
   class FakeElement {
     constructor({ text = "" } = {}) {
@@ -114,7 +115,7 @@ function makeProviderGateVmContext({
   const submit = new FakeButton({ disabled });
   submit.setAttribute("type", "submit");
   if (ariaDisabled != null) submit.setAttribute("aria-disabled", ariaDisabled);
-  const model = new FakeButton({ text: "ChatGPT Web — GPT-5.6 Sol" });
+  const model = new FakeButton({ text: modelText });
   if (providerIsSelectedControl) model.setAttribute("aria-haspopup", "menu");
   const editor = new FakeElement({ text: "hello" });
   const root = new FakeElement();
@@ -249,6 +250,7 @@ test("ChatGPT Web provider gate detects the v6 provider control outside the comp
     disabled: true,
     ariaDisabled: null,
     providerInsideRoot: false,
+    modelText: "GPT-5.6 Sol (Web)",
   });
 
   const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
@@ -262,6 +264,25 @@ test("ChatGPT Web provider gate detects the v6 provider control outside the comp
   assert.equal(unlocked.selected, true);
   assert.equal(submit.disabled, false);
   assert.equal(submit.getAttribute("aria-disabled"), "false");
+});
+
+test("native model labels without the Web suffix do not receive the quota override", () => {
+  const { context, submit } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: "true",
+    providerInsideRoot: false,
+    modelText: "GPT-5.6 Sol",
+  });
+
+  const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
+  assert.equal(probe.chatGptWebSelected, false);
+
+  const gate = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
+  assert.equal(gate.managed, false);
+  assert.equal(gate.unlocked, false);
+  assert.equal(gate.selected, false);
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.getAttribute("aria-disabled"), "true");
 });
 
 test("ChatGPT Web menu options outside the composer do not impersonate the selected provider", () => {

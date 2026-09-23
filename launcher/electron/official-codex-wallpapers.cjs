@@ -31,9 +31,13 @@ const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
     ...document.querySelectorAll('button[aria-haspopup="menu"]'),
     ...(root instanceof Element ? root.querySelectorAll('button') : []),
   ];
+  const isChatGptWebModelControl = candidate => {
+    const label = (candidate?.innerText || candidate?.textContent || '').replace(/\s+/g, ' ').trim();
+    return /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test(label) || /\(Web\)\s*$/i.test(label);
+  };
   const chatGptWebSelected = [...new Set(selectedModelButtons)]
     .filter(candidate => candidate !== button && visible(candidate))
-    .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
+    .some(isChatGptWebModelControl);
   const editor = root?.querySelector('#prompt-textarea, [contenteditable="true"]') || null;
   const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
   const hasAttachments = root instanceof Element && root.querySelector('.composer-attachment-surface') != null;
@@ -96,9 +100,13 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
           ...document.querySelectorAll('button[aria-haspopup="menu"]'),
           ...root.querySelectorAll('button'),
         ];
+        const isChatGptWebModelControl = candidate => {
+          const label = (candidate?.innerText || candidate?.textContent || '').replace(/\s+/g, ' ').trim();
+          return /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test(label) || /\(Web\)\s*$/i.test(label);
+        };
         const selected = [...new Set(selectedModelButtons)]
           .filter(candidate => candidate !== button && visible(candidate))
-          .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
+          .some(isChatGptWebModelControl);
         const editor = root.querySelector('#prompt-textarea, [contenteditable="true"]');
         const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
         const hasAttachments = root.querySelector('.composer-attachment-surface') != null;

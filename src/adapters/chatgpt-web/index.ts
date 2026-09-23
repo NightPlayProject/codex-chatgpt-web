@@ -1252,7 +1252,7 @@ export function createChatGptWebAdapter(
                       );
                     }
                     if (sourceUnavailable && handoffError === error) {
-                      return await runFreshCompactionFallback("source_disappeared_before_handoff");
+                      return await runFreshCompaction("source_disappeared_before_handoff");
                     }
                     throw handoffError;
                   } finally {

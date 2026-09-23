@@ -1575,10 +1575,10 @@ describe("ChatGPT outer-native harness v4", () => {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
       turn.onSendActivated?.();
-      throw new ChatGptWebAdapterError("ChatGPT is temporarily unavailable. Try again in a few minutes.", {
-        status: 502,
-        errorType: "server_error",
-        code: "upstream_server_error",
+      throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests. Try again in a few minutes.", {
+        status: 429,
+        errorType: "rate_limit_error",
+        code: "rate_limit_exceeded",
         retryable: true,
       });
     };
@@ -3612,7 +3612,7 @@ describe("ChatGPT outer-native harness v4", () => {
           wire_name: "tool_search",
           name: "tool_search",
           namespace: null,
-          kind: "gateway",
+          kind: "tool_search",
         }],
       });
 
@@ -3622,17 +3622,15 @@ describe("ChatGPT outer-native harness v4", () => {
         arguments: { query: "open-computer-use desktop control", limit: 8 },
       });
       const [deferredSearchRequest] = await broker.nextToolBatch(token);
-      const deferredSearchCalls: GatewayProgramCall[] = [];
-      const deferredSearchContent = await executeGatewayProgram(
-        deferredSearchRequest!.input!,
-        ["tool_search"],
-        deferredSearchCalls,
-      );
-      expect(deferredSearchCalls).toEqual([{
-        name: "tool_search",
-        input: { query: "open-computer-use desktop control", limit: 8 },
-      }]);
-      broker.completeTool(token, deferredSearchRequest!.callId, { content: deferredSearchContent });
+      expect(deferredSearchRequest).toMatchObject({
+        wireName: "tool_search",
+        freeform: false,
+        arguments: { query: "open-computer-use desktop control", limit: 8 },
+      });
+      expect(deferredSearchRequest?.input).toBeUndefined();
+      broker.completeTool(token, deferredSearchRequest!.callId, toolResult({
+        tools: [{ name: "mcp__open_computer_use__list_apps" }],
+      }));
       expect((await deferredSearch).isError).not.toBe(true);
 
       const desktopInventory = await inventoryThroughGateway(

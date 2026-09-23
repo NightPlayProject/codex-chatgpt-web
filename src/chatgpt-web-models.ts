@@ -295,6 +295,10 @@ interface ChatGptWebModelRouteBase {
   codexEffort: ChatGptWebCodexEffort;
   requiresPro: boolean;
   requiresExtraHigh?: boolean;
+  /** Old task identities remain resolvable, but are omitted from the picker. */
+  legacy?: boolean;
+  /** Omission denotes an immutable route, including all pre-6.0 task identities. */
+  supportedCodexEfforts?: readonly ChatGptWebCodexEffort[];
 }
 
 export interface ChatGptWebAutomaticModelRoute extends ChatGptWebModelRouteBase {
@@ -436,6 +440,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     adapterEffort: "xhigh",
     requiresPro: false,
     requiresExtraHigh: true,
+    legacy: true,
   },
   {
     slug: "chatgpt-web/pro",
@@ -531,10 +536,23 @@ export function availableChatGptWebModelRoutes(
       ? [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE, CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
       : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE];
   }
-  if (!capabilities.solAvailable) return CHATGPT_WEB_LUNA_MODEL_ROUTES;
-  return CHATGPT_WEB_MODEL_ROUTES.filter(route =>
+  if (!capabilities.solAvailable) return includeLegacy
+    ? [...CHATGPT_WEB_LUNA_MODEL_ROUTES, CHATGPT_WEB_LEGACY_LUNA_MODEL_ROUTE, CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE]
+    : CHATGPT_WEB_LUNA_MODEL_ROUTES;
+  const candidates = includeLegacy
+    ? [...CHATGPT_WEB_MODEL_ROUTES, ...CHATGPT_WEB_LEGACY_MODEL_ROUTES]
+    : CHATGPT_WEB_MODEL_ROUTES;
+  return candidates.filter(route =>
     (!route.requiresPro || capabilities.proAvailable)
     && (!route.requiresExtraHigh || capabilities.extraHighAvailable));
+}
+
+export function chatGptWebRouteEfforts(
+  route: ChatGptWebModelRoute,
+  capabilities: ChatGptWebAccountCapabilities,
+): readonly ChatGptWebCodexEffort[] {
+  return (route.supportedCodexEfforts ?? [route.codexEffort])
+    .filter(effort => effort !== "xhigh" || capabilities.extraHighAvailable === true);
 }
 
 export function requireChatGptWebModelRoute(

@@ -3,12 +3,18 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const vm = require("node:vm");
 const {
   browserIdFromVersionPayload,
   createOfficialCodexWallpaperController,
   discoverOfficialTargets,
   endpointRecordLooksValid,
   officialAppTarget,
+  providerAwareRateLimitGateScript,
+  RATE_LIMIT_GATE_PROBE_SCRIPT,
+  RATE_LIMIT_GATE_RECOVERY_SCRIPT,
+  usageAllowsRateLimitRecovery,
+  usageShowsNativeQuotaExhaustion,
 } = require("../electron/official-codex-wallpapers.cjs");
 
 const identity = Object.freeze({
@@ -45,12 +51,92 @@ class FakeWebSocket {
   }
 }
 
+function scriptedWebSocket(responder) {
+  return class ScriptedWebSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      const expression = message.params?.expression || "";
+      const value = expression.includes("performance.timeOrigin")
+        ? "official-codex-generation-1"
+        : responder(expression);
+      queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ id: message.id, result: { result: { value } } }),
+      }));
+    }
+  };
+}
+
 function logger() {
   return { info() {}, warn() {}, error() {} };
 }
 
 function validEndpoint(port = 9333) {
   return { port, browserId: "browser_1", version: identity.Version };
+}
+
+function makeProviderGateVmContext({ disabled = true, ariaDisabled = "true" } = {}) {
+  class FakeElement {
+    constructor({ text = "" } = {}) {
+      this.innerText = text;
+      this.textContent = text;
+      this.attrs = new Map();
+    }
+
+    getBoundingClientRect() {
+      return { width: 100, height: 40 };
+    }
+
+    getAttribute(name) {
+      return this.attrs.has(name) ? this.attrs.get(name) : null;
+    }
+
+    setAttribute(name, value) {
+      this.attrs.set(name, String(value));
+    }
+
+    removeAttribute(name) {
+      this.attrs.delete(name);
+    }
+  }
+
+  class FakeButton extends FakeElement {
+    constructor(options = {}) {
+      super(options);
+      this.disabled = options.disabled === true;
+    }
+  }
+
+  const submit = new FakeButton({ disabled });
+  submit.setAttribute("type", "submit");
+  if (ariaDisabled != null) submit.setAttribute("aria-disabled", ariaDisabled);
+  const model = new FakeButton({ text: "ChatGPT Web — GPT-5.6 Sol" });
+  const editor = new FakeElement({ text: "hello" });
+  const root = new FakeElement();
+  root.querySelectorAll = selector => selector === "button" ? [model, submit] : [];
+  root.querySelector = selector => {
+    if (selector === 'button[type="submit"]') return submit;
+    if (selector === '#prompt-textarea, [contenteditable="true"]') return editor;
+    if (selector === ".composer-attachment-surface") return null;
+    return null;
+  };
+
+  const context = {
+    Element: FakeElement,
+    HTMLElement: FakeElement,
+    HTMLButtonElement: FakeButton,
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    document: {
+      documentElement: root,
+      querySelectorAll: () => [root],
+    },
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    queueMicrotask,
+  };
+  context.globalThis = context;
+  return { context, submit };
 }
 
 function makeTarget(id = "page_1", url = "app://codex/index.html") {
@@ -80,6 +166,9 @@ function makeController({
   waitForEndpoint = async () => validEndpoint(),
   findPort = async () => 9333,
   platform = "win32",
+  WebSocketImpl = FakeWebSocket,
+  getCurrentUsage = async () => null,
+  now = () => Date.now(),
   refreshIntervalMs = 60_000,
 } = {}) {
   const controller = createOfficialCodexWallpaperController({
@@ -94,14 +183,280 @@ function makeController({
     waitForEndpoint,
     findPort,
     discoverTargets,
-    WebSocketImpl: FakeWebSocket,
+    WebSocketImpl,
     onStatus: status => events.push(status),
+    getCurrentUsage,
+    now,
     refreshIntervalMs,
     restartPollIntervalMs: 10,
   });
   if (storedEndpoint) fs.writeFileSync(path.join(root, "endpoint.json"), `${JSON.stringify(validEndpoint())}\n`);
   return controller;
 }
+
+test("stale rate-limit recovery requires fresh usage headroom", () => {
+  assert.equal(usageAllowsRateLimitRecovery(null), false);
+  assert.equal(usageAllowsRateLimitRecovery({ available: false, primaryUsedPercent: 10 }), false);
+  assert.equal(usageAllowsRateLimitRecovery({ available: true, primaryUsedPercent: null, secondaryUsedPercent: null }), false);
+  assert.equal(usageAllowsRateLimitRecovery({ available: true, primaryUsedPercent: 100, secondaryUsedPercent: 47 }), false);
+  assert.equal(usageAllowsRateLimitRecovery({ available: true, primaryUsedPercent: 0, secondaryUsedPercent: 47 }), true);
+  assert.equal(usageShowsNativeQuotaExhaustion(null), false);
+  assert.equal(usageShowsNativeQuotaExhaustion({ available: false, primaryUsedPercent: 100 }), false);
+  assert.equal(usageShowsNativeQuotaExhaustion({ available: true, primaryUsedPercent: 99, secondaryUsedPercent: 47 }), false);
+  assert.equal(usageShowsNativeQuotaExhaustion({ available: true, primaryUsedPercent: 100, secondaryUsedPercent: 47 }), true);
+});
+
+test("ChatGPT Web provider gate handles a natively disabled quota button and restores it", () => {
+  const { context, submit } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: "true",
+  });
+
+  const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
+  assert.equal(probe.rateLimitBlocked, true);
+  assert.equal(probe.chatGptWebSelected, true);
+  assert.equal(probe.hasSendableContent, true);
+
+  const unlocked = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
+  assert.equal(unlocked.managed, true);
+  assert.equal(unlocked.unlocked, true);
+  assert.equal(submit.disabled, false);
+  assert.equal(submit.getAttribute("aria-disabled"), "false");
+  assert.equal(submit.getAttribute("data-cw-chatgpt-web-quota-original-disabled"), "true");
+
+  const restored = vm.runInNewContext(providerAwareRateLimitGateScript(false), context);
+  assert.equal(restored.managed, false);
+  assert.equal(restored.unlocked, false);
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.getAttribute("aria-disabled"), "true");
+  assert.equal(submit.getAttribute("data-cw-chatgpt-web-quota-unlock"), null);
+});
+
+test("ChatGPT Web provider gate unlocks send while native Codex quota is exhausted", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-web-gate-"));
+  let unlocked = false;
+  let gateCalls = 0;
+  let recoveryCalls = 0;
+  let usageCalls = 0;
+  let clock = 300_000;
+  const WebSocketImpl = scriptedWebSocket(expression => {
+    if (expression === RATE_LIMIT_GATE_PROBE_SCRIPT) {
+      return {
+        rateLimitBlocked: !unlocked,
+        providerGateUnlocked: unlocked,
+        chatGptWebSelected: true,
+        hasSendableContent: true,
+        hasAttachments: false,
+      };
+    }
+    if (expression === providerAwareRateLimitGateScript(true)) {
+      gateCalls += 1;
+      unlocked = true;
+      return { managed: true, unlocked: true, selected: true, sendable: true };
+    }
+    if (expression === RATE_LIMIT_GATE_RECOVERY_SCRIPT) {
+      recoveryCalls += 1;
+      return true;
+    }
+    return true;
+  });
+  const controller = makeController({
+    root,
+    storedEndpoint: true,
+    processes: [{ ProcessId: 5678, ExecutablePath: identity.Executable }],
+    discoverTargets: async () => [makeTarget()],
+    WebSocketImpl,
+    getCurrentUsage: async () => {
+      usageCalls += 1;
+      return {
+        available: true,
+        fetchedAt: "2026-09-23T00:34:00.000Z",
+        primaryUsedPercent: 100,
+        secondaryUsedPercent: 47,
+      };
+    },
+    now: () => {
+      clock += 2_000;
+      return clock;
+    },
+    refreshIntervalMs: 10,
+  });
+  try {
+    await controller.setEnabled(true);
+    const deadline = Date.now() + 500;
+    while (!unlocked && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(unlocked, true);
+    assert.ok(gateCalls >= 1);
+    assert.equal(usageCalls, 1);
+    assert.equal(recoveryCalls, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("native Codex models never receive the ChatGPT Web quota override", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-native-gate-"));
+  let providerGateCalls = 0;
+  let recoveryCalls = 0;
+  let clock = 400_000;
+  const WebSocketImpl = scriptedWebSocket(expression => {
+    if (expression === RATE_LIMIT_GATE_PROBE_SCRIPT) {
+      return {
+        rateLimitBlocked: true,
+        providerGateUnlocked: false,
+        chatGptWebSelected: false,
+        hasSendableContent: true,
+        hasAttachments: false,
+      };
+    }
+    if (expression === providerAwareRateLimitGateScript(true)
+      || expression === providerAwareRateLimitGateScript(false)) {
+      providerGateCalls += 1;
+      return { managed: false, unlocked: false, selected: false, sendable: true };
+    }
+    if (expression === RATE_LIMIT_GATE_RECOVERY_SCRIPT) {
+      recoveryCalls += 1;
+      return true;
+    }
+    return true;
+  });
+  const controller = makeController({
+    root,
+    storedEndpoint: true,
+    processes: [{ ProcessId: 5678, ExecutablePath: identity.Executable }],
+    discoverTargets: async () => [makeTarget()],
+    WebSocketImpl,
+    getCurrentUsage: async () => ({
+      available: true,
+      primaryUsedPercent: 100,
+      secondaryUsedPercent: 47,
+    }),
+    now: () => {
+      clock += 2_000;
+      return clock;
+    },
+    refreshIntervalMs: 10,
+  });
+  try {
+    await controller.setEnabled(true);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(providerGateCalls, 0);
+    assert.equal(recoveryCalls, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stale native rate-limit gate refreshes only after authoritative usage says send is available", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-rate-limit-"));
+  const calls = { install: 0, dispose: 0 };
+  let blocked = true;
+  let recoveryCalls = 0;
+  let usageCalls = 0;
+  let clock = 100_000;
+  const WebSocketImpl = scriptedWebSocket(expression => {
+    if (expression === RATE_LIMIT_GATE_PROBE_SCRIPT) {
+      return { rateLimitBlocked: blocked, hasAttachments: false };
+    }
+    if (expression === RATE_LIMIT_GATE_RECOVERY_SCRIPT) {
+      recoveryCalls += 1;
+      blocked = false;
+      return true;
+    }
+    return true;
+  });
+  const controller = makeController({
+    root,
+    calls,
+    storedEndpoint: true,
+    processes: [{ ProcessId: 5678, ExecutablePath: identity.Executable }],
+    discoverTargets: async () => [makeTarget()],
+    WebSocketImpl,
+    getCurrentUsage: async () => {
+      usageCalls += 1;
+      return {
+        available: true,
+        fetchedAt: "2026-09-22T23:20:00.000Z",
+        primaryUsedPercent: 0,
+        secondaryUsedPercent: 47,
+      };
+    },
+    now: () => {
+      clock += 2_000;
+      return clock;
+    },
+    refreshIntervalMs: 10,
+  });
+  try {
+    await controller.setEnabled(true);
+    const deadline = Date.now() + 500;
+    while (recoveryCalls === 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(recoveryCalls, 1);
+    assert.equal(usageCalls, 1);
+    assert.equal(blocked, false);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("genuine or attachment-bearing rate-limit states are never refreshed", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-real-limit-"));
+  let probeCount = 0;
+  let recoveryCalls = 0;
+  let usageCalls = 0;
+  let clock = 200_000;
+  const WebSocketImpl = scriptedWebSocket(expression => {
+    if (expression === RATE_LIMIT_GATE_PROBE_SCRIPT) {
+      probeCount += 1;
+      return {
+        rateLimitBlocked: true,
+        hasAttachments: probeCount < 3,
+      };
+    }
+    if (expression === RATE_LIMIT_GATE_RECOVERY_SCRIPT) {
+      recoveryCalls += 1;
+      return true;
+    }
+    return true;
+  });
+  const controller = makeController({
+    root,
+    storedEndpoint: true,
+    processes: [{ ProcessId: 5678, ExecutablePath: identity.Executable }],
+    discoverTargets: async () => [makeTarget()],
+    WebSocketImpl,
+    getCurrentUsage: async () => {
+      usageCalls += 1;
+      return {
+        available: true,
+        primaryUsedPercent: 100,
+        secondaryUsedPercent: 47,
+      };
+    },
+    now: () => {
+      clock += 2_000;
+      return clock;
+    },
+    refreshIntervalMs: 10,
+  });
+  try {
+    await controller.setEnabled(true);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.ok(probeCount >= 3);
+    assert.equal(usageCalls, 1);
+    assert.equal(recoveryCalls, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("official wallpaper endpoint identity rejects wrong version, browser id, and non-loopback websocket URLs", () => {
   const endpoint = validEndpoint();

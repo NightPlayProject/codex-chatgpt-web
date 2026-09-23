@@ -173,7 +173,7 @@ test("read-only prompts resume without exposing a bind capability", () => {
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
 });
 
-test("Bigger Context sends six semantic record envelopes and starts work from the final part", () => {
+test("Bigger Context sends semantic record envelopes and starts work from the final part", () => {
   const token = "turn_12345678901234567890123456789012";
   const parsed = request("high");
   parsed.context.systemPrompt = ["system-one", "system-two"];
@@ -188,7 +188,7 @@ test("Bigger Context sends six semantic record envelopes and starts work from th
     { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
   );
 
-  expect(compiled.multipart?.parts).toHaveLength(6);
+  expect(compiled.multipart?.parts).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS);
   const records = compiled.multipart!.parts.flatMap(part => {
     const payload = JSON.parse(part) as { version: number; records: unknown[] };
     expect(payload.version).toBe(1);
@@ -208,14 +208,14 @@ test("Bigger Context sends six semantic record envelopes and starts work from th
 
   const transactionId = `ctx_${"a".repeat(32)}`;
   const stages = compiled.multipart!.parts.slice(0, -1).map((part, index) => (
-    formatChatGptWebMultipartStage(part, transactionId, index + 1)
+    formatChatGptWebMultipartStage(part, transactionId, index + 1, CHATGPT_BIGGER_CONTEXT_PARTS)
   ));
-  expect(stages).toHaveLength(5);
+  expect(stages).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS - 1);
   for (const [index, stage] of stages.entries()) {
-    expect(stage.text).toContain(`part: ${index + 1}/6`);
+    expect(stage.text).toContain(`part: ${index + 1}/${CHATGPT_BIGGER_CONTEXT_PARTS}`);
     expect(stage.text).toContain(stage.sha256);
     expect(stage.acknowledgement).toBe(
-      `CODEX_MULTIPART_ACK ${transactionId} ${index + 1}/6 ${stage.sha256}`,
+      `CODEX_MULTIPART_ACK ${transactionId} ${index + 1}/${CHATGPT_BIGGER_CONTEXT_PARTS} ${stage.sha256}`,
     );
     expect(stage.text).toContain("```json\n");
     expect(stage.text).toContain("<codex_multipart_stage_end>");
@@ -226,19 +226,21 @@ test("Bigger Context sends six semantic record envelopes and starts work from th
   }
   const commit = formatChatGptWebMultipartCommit(compiled.multipart!, transactionId);
   expect(commit).toContain(`transaction_id: ${transactionId}`);
-  expect(commit).toContain("acknowledged_parts: 5/6");
+  expect(commit).toContain(
+    `acknowledged_parts: ${CHATGPT_BIGGER_CONTEXT_PARTS - 1}/${CHATGPT_BIGGER_CONTEXT_PARTS}`,
+  );
   expect(commit).toContain("The final part is included in this same message and starts the task");
   expect(commit).toContain(compiled.multipart!.parts.at(-1)!);
   expect(commit).toContain("latest-request");
   expect(commit.match(new RegExp(token, "g"))).toHaveLength(1);
 });
 
-test("Bigger Context uses the minimum transport and reserves six parts for compaction", () => {
+test("Bigger Context uses the minimum transport and starts compaction at the configured multipart count", () => {
   expect(biggerContextPartCount(94_999, 95_000, false)).toBeUndefined();
   expect(biggerContextPartCount(95_000, 95_000, false)).toBe(2);
   expect(biggerContextPartCount(189_999, 95_000, false)).toBe(2);
-  expect(biggerContextPartCount(190_000, 95_000, false)).toBe(6);
-  expect(biggerContextPartCount(1, 95_000, true)).toBe(6);
+  expect(biggerContextPartCount(190_000, 95_000, false)).toBe(CHATGPT_BIGGER_CONTEXT_PARTS);
+  expect(biggerContextPartCount(1, 95_000, true)).toBe(CHATGPT_BIGGER_CONTEXT_PARTS);
 
   const compiled = compileChatGptWebPrompt(
     request("high"),
@@ -783,7 +785,7 @@ test("Bigger Context compaction preserves history above the retired inline byte 
   );
 
   expect(multipart.trimmedCompactionMessages).toBeUndefined();
-  expect(multipart.multipart?.parts).toHaveLength(6);
+  expect(multipart.multipart?.parts).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS);
   const transactionId = `ctx_${"0".repeat(32)}`;
   const stageBytes = multipart.multipart!.parts.map((payload, index) => chatGptPromptJsonBytes(
     formatChatGptWebMultipartStage(payload, transactionId, index + 1).text,
@@ -816,9 +818,10 @@ test("Bigger Context minimizes the largest ordered stage instead of overfilling 
   );
   const parts = multipart.multipart!.parts.map(part => JSON.parse(part) as { records: unknown[] });
 
-  expect(parts).toHaveLength(6);
+  expect(parts).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS);
   expect(parts.flatMap(part => part.records)).toHaveLength(8);
-  expect(Math.max(...multipart.multipart!.parts.map(part => part.length))).toBeLessThan(120_000);
+  const payloadLengths = multipart.multipart!.parts.map(part => part.length);
+  expect(Math.max(...payloadLengths) - Math.min(...payloadLengths)).toBeLessThan(10_000);
 });
 
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {

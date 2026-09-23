@@ -86,6 +86,8 @@ export interface AppConfig {
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
   experimentalSkillAttachments: boolean;
+  experimentalFreshConversationPerTurn: boolean;
+  useSavedChats: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -216,6 +218,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     proAvailable: false,
     experimentalBiggerContext: false,
     experimentalSkillAttachments: false,
+    experimentalFreshConversationPerTurn: false,
+    useSavedChats: false,
     zeroRiskProEnabled: false,
     // Full automatic mode is intended to expose the active native Codex tool surface without
     // stopping on a per-call ChatGPT connector prompt. Zero Risk remains explicitly manual below.
@@ -499,10 +503,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && typeof parsed.experimentalBiggerContext !== "boolean") {
     throw new Error(`Invalid experimentalBiggerContext in ${path}`);
   }
-  if (parsed.experimentalSkillAttachments !== undefined
-    && typeof parsed.experimentalSkillAttachments !== "boolean") {
-    throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
-  }
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
@@ -530,7 +530,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Zero Risk does not support Skills as files in ${path}`);
   }
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
-  const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
     throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
@@ -556,6 +555,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
     proAvailable,
     experimentalBiggerContext,
     experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn,
+    useSavedChats,
     zeroRiskProEnabled,
     // A stale v3 config may still contain false from releases that required an explicit opt-in.
     // Full automatic mode now owns this setting so a runtime upgrade does not leave tool calls
@@ -621,6 +622,8 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       experimentalSkillAttachments: manual ? false : config.experimentalSkillAttachments,
+      experimentalFreshConversationPerTurn: !manual && config.experimentalFreshConversationPerTurn === true,
+      useSavedChats: config.useSavedChats === true,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.mode === "full" ? true : config.autoApproveToolCalls,
     },

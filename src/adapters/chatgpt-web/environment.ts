@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { hasOnlyCodexContextualUserContentItemKinds, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
-import { isAcceptedCompactionContinuation } from "./compaction-continuation";
+import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "./compaction-continuation";
 import {
   authorizeGoalContinuation,
   hasCurrentNativeGoalClaim,
@@ -167,7 +167,7 @@ export function hasRawChatGptFilesystemEnvironmentContext(parsed: CodexParsedReq
   const input = Array.isArray(body?.input) ? body.input : [];
   return input.some(value => {
     const item = record(value);
-    return item?.type === "message"
+    return hasEnvironmentContextFragment(item)
       && chatGptEnvironmentContextCarriesFilesystemAuthority(rawMessageText(item));
   });
 }
@@ -210,7 +210,7 @@ export function hasCurrentChatGptFilesystemEnvironmentContext(parsed: CodexParse
       || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
       laterAssistantOutput = true;
     }
-    if (item.type !== "message"
+    if (!hasEnvironmentContextFragment(item)
       || !chatGptEnvironmentContextCarriesFilesystemAuthority(rawMessageText(item))) continue;
     const owner = itemTurnId(item);
     if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
@@ -381,7 +381,8 @@ function latestChatGptTurnUserRevisionRecord(
     const revision = userRevision(input[index], expectedTurnId, metadata);
     if (revision) return { ...revision, inputIndex: index };
   }
-  return recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
+  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
+  return recovered ? { ...recovered.source, inputIndex: recovered.summaryIndex } : undefined;
 }
 
 function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record<string, unknown>): ChatGptTurnUserRevision | undefined {

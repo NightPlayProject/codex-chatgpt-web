@@ -7,6 +7,7 @@ import {
   resolveStandardContextMultipartParts,
 } from "../src/adapters/chatgpt-web/usage";
 import {
+  CHATGPT_BIGGER_CONTEXT_PARTS,
   compileChatGptWebPrompt,
   formatChatGptWebMultipartCommit,
   formatChatGptWebMultipartStage,
@@ -223,7 +224,7 @@ test("multipart selection accounts for whole-record and composer fit before subm
   const plus = { ...capabilities, extraHighAvailable: false, proAvailable: false };
   for (const [contents, expected] of [
     [["small task"], undefined],
-    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
+    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), CHATGPT_BIGGER_CONTEXT_PARTS],
     [Array.from({ length: 3 }, () => " ".repeat(450_000)), 2],
   ] as const) {
     const parsed = request("");
@@ -320,11 +321,11 @@ test("v2 compaction replacement does not replay the large source history into th
     .toBeLessThan(CHATGPT_WEB_HIGH_RELIABLE_BROWSER_INPUT_TOKEN_LIMIT);
 });
 
-test("Bigger Context compaction selects six parts before the legacy inline byte budget", () => {
+test("Bigger Context compaction starts at the minimum safe multipart count before the legacy inline byte budget", () => {
   const parsed = request("x".repeat(160_000));
   parsed._compactionRequest = true;
   const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
-  expect(parts).toBe(6);
+  expect(parts).toBe(CHATGPT_BIGGER_CONTEXT_PARTS);
   const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
   expect(compiled.trimmedCompactionMessages).toBeUndefined();
   expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))

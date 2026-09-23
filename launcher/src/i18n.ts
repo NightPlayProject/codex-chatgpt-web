@@ -5,6 +5,9 @@ const en = {
   saveChatsBody: "Use regular chats for new tasks so conversations stay in your ChatGPT history. Turn off for temporary chats. Existing task chats keep their current mode. Saved chats may use your ChatGPT memory and personalization settings.",
   savedChats: "Recent saved chats",
   savedChatsBody: "Review saved conversations in your browser. Automatic mode can resume a completed chat after restart when its task, last answer and page checkpoint still match. Interrupted chats start fresh from Codex context.",
+  freshConversation: "New browser chat for each turn",
+  freshConversationBody: "Rebuild context from the same Codex task in a new browser chat for each turn. This may help when ChatGPT loses access to tools, but can send more context and be slower. Off by default.",
+  manualFreshConversationUnavailable: "Available only with Automation. Your preference is saved while Zero Risk is active.",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "Set up the isolated DEV profile",
@@ -297,7 +300,7 @@ const en = {
   doctorMacTunnelRunning: "macOS tunnel service is installed, loaded, and running",
 } as const;
 
-const zh: Record<keyof typeof en, string> = {
+const zh: Partial<Record<keyof typeof en, string>> = {
   saveChats: "在 ChatGPT 中保存聊天",
   saveChatsBody: "新任务使用普通聊天并保留在 ChatGPT 历史中。关闭后使用临时聊天。现有任务不变。普通聊天可能使用 ChatGPT 的记忆和个性化设置。",
   savedChats: "最近保存的聊天",
@@ -594,7 +597,7 @@ const zh: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS 隧道服务已安装、加载并运行",
 };
 
-const ja: Record<keyof typeof en, string> = {
+const ja: Partial<Record<keyof typeof en, string>> = {
   saveChats: "ChatGPT にチャットを保存",
   saveChatsBody: "新しいタスクを通常のチャットで開始し、ChatGPT の履歴に保存します。オフにすると一時チャットを使用します。既存のタスクには適用されません。通常のチャットではメモリやパーソナライズ設定が適用される場合があります。",
   savedChats: "最近保存したチャット",
@@ -891,7 +894,7 @@ const ja: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS トンネルサービスはインストール・読み込み済みで稼働中です",
 };
 
-const ko: Record<keyof typeof en, string> = {
+const ko: Partial<Record<keyof typeof en, string>> = {
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "격리된 DEV 프로필 설정",
@@ -1098,7 +1101,7 @@ const ko: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS 터널 서비스가 설치 및 로드되어 실행 중입니다",
 };
 
-const zhTW: Record<keyof typeof en, string> = {
+const zhTW: Partial<Record<keyof typeof en, string>> = {
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "設定隔離的 DEV 設定檔",
@@ -1305,13 +1308,13 @@ const zhTW: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS 隧道服務已安裝、載入並執行",
 };
 
-export type Copy = typeof en;
+export type Copy = Record<keyof typeof en, string>;
 
 export function copyFor(language: Language): Copy {
-  if (language === "zh-CN") return zh as Copy;
-  if (language === "ja") return ja as Copy;
-  if (language === "ko") return ko as Copy;
-  if (language === "zh-TW") return zhTW as Copy;
+  if (language === "zh-CN") return { ...en, ...zh };
+  if (language === "ja") return { ...en, ...ja };
+  if (language === "ko") return { ...en, ...ko };
+  if (language === "zh-TW") return { ...en, ...zhTW };
   return en;
 }
 

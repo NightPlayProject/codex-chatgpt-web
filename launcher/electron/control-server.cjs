@@ -38,11 +38,12 @@ function writeJson(response, status, body) {
 }
 
 class BrowserControlServer {
-  constructor({ logger, getBrowserHost, getPreferences, resolveProxy }) {
+  constructor({ logger, getBrowserHost, getPreferences, resolveProxy, limits }) {
     this.logger = logger;
     this.getBrowserHost = getBrowserHost;
     this.getPreferences = getPreferences;
     this.resolveProxy = resolveProxy;
+    this.limits = limits;
     this.token = randomBytes(32).toString("base64url");
     this.port = 0;
     this.server = createServer((request, response) => {
@@ -305,15 +306,27 @@ class BrowserControlServer {
         if (host.browserInteractionMode() === "manual") {
           throw new Error("Automatic browser interaction is disabled");
         }
-        const lease = await host.beginTurn(
-          body.traceId,
-          preferences.showBrowserDuringTurns === true,
-          body.helperPid,
-          body.conversationKey,
-          body.connectorIdentity,
-          body.requireRetainedConversation === true,
-          body.resumeAnswerDigest,
-        );
+        const acquisition = new AbortController();
+        const onClose = () => {
+          if (!response.writableFinished) acquisition.abort(new Error("Browser turn acquisition caller disconnected"));
+        };
+        response.once("close", onClose);
+        let lease;
+        try {
+          if (response.destroyed) onClose();
+          lease = await host.beginTurn(
+            body.traceId,
+            preferences.showBrowserDuringTurns === true,
+            body.helperPid,
+            body.conversationKey,
+            body.connectorIdentity,
+            body.requireRetainedConversation === true,
+            body.resumeAnswerDigest,
+            acquisition.signal,
+          );
+        } finally {
+          response.off("close", onClose);
+        }
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease, trackUsage: this.limits?.enabled() === true });
         return;

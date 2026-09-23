@@ -327,5 +327,9 @@ export interface CodexProviderConfig {
     experimentalBiggerContext?: boolean;
     /** Transport native Codex selected-skill instructions as authenticated text-file attachments. */
     experimentalSkillAttachments?: boolean;
+    /** Explicitly rebuild each automatic turn in a fresh browser conversation. */
+    experimentalFreshConversationPerTurn?: boolean;
+    /** Use ordinary ChatGPT history for task conversations. Default: Temporary Chat. */
+    useSavedChats?: boolean;
   };
 }

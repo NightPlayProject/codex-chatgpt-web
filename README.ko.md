@@ -49,13 +49,13 @@ Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미�
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 </details>
@@ -74,6 +74,14 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Zero Risk** | 직접 붙여넣고 전송 | 별도 MCP 커넥터를 통해 사용 |
 
 Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
+
+**소스에서 실행**
+
+```bash
+git clone https://github.com/NightPlayProject/codex-chatgpt-web.git && \
+cd codex-chatgpt-web && \
+bun run app
+```
 
 <a id="full-harness"></a>
 
@@ -101,6 +109,14 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
    **Codex Native2**로 지정합니다. **Authentication: None**과 **Allow all actions**를 사용합니다.
 3. **런타임 검증**을 실행해 **Codex Native2**가 연결되어 사용 가능한지 확인합니다.
 
+데스크톱 제어는 선택 사항입니다. Full 모드는 같은 **Codex Native2** 커넥터를 통해 네이티브 Codex MCP/플러그인 도구를 전달합니다. Windows에서는 [`open-computer-use`](https://www.npmjs.com/package/open-computer-use)를 사용할 수 있습니다. 런처의 **MCP** 페이지에서 **Set up desktop controls**를 선택하면 번들된 네이티브 런타임을 등록할 수 있습니다. 이전 빌드에서는 다음 수동 설치를 사용할 수 있습니다.
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+등록 후 Codex를 완전히 종료했다가 다시 열어 도구 카탈로그를 새로 불러오세요.
 쓰기/수정 작업은 ChatGPT 작업 공간과 관리자 정책에서도 허용되어야 합니다.
 [Developer Mode와 MCP 앱](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)을
 참고하세요. `--auto-approve-tool-calls`를 명시적으로 활성화하지 않은 상태에서 예상치 못한 승인

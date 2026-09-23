@@ -133,6 +133,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       reused: true,
       connectorBound: true,
       saveChat: false,
+      trackUsage: false,
     });
     expect(received.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
     expect(received.body).toEqual({

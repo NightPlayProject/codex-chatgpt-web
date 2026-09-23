@@ -6,9 +6,12 @@ import { dirname, join, resolve, toNamespacedPath } from "node:path";
 import {
   chatGptEnvironmentContextCarriesFilesystemAuthority,
   chatGptTurnUserRevisionHistory,
+  extractChatGptCompactionSourceRevision,
   extractChatGptTurnEnvironment,
   extractChatGptTurnIdentity,
+  extractChatGptTurnUserRevision,
 } from "../src/adapters/chatgpt-web/environment";
+import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import {
   bindCompactionContinuationStore,
   ChatGptCompactionContinuationStore,

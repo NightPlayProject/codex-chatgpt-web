@@ -1,7 +1,6 @@
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, chatGptWebImageTokenReserve } from "../../chatgpt-web-models";
 import { skillFileTokens } from "./skill-attachments";
 import { estimateTokens } from "../../lib/token-estimate";
-import { skillFileTokens } from "./skill-attachments";
 import {
   formatChatGptWebMultipartCommit,
   formatChatGptWebMultipartStage,

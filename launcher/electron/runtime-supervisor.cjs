@@ -280,6 +280,10 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalSkillAttachments !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalSkillAttachments");
   }
+  if (config.experimentalFreshConversationPerTurn !== undefined
+    && typeof config.experimentalFreshConversationPerTurn !== "boolean") {
+    throw new Error("Runtime configuration has an invalid experimentalFreshConversationPerTurn");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");

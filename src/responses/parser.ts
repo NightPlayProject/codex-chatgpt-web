@@ -16,6 +16,7 @@ import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import {
   compactionItemToText,
+  isNativeTextCompaction,
   isNativeGoalContextItem,
   isOnePixelPngDataUrl,
   isReadableCompactionSummaryText,

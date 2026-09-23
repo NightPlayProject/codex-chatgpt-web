@@ -323,9 +323,6 @@ async function setupCommand(args: string[]): Promise<void> {
   if (biggerContext && standardContext) {
     throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
   }
-  const skillAttachments = takeFlag(args, "--skill-attachments");
-  const inlineSkills = takeFlag(args, "--inline-skills");
-  if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
   if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
   const zeroRiskPro = takeFlag(args, "--zero-risk-pro");

@@ -640,6 +640,7 @@ export async function notifyLauncherTurn(
   connectorBound?: boolean;
   cancelledByUser?: boolean;
   saveChat?: boolean;
+  trackUsage?: boolean;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
@@ -685,6 +686,7 @@ export async function notifyLauncherTurn(
         reused: body.reused,
         connectorBound: body.connectorBound,
         saveChat: body.saveChat === true,
+        trackUsage: body.trackUsage === true,
       };
     }
     if (activity.phase === "end") {

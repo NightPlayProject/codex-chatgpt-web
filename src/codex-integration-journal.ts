@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { atomicWriteFile, stripUtf8Bom } from "./config";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+  MANAGED_PROVIDER_ID,
   getCodexConfigPath,
   getCodexJournalPath,
   getCodexJournalRecoveryPath,
@@ -13,6 +14,7 @@ import type {
   AnyCodexIntegrationJournal,
   CodexIntegrationJournal,
   LegacyCodexIntegrationJournal,
+  LegacyCodexIntegrationJournalV10,
   LegacyCodexIntegrationJournalV9,
   LegacyCodexIntegrationJournalV3,
   LegacyCodexIntegrationJournalV4,
@@ -44,6 +46,27 @@ function isInstalledInterruptHook(value: unknown): boolean {
 function parseJournal(path: string): AnyCodexIntegrationJournal {
   const value = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))) as Record<string, unknown>;
   const installed = value.installed as Record<string, unknown> | undefined;
+  if (value.version === 11
+    && typeof value.active === "boolean"
+    && installed
+    && typeof installed.openai_base_url === "string"
+    && installed.model_provider === MANAGED_PROVIDER_ID
+    && installed.experimental_realtime_webrtc_call_base_url === CODEX_REALTIME_WEBRTC_CALL_BASE_URL
+    && (installed.subagent_protocol === "compatibility-v1" || installed.subagent_protocol === "native")
+    && (installed.subagent_protocol !== "compatibility-v1"
+      || (value.previousMultiAgent && value.previousMultiAgentV2
+        && value.previousAgentMaxDepth
+        && typeof installed.agent_max_depth === "number"
+        && Number.isSafeInteger(installed.agent_max_depth)
+        && installed.agent_max_depth >= 2))
+    && value.previous
+    && typeof value.providerBlock === "string"
+    && value.providerBlock.length > 0
+    && isPreviousAssignment(value.previousRealtimeWebrtcCallBaseUrl)
+    && isInstalledInterruptHook(value.interruptHook)
+    && typeof value.configPath === "string") {
+    return value as unknown as CodexIntegrationJournal;
+  }
   if (value.version === 10
     && typeof value.active === "boolean"
     && installed
@@ -60,7 +83,7 @@ function parseJournal(path: string): AnyCodexIntegrationJournal {
     && isPreviousAssignment(value.previousRealtimeWebrtcCallBaseUrl)
     && isInstalledInterruptHook(value.interruptHook)
     && typeof value.configPath === "string") {
-    return value as unknown as CodexIntegrationJournal;
+    return value as unknown as LegacyCodexIntegrationJournalV10;
   }
   if (value.version === 9
     && typeof value.active === "boolean"

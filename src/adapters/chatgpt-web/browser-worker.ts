@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, type ChatGptUsageModel } from "./limits";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
 import {
   atomicWriteFile,
   CHATGPT_CONNECTOR_NAME,
@@ -764,7 +765,7 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
     }
   }
   // Dismissing the modal does not prove the account cooldown has cleared. Keep this failure
-  // replayable in the adapter so native reconnects cannot start more browser submissions.
+  // non-retryable so native reconnects cannot start more browser submissions during the cooldown.
   throw new ChatGptWebAdapterError(
     "ChatGPT rate limit: too many requests. Try again in a few minutes.",
     { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false },
@@ -875,8 +876,28 @@ type SelectedChatGptWebModelMode = ChatGptWebModelMode & {
   usageModel?: ChatGptUsageModel;
 };
 
+const chatGptContextWindowErrorAlert = (scope: ChatGptTextScope): Locator => scope
+  .getByText(
+    /ran out of room in (?:the )?model(?:'s|’s) context window|context (?:window|length) (?:was |is )?(?:exceeded|exhausted)|maximum context (?:length|window)/i,
+  )
+  .last();
+
 export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope): Promise<void> {
-  if (await scope.getByTestId("regenerate-thread-error-button").last().isVisible().catch(() => false)) {
+  const responseErrorActionVisible = await scope
+    .getByTestId("regenerate-thread-error-button")
+    .last()
+    .isVisible()
+    .catch(() => false);
+  if (
+    responseErrorActionVisible
+    && await chatGptContextWindowErrorAlert(scope).isVisible().catch(() => false)
+  ) {
+    throw new ChatGptWebAdapterError(
+      "ChatGPT ran out of room in the model context window. Compact the Codex task and retry the turn.",
+      { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
+    );
+  }
+  if (responseErrorActionVisible) {
     throw new ChatGptWebAdapterError(
       "ChatGPT displayed an error for this response. Check the ChatGPT tab for the exact error, then retry the turn.",
       { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true },
@@ -2777,13 +2798,13 @@ export class ChatGptBrowserWorker {
   private async prepareChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
-    saveChat = false,
+    useSavedChats = false,
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
-    const targetUrl = saveChat ? "https://chatgpt.com/" : CHATGPT_TEMPORARY_CHAT_URL;
+    const targetUrl = chatGptNewChatUrl(useSavedChats);
     if (page.url() !== targetUrl) {
       await page.goto(targetUrl, {
         waitUntil: "domcontentloaded",
@@ -2803,13 +2824,7 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("composer-ready");
     await throwIfChatGptSessionFailureAlert(page);
     await assertAuthenticatedChatGptPage(page);
-    if (!saveChat) await assertTemporaryChatPage(page);
-    else {
-      const actual = new URL(page.url());
-      if (actual.origin !== "https://chatgpt.com" || actual.pathname !== "/" || actual.search) {
-        throw new Error("Saved chat must start on a fresh ChatGPT conversation");
-      }
-    }
+    await assertNewChatPage(page, useSavedChats);
     await captureDiagnostic?.("session-verified");
     return composer;
   }
@@ -4550,7 +4565,9 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      return this.runBrowserTurn(turn, undefined, undefined, false, this.config.useSavedChats, false);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
@@ -4608,7 +4625,14 @@ export class ChatGptBrowserWorker {
       await turn.onPreparedSelected?.(reused);
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
-      const answer = await this.runBrowserTurn(turn, surfaceId, undefined, reused, lease.saveChat === true);
+      const answer = await this.runBrowserTurn(
+        turn,
+        surfaceId,
+        undefined,
+        reused,
+        lease.saveChat === true,
+        lease.trackUsage === true,
+      );
       completedAnswerDigest = createHash("sha256").update(answer).digest("hex");
       return answer;
     } catch (error) {
@@ -4654,8 +4678,10 @@ export class ChatGptBrowserWorker {
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
-    saveChat = false,
+    saveChat?: boolean,
+    trackUsage = false,
   ): Promise<string> {
+    const useSavedChats = saveChat ?? this.config.useSavedChats;
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
       throw new Error("Tool-capable ChatGPT turns require both progress and terminal-fence transports");
@@ -4915,7 +4941,7 @@ export class ChatGptBrowserWorker {
           () => this.prepareChatSurface(
             page,
             checkpoint => diagnostics.capture(page, checkpoint),
-            saveChat,
+            useSavedChats,
           ),
         );
       }
@@ -5126,7 +5152,7 @@ export class ChatGptBrowserWorker {
               await this.prepareChatSurface(
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
-                saveChat,
+                useSavedChats,
               );
               mode = await this.selectModelAndEffort(
                 page,

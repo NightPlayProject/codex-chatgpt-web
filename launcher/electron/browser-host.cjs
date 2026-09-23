@@ -326,6 +326,7 @@ class BrowserHost {
     showWindow = () => {},
     clipboardApi = clipboard,
     getBrowserInteractionMode = () => "automatic",
+    getUseSavedChats = () => false,
     getSaveChats = () => false,
     rememberChat = () => {},
     getSavedChats = () => [],
@@ -716,7 +717,7 @@ class BrowserHost {
     }
     if (this.turnTabs.get(tab.id) !== tab || contents.isDestroyed()) return;
     try {
-      await contents.loadURL(tab.saveChat ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL);
+      await contents.loadURL(chatUrl);
     } catch (error) {
       if (this.turnTabs.get(tab.id) !== tab || contents.isDestroyed()) return;
       if (isAbortedNavigationError(error)) {
@@ -2292,6 +2293,7 @@ class BrowserHost {
     connectorIdentity,
     requireRetainedConversation = false,
     resumeAnswerDigest,
+    signal,
   ) {
     signal?.throwIfAborted();
     if (this.manualOperation) {
@@ -2370,7 +2372,7 @@ class BrowserHost {
       ? require("./saved-chats.cjs").resumableSavedChat(this.getSavedChats?.() ?? [], conversationKey, connectorIdentity, resumeAnswerDigest)
       : null;
     if (saved) {
-      const restored = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
+      const restored = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal);
       try {
         await boundedSavedChatOperation(restored.view.webContents.loadURL(saved.url), 25_000);
         const deadline = Date.now() + 20_000;
@@ -2720,104 +2722,117 @@ class BrowserHost {
 
   async probeAuthentication() {
     requireAutomaticBrowserInspection(this, "ChatGPT authentication probe");
-    if (!this.view || this.view.webContents.isDestroyed()) return this.snapshot();
-    let url = this.view.webContents.getURL();
-    if (url === IDLE_BROWSER_URL) {
-      this.setState({
-        status: this.state.authenticated ? "ready" : "signed-out",
-        message: this.state.authenticated ? "No active task" : "Sign in to ChatGPT",
-        url,
-      });
-      return this.snapshot();
-    }
-    if (!url.startsWith(CHATGPT_ORIGIN)) {
-      this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
-      return this.snapshot();
-    }
-    const probe = (contents) => contents.executeJavaScript(`(async () => {
-      const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
-      const readSurface = () => {
-        const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-        const actualUrl = new URL(location.href);
-        return {
-          url: actualUrl.href,
-          composer: Boolean(composer),
-          temporary: actualUrl.origin === expectedUrl.origin
-            && actualUrl.pathname === expectedUrl.pathname
-            && actualUrl.searchParams.get("temporary-chat") === "true",
-          readyState: document.readyState,
+    if (this.authenticationProbe) return this.authenticationProbe;
+    // did-finish-load and the login polling loop can arrive together. Only one probe may
+    // navigate the shared primary surface; overlapping loadURL calls abort one another.
+    const operation = (async () => {
+      if (!this.view || this.view.webContents.isDestroyed()) return this.snapshot();
+      let url = this.view.webContents.getURL();
+      if (url === IDLE_BROWSER_URL) {
+        this.setState({
+          status: this.state.authenticated ? "ready" : "signed-out",
+          message: this.state.authenticated ? "No active task" : "Sign in to ChatGPT",
+          url,
+        });
+        return this.snapshot();
+      }
+      if (!url.startsWith(CHATGPT_ORIGIN)) {
+        this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
+        return this.snapshot();
+      }
+      const probe = (contents) => contents.executeJavaScript(`(async () => {
+        const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
+        const readSurface = () => {
+          const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
+          const actualUrl = new URL(location.href);
+          return {
+            url: actualUrl.href,
+            composer: Boolean(composer),
+            temporary: actualUrl.origin === expectedUrl.origin
+              && actualUrl.pathname === expectedUrl.pathname
+              && actualUrl.searchParams.get("temporary-chat") === "true",
+            readyState: document.readyState,
+          };
         };
-      };
-      const initialSurface = readSurface();
-      let sessionAuthenticated = false;
-      let sessionCheckError = null;
-      if (new URL(initialSurface.url).origin === expectedUrl.origin) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), ${CHATGPT_AUTH_SESSION_TIMEOUT_MS});
-        let responseReceived = false;
-        try {
-          const response = await fetch("/api/auth/session", {
-            credentials: "include",
-            cache: "no-store",
-            headers: { accept: "application/json" },
-            signal: controller.signal,
-          });
-          responseReceived = true;
-          const responseUrl = new URL(response.url);
-          let payload = null;
-          if (responseUrl.origin !== expectedUrl.origin || responseUrl.pathname !== "/api/auth/session") {
-            sessionCheckError = "ChatGPT session verification received an unexpected response. Check your connection and retry.";
-          } else if (response.status !== 401) {
-            if (!response.ok) {
-              sessionCheckError = "ChatGPT session verification failed (HTTP " + response.status + "). Check your connection and retry.";
-            } else if (!response.headers.get("content-type")?.includes("application/json")) {
+        const initialSurface = readSurface();
+        let sessionAuthenticated = false;
+        let sessionCheckError = null;
+        if (new URL(initialSurface.url).origin === expectedUrl.origin) {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), ${CHATGPT_AUTH_SESSION_TIMEOUT_MS});
+          let responseReceived = false;
+          try {
+            const response = await fetch("/api/auth/session", {
+              credentials: "include",
+              cache: "no-store",
+              headers: { accept: "application/json" },
+              signal: controller.signal,
+            });
+            responseReceived = true;
+            const responseUrl = new URL(response.url);
+            let payload = null;
+            if (responseUrl.origin !== expectedUrl.origin || responseUrl.pathname !== "/api/auth/session") {
               sessionCheckError = "ChatGPT session verification received an unexpected response. Check your connection and retry.";
-            } else {
-              payload = await response.json();
-              if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-                sessionCheckError = "ChatGPT session verification received an invalid response. Retry after the page finishes loading.";
+            } else if (response.status !== 401) {
+              if (!response.ok) {
+                sessionCheckError = "ChatGPT session verification failed (HTTP " + response.status + "). Check your connection and retry.";
+              } else if (!response.headers.get("content-type")?.includes("application/json")) {
+                sessionCheckError = "ChatGPT session verification received an unexpected response. Check your connection and retry.";
+              } else {
+                payload = await response.json();
+                if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+                  sessionCheckError = "ChatGPT session verification received an invalid response. Retry after the page finishes loading.";
+                }
               }
             }
+            const user = payload?.user && typeof payload.user === "object" && !Array.isArray(payload.user)
+              ? payload.user
+              : null;
+            const sessionHasUser = user !== null && Object.keys(user).length > 0;
+            const sessionHasNoError = payload?.error === undefined || payload.error === null || payload.error === "";
+            const sessionExpiryIsValid = payload?.expires === undefined || payload.expires === null
+              ? true
+              : typeof payload.expires === "string"
+                && Number.isFinite(Date.parse(payload.expires))
+                && Date.parse(payload.expires) > Date.now();
+            sessionAuthenticated = sessionHasUser
+              && sessionHasNoError
+              && sessionExpiryIsValid;
+          } catch {
+            sessionCheckError = controller.signal.aborted
+              ? "ChatGPT session verification timed out. Check your network or proxy and retry."
+              : responseReceived
+                ? "ChatGPT session verification received an invalid response. Retry after the page finishes loading."
+                : "ChatGPT session verification failed. Check your network or proxy and retry.";
           }
-          const user = payload?.user && typeof payload.user === "object" && !Array.isArray(payload.user)
-            ? payload.user
-            : null;
-          const sessionHasUser = user !== null && Object.keys(user).length > 0;
-          const sessionHasNoError = payload?.error === undefined || payload.error === null || payload.error === "";
-          const sessionExpiryIsValid = payload?.expires === undefined || payload.expires === null
-            ? true
-            : typeof payload.expires === "string"
-              && Number.isFinite(Date.parse(payload.expires))
-              && Date.parse(payload.expires) > Date.now();
-          sessionAuthenticated = sessionHasUser
-            && sessionHasNoError
-            && sessionExpiryIsValid;
-        } catch {
-          sessionCheckError = controller.signal.aborted
-            ? "ChatGPT session verification timed out. Check your network or proxy and retry."
-            : responseReceived
-              ? "ChatGPT session verification received an invalid response. Retry after the page finishes loading."
-              : "ChatGPT session verification failed. Check your network or proxy and retry.";
+          finally { clearTimeout(timeout); }
         }
-        finally { clearTimeout(timeout); }
+        return { ...readSurface(), sessionAuthenticated, sessionCheckError };
+      })()`, true).catch(() => ({
+        url: "",
+        composer: false,
+        temporary: false,
+        sessionAuthenticated: false,
+        sessionCheckError: "ChatGPT session verification could not inspect the browser. Retry after the page finishes loading.",
+        readyState: "unknown",
+      }));
+      let result = await probe(this.view.webContents);
+      if (!(result.composer && result.temporary && result.sessionAuthenticated)
+        && this.authView
+        && !this.authView.webContents.isDestroyed()) {
+        const authResult = await probe(this.authView.webContents);
+        if (authResult.sessionAuthenticated) {
+          const completedAuthView = this.authView;
+          this.closeAuthView(completedAuthView, true, false);
+          await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+          url = this.view.webContents.getURL();
+          result = await probe(this.view.webContents);
+        }
       }
-      return { ...readSurface(), sessionAuthenticated, sessionCheckError };
-    })()`, true).catch(() => ({
-      url: "",
-      composer: false,
-      temporary: false,
-      sessionAuthenticated: false,
-      sessionCheckError: "ChatGPT session verification could not inspect the browser. Retry after the page finishes loading.",
-      readyState: "unknown",
-    }));
-    let result = await probe(this.view.webContents);
-    if (!(result.composer && result.temporary && result.sessionAuthenticated)
-      && this.authView
-      && !this.authView.webContents.isDestroyed()) {
-      const authResult = await probe(this.authView.webContents);
-      if (authResult.sessionAuthenticated) {
-        const completedAuthView = this.authView;
-        this.closeAuthView(completedAuthView, true, false);
+      if (this.manualOperation === "ChatGPT login"
+        && result.sessionAuthenticated
+        && !result.temporary
+        && !this.view.webContents.isDestroyed()) {
         await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
         url = this.view.webContents.getURL();
         result = await probe(this.view.webContents);
@@ -2845,26 +2860,13 @@ class BrowserHost {
           url: result.url || url,
         });
       }
-      const wasAuthenticated = this.state.authenticated;
-      const availability = this.activeTraceId
-        ? { status: "running", message: "ChatGPT is working" }
-        : this.manualOperation
-          ? {}
-          : { status: "ready", message: "ChatGPT is ready" };
-      this.setState({ ...availability, authenticated: true, url: result.url });
-      if (!wasAuthenticated) this.logger.info("browser.authenticated", { url: result.url });
-    } else if (result.sessionCheckError) {
-      this.setState({ status: "error", message: result.sessionCheckError, authenticated: false, url: result.url || url });
-    } else {
-      const loaded = result.readyState === "complete";
-      this.setState({
-        status: loaded ? "signed-out" : "loading",
-        message: loaded ? "Sign in to ChatGPT" : "Waiting for ChatGPT",
-        authenticated: false,
-        url: result.url || url,
-      });
-    }
-    return this.snapshot();
+      return this.snapshot();
+    })();
+    const tracked = operation.finally(() => {
+      if (this.authenticationProbe === tracked) this.authenticationProbe = null;
+    });
+    this.authenticationProbe = tracked;
+    return tracked;
   }
 
   async waitForAuthenticated(timeoutMs = 180_000) {

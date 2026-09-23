@@ -737,6 +737,19 @@ function LauncherShell({
             {surface === "activity" ? (
               <ActivitySurface copy={copy} language={language} logs={logs} setError={setError} />
             ) : null}
+            {surface === "limits" ? (
+              <LimitsSurface
+                api={api!}
+                tracker={limits}
+                language={language}
+                manualMode={snapshot.state.browserInteractionMode === "manual"}
+                runtimeBusy={operation?.status === "running"
+                  || browser?.status === "running" || browser?.status === "testing" || browser?.status === "loading"
+                  || browser?.loading === true
+                  || browser?.tabs.some((tab) => tab.status === "running" || tab.status === "testing" || tab.loading) === true}
+                setError={setError}
+              />
+            ) : null}
             {surface === "accounts" ? (
               <AccountSwitcherSurface
                 copy={copy}

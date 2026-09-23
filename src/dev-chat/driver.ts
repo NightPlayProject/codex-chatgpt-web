@@ -406,7 +406,6 @@ export function createLauncherDevAdapter(
       ...(config.experimentalBiggerContext
         ? { experimentalBiggerContext: true }
         : {}),
-      experimentalSkillAttachments: config.experimentalSkillAttachments,
     },
   }, { broker });
   return { broker, adapterFactory };

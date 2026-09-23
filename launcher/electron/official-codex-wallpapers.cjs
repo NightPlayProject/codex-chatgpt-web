@@ -8,11 +8,167 @@ const { createWallpaperManager, wallpaperDataRoot } = require("./wallpapers.cjs"
 const execFileAsync = promisify(execFile);
 const TARGET_REFRESH_INTERVAL_MS = 2_000;
 const RESTART_POLL_INTERVAL_MS = 2_000;
+const RATE_LIMIT_STALE_CONFIRM_MS = 1_500;
+const RATE_LIMIT_USAGE_RECHECK_MS = 30_000;
+const RATE_LIMIT_RECOVERY_COOLDOWN_MS = 60_000;
 const ENDPOINT_CONNECT_TIMEOUT_MS = 40_000;
 const ENDPOINT_POLL_INTERVAL_MS = 400;
 const POWERSHELL_TIMEOUT_MS = 12_000;
 const CDP_CALL_TIMEOUT_MS = 20_000;
 const TARGET_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
+  const roots = [...document.querySelectorAll('form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]')];
+  const visible = element => {
+    if (!(element instanceof Element)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const root = roots.filter(visible).at(-1) || null;
+  const button = root?.querySelector('button[type="submit"]') || null;
+  const chatGptWebSelected = root instanceof Element && [...root.querySelectorAll('button')]
+    .filter(candidate => candidate !== button && visible(candidate))
+    .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
+  const editor = root?.querySelector('#prompt-textarea, [contenteditable="true"]') || null;
+  const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
+  const hasAttachments = root instanceof Element && root.querySelector('.composer-attachment-surface') != null;
+  return {
+    rateLimitBlocked: button instanceof HTMLButtonElement
+      && button.getAttribute('aria-disabled') === 'true',
+    providerGateUnlocked: button instanceof HTMLButtonElement
+      && button.getAttribute('data-cw-chatgpt-web-quota-unlock') === 'true',
+    chatGptWebSelected,
+    hasSendableContent: editorText.trim().length > 0 || hasAttachments,
+    hasAttachments,
+  };
+})()`;
+
+const RATE_LIMIT_GATE_RECOVERY_SCRIPT = String.raw`(() => {
+  const roots = [...document.querySelectorAll('form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]')];
+  const visible = element => {
+    if (!(element instanceof Element)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const root = roots.filter(visible).at(-1) || null;
+  const button = root?.querySelector('button[type="submit"][aria-disabled="true"]') || null;
+  const stillRateLimited = button instanceof HTMLButtonElement && button.disabled === false;
+  if (!stillRateLimited || root.querySelector('.composer-attachment-surface') != null) return false;
+  location.reload();
+  return true;
+})()`;
+
+function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
+  const blocked = nativeQuotaBlocked === true ? "true" : "false";
+  return String.raw`(() => {
+    const key = '__codexWebGptProviderRateLimitGate';
+    let state = globalThis[key];
+    if (!state || state.version !== 2 || typeof state.sync !== 'function') {
+      try { state?.observer?.disconnect?.(); } catch {}
+      state = {
+        version: 2,
+        nativeQuotaBlocked: false,
+        scheduled: false,
+        observer: null,
+        sync: null,
+        schedule: null,
+      };
+      const visible = element => {
+        if (!(element instanceof Element)) return false;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      state.sync = () => {
+        const roots = [...document.querySelectorAll('form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]')];
+        const root = roots.filter(visible).at(-1) || null;
+        const button = root?.querySelector('button[type="submit"]') || null;
+        if (!(root instanceof Element) || !(button instanceof HTMLButtonElement)) {
+          return { managed: false, unlocked: false, selected: false, sendable: false };
+        }
+        const selected = [...root.querySelectorAll('button')]
+          .filter(candidate => candidate !== button && visible(candidate))
+          .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
+        const editor = root.querySelector('#prompt-textarea, [contenteditable="true"]');
+        const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
+        const hasAttachments = root.querySelector('.composer-attachment-surface') != null;
+        const sendable = editorText.trim().length > 0 || hasAttachments;
+        const marked = button.getAttribute('data-cw-chatgpt-web-quota-unlock') === 'true';
+        const shouldUnlock = state.nativeQuotaBlocked === true
+          && selected
+          && sendable;
+        if (shouldUnlock) {
+          if (!marked) {
+            button.setAttribute(
+              'data-cw-chatgpt-web-quota-original-disabled',
+              button.disabled === true ? 'true' : 'false',
+            );
+            const originalAriaDisabled = button.getAttribute('aria-disabled');
+            button.setAttribute(
+              'data-cw-chatgpt-web-quota-original-aria-disabled',
+              originalAriaDisabled == null ? '__null__' : originalAriaDisabled,
+            );
+          }
+          button.setAttribute('data-cw-chatgpt-web-quota-unlock', 'true');
+          button.disabled = false;
+          button.setAttribute('aria-disabled', 'false');
+        } else if (!shouldUnlock && marked) {
+          button.disabled = button.getAttribute('data-cw-chatgpt-web-quota-original-disabled') === 'true';
+          const originalAriaDisabled = button.getAttribute('data-cw-chatgpt-web-quota-original-aria-disabled');
+          if (originalAriaDisabled === '__null__') {
+            button.removeAttribute('aria-disabled');
+          } else if (originalAriaDisabled != null) {
+            button.setAttribute('aria-disabled', originalAriaDisabled);
+          }
+          button.removeAttribute('data-cw-chatgpt-web-quota-unlock');
+          button.removeAttribute('data-cw-chatgpt-web-quota-original-disabled');
+          button.removeAttribute('data-cw-chatgpt-web-quota-original-aria-disabled');
+        }
+        return {
+          managed: button.getAttribute('data-cw-chatgpt-web-quota-unlock') === 'true',
+          unlocked: button.disabled === false && button.getAttribute('aria-disabled') !== 'true',
+          selected,
+          sendable,
+        };
+      };
+      state.schedule = () => {
+        if (state.scheduled) return;
+        state.scheduled = true;
+        queueMicrotask(() => {
+          state.scheduled = false;
+          try { state.sync(); } catch {}
+        });
+      };
+      state.observer = new MutationObserver(state.schedule);
+      state.observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['aria-disabled', 'disabled', 'class'],
+      });
+      globalThis[key] = state;
+    }
+    state.nativeQuotaBlocked = ${blocked};
+    return state.sync();
+  })()`;
+}
+
+function usageShowsNativeQuotaExhaustion(usage) {
+  if (!usage || usage.available !== true) return false;
+  const windows = [usage.primaryUsedPercent, usage.secondaryUsedPercent]
+    .filter(value => Number.isFinite(value));
+  return windows.length > 0 && windows.some(value => value >= 100);
+}
+
+function usageAllowsRateLimitRecovery(usage) {
+  if (!usage || usage.available !== true) return false;
+  const windows = [usage.primaryUsedPercent, usage.secondaryUsedPercent]
+    .filter(value => Number.isFinite(value));
+  return windows.length > 0 && windows.every(value => value < 100);
+}
 
 const STORE_IDENTITY_SCRIPT = String.raw`
 $ErrorActionPreference='Stop'
@@ -357,6 +513,8 @@ function createOfficialCodexWallpaperController({
   discoverTargets = discoverOfficialTargets,
   WebSocketImpl = globalThis.WebSocket,
   onStatus = () => {},
+  getCurrentUsage = async () => null,
+  now = () => Date.now(),
   refreshIntervalMs = TARGET_REFRESH_INTERVAL_MS,
   restartPollIntervalMs = RESTART_POLL_INTERVAL_MS,
 } = {}) {
@@ -375,6 +533,93 @@ function createOfficialCodexWallpaperController({
   let restartRequired = false;
   let lastError = null;
   let restartBaseline = null;
+
+  const readRateLimitUsage = async (entry, targetId, checkedAt) => {
+    if ((entry.rateLimitUsageCheckedAt || 0) > 0
+      && checkedAt - entry.rateLimitUsageCheckedAt < RATE_LIMIT_USAGE_RECHECK_MS) {
+      return entry.rateLimitUsage ?? null;
+    }
+    entry.rateLimitUsageCheckedAt = checkedAt;
+    const usage = await getCurrentUsage().catch(error => {
+      logger.warn("wallpapers.official_codex_rate_limit_usage_failed", {
+        targetId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    entry.rateLimitUsage = usage;
+    if (usage?.available === true
+      && [usage.primaryUsedPercent, usage.secondaryUsedPercent].some(value => Number.isFinite(value))) {
+      entry.nativeQuotaBlocked = usageShowsNativeQuotaExhaustion(usage);
+    }
+    return usage;
+  };
+
+  const maybeRecoverStaleRateLimit = async (entry, targetId) => {
+    const checkedAt = now();
+    const probe = await entry.contents.executeJavaScript(RATE_LIMIT_GATE_PROBE_SCRIPT);
+    if (!probe) {
+      entry.rateLimitBlockedSince = null;
+      return false;
+    }
+
+    const providerGateCandidate = probe.chatGptWebSelected === true
+      && probe.hasSendableContent === true
+      && (probe.rateLimitBlocked === true || probe.providerGateUnlocked === true);
+    let usage = null;
+    if (providerGateCandidate) {
+      usage = await readRateLimitUsage(entry, targetId, checkedAt);
+      if (entry.nativeQuotaBlocked === true) {
+        const gate = await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(true));
+        entry.rateLimitBlockedSince = null;
+        if (gate?.managed === true && entry.providerGateActive !== true) {
+          entry.providerGateActive = true;
+          logger.info("wallpapers.official_codex_chatgpt_web_rate_limit_gate_unlocked", {
+            targetId,
+            usageFetchedAt: usage?.fetchedAt ?? null,
+            primaryUsedPercent: usage?.primaryUsedPercent ?? null,
+            secondaryUsedPercent: usage?.secondaryUsedPercent ?? null,
+          });
+        }
+        return gate?.unlocked === true;
+      }
+      if (probe.providerGateUnlocked === true) {
+        await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false));
+        entry.providerGateActive = false;
+      }
+    } else if (probe.providerGateUnlocked === true) {
+      // A native model must never inherit the ChatGPT Web override. The renderer-side
+      // observer normally restores this immediately on model switch; this is a bounded
+      // fallback if React replaced the model control before the observer ran.
+      await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false));
+      entry.providerGateActive = false;
+    }
+
+    const rateLimitBlocked = probe.rateLimitBlocked === true
+      || (probe.providerGateUnlocked === true && entry.nativeQuotaBlocked === false);
+    if (!rateLimitBlocked) {
+      entry.rateLimitBlockedSince = null;
+      return false;
+    }
+    entry.rateLimitBlockedSince ??= checkedAt;
+    if (probe.hasAttachments === true) return false;
+    if (checkedAt - entry.rateLimitBlockedSince < RATE_LIMIT_STALE_CONFIRM_MS) return false;
+    if ((entry.rateLimitRecoveryCooldownUntil || 0) > checkedAt) return false;
+    usage ??= await readRateLimitUsage(entry, targetId, checkedAt);
+    if (!usageAllowsRateLimitRecovery(usage)) return false;
+    entry.rateLimitRecoveryCooldownUntil = checkedAt + RATE_LIMIT_RECOVERY_COOLDOWN_MS;
+    const recovered = await entry.contents.executeJavaScript(RATE_LIMIT_GATE_RECOVERY_SCRIPT);
+    if (recovered !== true) return false;
+    entry.generation = null;
+    entry.rateLimitBlockedSince = null;
+    logger.info("wallpapers.official_codex_rate_limit_state_refreshed", {
+      targetId,
+      usageFetchedAt: usage?.fetchedAt ?? null,
+      primaryUsedPercent: usage?.primaryUsedPercent ?? null,
+      secondaryUsedPercent: usage?.secondaryUsedPercent ?? null,
+    });
+    return true;
+  };
 
   const publish = patch => {
     if (typeof patch.status === "string") status = patch.status;
@@ -425,7 +670,16 @@ function createOfficialCodexWallpaperController({
       for (const target of targets) {
         let entry = sessions.get(target.id);
         if (!entry || entry.contents.isDestroyed()) {
-          entry = { contents: new CdpContents(target.webSocketUrl, WebSocketImpl), generation: null };
+          entry = {
+            contents: new CdpContents(target.webSocketUrl, WebSocketImpl),
+            generation: null,
+            rateLimitBlockedSince: null,
+            rateLimitUsageCheckedAt: 0,
+            rateLimitUsage: null,
+            nativeQuotaBlocked: null,
+            providerGateActive: false,
+            rateLimitRecoveryCooldownUntil: 0,
+          };
           sessions.set(target.id, entry);
         }
         try {
@@ -441,6 +695,7 @@ function createOfficialCodexWallpaperController({
               injected: result?.injected === true,
             });
           }
+          await maybeRecoverStaleRateLimit(entry, target.id);
         } catch (error) {
           logger.warn("wallpapers.official_codex_target_failed", {
             targetId: target.id,
@@ -662,6 +917,11 @@ function createOfficialCodexWallpaperController({
 module.exports = {
   CdpContents,
   ENDPOINT_CONNECT_TIMEOUT_MS,
+  RATE_LIMIT_GATE_PROBE_SCRIPT,
+  RATE_LIMIT_GATE_RECOVERY_SCRIPT,
+  RATE_LIMIT_RECOVERY_COOLDOWN_MS,
+  RATE_LIMIT_STALE_CONFIRM_MS,
+  RATE_LIMIT_USAGE_RECHECK_MS,
   RESTART_POLL_INTERVAL_MS,
   TARGET_REFRESH_INTERVAL_MS,
   browserIdFromVersionPayload,
@@ -673,7 +933,10 @@ module.exports = {
   launchOfficialCodexApplication,
   listOfficialCodexProcesses,
   officialAppTarget,
+  providerAwareRateLimitGateScript,
   resolveOfficialCodexIdentity,
+  usageAllowsRateLimitRecovery,
+  usageShowsNativeQuotaExhaustion,
   validateOfficialEndpoint,
   waitForOfficialEndpoint,
 };

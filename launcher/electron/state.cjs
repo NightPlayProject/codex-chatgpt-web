@@ -19,6 +19,8 @@ const DEFAULT_STATE = Object.freeze({
   browserInteractionMode: "automatic",
   experimentalBiggerContext: false,
   experimentalSkillAttachments: false,
+  experimentalFreshConversationPerTurn: false,
+  useSavedChats: false,
   zeroRiskProEnabled: false,
   codexWallpapersEnabled: false,
   codexWallpapersRestartRequired: false,
@@ -44,7 +46,7 @@ function readState(filePath) {
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
     delete state.codexRouterEnabled;
-    if (state.language !== null && state.language !== "en" && state.language !== "zh-CN" && state.language !== "ja") {
+    if (state.language !== null && (typeof state.language !== "string" || !Object.hasOwn(languages, state.language))) {
       state.language = DEFAULT_STATE.language;
     }
     for (const key of [
@@ -56,6 +58,8 @@ function readState(filePath) {
       "showBrowserDuringTurns",
       "experimentalBiggerContext",
       "experimentalSkillAttachments",
+      "experimentalFreshConversationPerTurn",
+      "useSavedChats",
       "zeroRiskProEnabled",
       "codexWallpapersEnabled",
       "codexWallpapersRestartRequired",

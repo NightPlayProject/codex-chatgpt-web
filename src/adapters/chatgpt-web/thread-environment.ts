@@ -11,6 +11,7 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
+  hasChatGptCalendarEnvironmentDelta,
   hasCurrentChatGptFilesystemEnvironmentContext,
   hasRawChatGptFilesystemEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
@@ -166,11 +167,17 @@ export class ChatGptThreadEnvironmentStore {
       const currentContinuation = currentCompaction || currentGoal;
       const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+      const steeringClaim = hasCurrentFilesystemContext && !currentContinuation
+        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
+      const calendarDelta = hasCurrentFilesystemContext && !currentContinuation
+        && hasChatGptCalendarEnvironmentDelta(parsed);
       const blockedCurrentFilesystemFallback = hasCurrentFilesystemContext
         && !currentContinuation
-        && !historicalMessages;
+        && !historicalMessages
+        && !steeringClaim
+        && !calendarDelta;
       if (blockedCurrentFilesystemFallback && !options.allowCurrentFilesystemRolloutRecovery) throw error;
-      const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+      const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.

@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
-import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -27,9 +26,10 @@ test("daemon streams browser lifecycle through the real helper process", async (
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
-      if (prepared.multipart.parts.length !== 3) throw new Error("Multipart context was lost");
-      await turn.onMultipartStageAcknowledged?.(1);
-      await turn.onMultipartStageAcknowledged?.(2);
+      if (prepared.multipart.parts.length !== 6) throw new Error("Multipart context was lost");
+      for (let index = 1; index < prepared.multipart.parts.length; index++) {
+        await turn.onMultipartStageAcknowledged?.(index);
+      }
       await turn.onSendActivated();
       turn.onSubmitted();
       turn.onReasoningSummary("Reading project");
@@ -105,7 +105,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
           timestamp: 0,
           content: "<skill>\n<name>ipc</name>\n<path>/skills/ipc/SKILL.md</path>\ncheck IPC\n</skill>",
         })],
-        multipart: { parts: ["part one", "part two", "part three"], commit: "inspect" },
+        multipart: { parts: ["part one", "part two", "part three", "part four", "part five", "part six"], commit: "inspect" },
         release: () => { released = true; },
       }),
       onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
@@ -426,6 +426,7 @@ test("an older helper cannot silently drop selected skill files and releases the
     chromeExecutablePath: "/durable/chrome",
     headed: true,
     autoApproveToolCalls: false,
+    useSavedChats: false,
   });
   const internal = client as unknown as {
     child: unknown;

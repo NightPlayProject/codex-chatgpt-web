@@ -237,12 +237,15 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
 
 function reasoningPicker(options: {
   max?: string;
+  locks?: Array<string | null>;
   delay?: number;
   missing?: boolean;
   proRow?: "enabled" | "disabled" | "missing";
+  loseSelectionOnClose?: boolean;
 } = {}) {
   let value = 0;
   let proClicked = false;
+  let opened = true;
   const keys: string[] = [];
   const hidden = {
     filter() { return this; }, last() { return this; }, getByText() { return this; },
@@ -287,7 +290,10 @@ function reasoningPicker(options: {
     innerText: async () => opened ? "Thinking effort" : ["Instant", "Medium", "High", "Extra High", "Pro"][value]!,
     getAttribute: async (name: string) => name === "aria-expanded" ? String(opened) : null,
   };
-  const composer = { filter() { return this; }, last() { return this; }, isEditable: async () => true, locator: () => ({ locator: () => control }) };
+  const composer = {
+    filter() { return this; }, last() { return this; }, isEditable: async () => true,
+    locator: () => ({ locator: () => control }),
+  };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
   const proRow = {
     filter() { return this; },
@@ -344,7 +350,8 @@ test("Pro selection changes the hidden slider through its visible owner, never t
   const select = (ChatGptBrowserWorker.prototype as unknown as {
     selectModelAndEffort(...args: unknown[]): Promise<unknown>;
   }).selectModelAndEffort;
-  await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { activeComposer: async () => fixture.composer });
+  await select.call(worker, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
   expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
   expect(fixture.value()).toBe(4);
 });
@@ -354,7 +361,8 @@ test("Pro selection uses the enabled Pro picker row when it is no longer the fif
   const select = (ChatGptBrowserWorker.prototype as unknown as {
     selectModelAndEffort(...args: unknown[]): Promise<unknown>;
   }).selectModelAndEffort;
-  await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { activeComposer: async () => fixture.composer });
+  await select.call(worker, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
   expect(fixture.keys).toEqual([]);
   expect(fixture.proClicked()).toBe(true);
 });

@@ -8,7 +8,7 @@ import type { ChatGptTurnIdentity, ChatGptTurnUserRevision } from "./environment
 interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
-  source: ChatGptTurnUserRevision;
+  source?: ChatGptTurnUserRevision;
 }
 
 interface PersistedCheckpoint {
@@ -147,12 +147,13 @@ export class ChatGptCompactionContinuationStore {
     summary: string,
   ): void {
     const key = scope(parsed, identity);
-    if (!key || !parsed._compactionRequest || !summary) return;
+    if (!key || !parsed._compactionRequest || !summary || !sources[0]) return;
     this.load();
     this.checkpoints.delete(key);
     this.checkpoints.set(key, {
       summaryHash: digest(summary),
       sourceHashes: new Set(sources.map(sourceDigest)),
+      source: structuredClone(sources[0]),
     });
     while (this.checkpoints.size > MAX_CHECKPOINTS) {
       const oldest = this.checkpoints.keys().next().value as string | undefined;
@@ -174,6 +175,38 @@ export class ChatGptCompactionContinuationStore {
     if (!checkpoint || !checkpoint.sourceHashes.has(sourceDigest(source))) return false;
     const summary = latestCompactionSummary(parsed);
     return summary !== undefined && this.acceptsSummary(key, checkpoint, summary);
+  }
+
+  recover(
+    parsed: CodexParsedRequest,
+    identity: ChatGptTurnIdentity,
+  ): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
+    const key = scope(parsed, identity);
+    if (!key) return undefined;
+    this.load();
+    const checkpoint = this.checkpoints.get(key);
+    if (!checkpoint?.source) return undefined;
+    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+    if (!Array.isArray(input)) return undefined;
+    for (let index = input.length - 1; index >= 0; index -= 1) {
+      const item = input[index] as Record<string, unknown> | null;
+      if (!item || typeof item !== "object") continue;
+      let summary: string | null;
+      if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) {
+        summary = typeof item.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null;
+      } else {
+        if (item.type !== "message" || item.role !== "user") continue;
+        const text = typeof item.content === "string" ? item.content : Array.isArray(item.content)
+          ? item.content.map(part => (part as { text?: string } | null)?.text ?? "").join("\n") : "";
+        if (!isReadableCompactionSummaryText(text)) continue;
+        summary = text.slice(SUMMARY_PREFIX.length + 1);
+      }
+      const owner = (item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined)?.turn_id;
+      if (owner !== undefined && owner !== identity.turnId) return undefined;
+      if (summary === null || !this.acceptsSummary(key, checkpoint, summary)) return undefined;
+      return { source: structuredClone(checkpoint.source), summaryIndex: index };
+    }
+    return undefined;
   }
 
   /**
@@ -307,6 +340,13 @@ export function isAcceptedCompactionContinuation(
   source: ChatGptTurnUserRevision,
 ): boolean {
   return storeFor(parsed).accepts(parsed, identity, source);
+}
+
+export function recoverCompactionInstruction(
+  parsed: CodexParsedRequest,
+  identity: ChatGptTurnIdentity,
+): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
+  return storeFor(parsed).recover(parsed, identity);
 }
 
 export function matchingCompactionCheckpoint(

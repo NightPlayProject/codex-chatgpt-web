@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BIGGER_CONTEXT_PARTS } from "../src/adapters/chatgpt-web/prompt";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   LATEST_USER_PROMPT_MARKER,
@@ -1371,7 +1372,7 @@ test.each([false, true])("structured compact rebuilds canonical context when its
     expect(contextText).toContain("Original task");
     expect(contextText).toContain("Continue with the next step");
     if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(6);
+      expect(prepared.multipart!.parts).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS);
       expect(prepared.trimmedCompactionMessages).toBeUndefined();
       const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
       expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);

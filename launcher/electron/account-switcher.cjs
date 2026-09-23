@@ -750,6 +750,21 @@ async function fetchAccountUsage(account) {
   return { usage, stats };
 }
 
+async function fetchAccountUsageSnapshot(account) {
+  const fetchedAt = new Date().toISOString();
+  const data = accountAuthData(account);
+  if (!data || data.mode !== "chatgpt") {
+    return emptyUsage("Usage is available for ChatGPT OAuth accounts only", fetchedAt);
+  }
+  const accountId = data.accountId || claimsFromToken(data.idToken || data.accessToken).accountId;
+  try {
+    const payload = await requestJson(CHATGPT_USAGE_URL, data.accessToken, accountId);
+    return mapUsagePayload(payload, fetchedAt);
+  } catch (error) {
+    return emptyUsage(safeErrorMessage(error), fetchedAt);
+  }
+}
+
 function safeErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /HTTP \d+/.test(message) || /timed out|unavailable/i.test(message)
@@ -962,6 +977,21 @@ function createAccountSwitcher({
       usageRefreshPromise = null;
     });
     return usageRefreshPromise;
+  }
+
+  async function currentUsage() {
+    if (platform !== "win32") {
+      return emptyUsage("Usage refresh is currently available on Windows only", new Date().toISOString());
+    }
+    const auth = readAuthFile(authPath);
+    if (!auth) {
+      return emptyUsage("No official Codex account is signed in", new Date().toISOString());
+    }
+    try {
+      return fetchAccountUsageSnapshot(accountRecordFromAuthJson(auth, "Current Codex session"));
+    } catch (error) {
+      return emptyUsage(safeErrorMessage(error), new Date().toISOString());
+    }
   }
 
   function addAccountToStore(store, account) {
@@ -1291,6 +1321,7 @@ function createAccountSwitcher({
     switchAccount,
     removeAccount,
     currentOperation() { return operation; },
+    currentUsage,
     refreshUsage: refreshUsageNow,
     paths: { accountStore: resolvedStorePath, auth: authPath, activity: resolvedActivityPath, usage: resolvedUsageCachePath },
   };

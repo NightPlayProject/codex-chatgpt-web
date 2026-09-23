@@ -20,6 +20,9 @@ const {
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
+const { LimitsController } = require("./limits-controller.cjs");
+const { SOURCE_URL: LIMITS_SOURCE_URL } = require("./limits-store.cjs");
+const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { createAccountSwitcher } = require("./account-switcher.cjs");
 const { createOfficialCodexWallpaperController } = require("./official-codex-wallpapers.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
@@ -61,7 +64,7 @@ const CONNECTORS_URL = "https://chatgpt.com/#settings/Plugins";
 const TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels";
 const KEYS_URL = "https://platform.openai.com/settings/organization/api-keys";
 const CODEX_SWITCHER_URL = "https://github.com/Lampese/codex-switcher";
-const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL, CODEX_SWITCHER_URL]);
+const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL, LIMITS_SOURCE_URL, CODEX_SWITCHER_URL]);
 const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
 const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
 
@@ -250,6 +253,10 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "Remove Codex Web GPT",
     removeMessage: "Remove the ChatGPT Web models from Codex and restore the previous model route?",
     removeDetail: "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+    retry: "Retry",
+    startupTitle: "Codex Web GPT could not start",
+    startupDetail: "Retry starts the launcher again without changing your saved settings or ChatGPT profile.",
+    startupCleanupFailed: "Startup cleanup failed",
     catalogFailure: "Codex reached the launcher, but loading its model catalog failed (HTTP {status}; {reason}). Check Activity for details and export a safe log if it persists.",
   }),
   "zh-CN": Object.freeze({
@@ -261,6 +268,10 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "移除 Codex Web GPT",
     removeMessage: "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？",
     removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
+    retry: "重试",
+    startupTitle: "Codex Web GPT 无法启动",
+    startupDetail: "重试会重新启动应用，不会更改已保存的设置或 ChatGPT 登录配置。",
+    startupCleanupFailed: "启动清理失败",
     catalogFailure: "Codex 已连接到启动器，但模型列表加载失败（HTTP {status}；{reason}）。请查看“活动”了解详情；若问题持续，请导出安全日志。",
   }),
   "zh-TW": Object.freeze({
@@ -287,7 +298,26 @@ const NATIVE_COPY = Object.freeze({
     removeTitle: "Codex Web GPT を削除",
     removeMessage: "Codex から ChatGPT Web モデルを削除し、以前のモデルルートを復元しますか？",
     removeDetail: "ランチャーの ChatGPT ログインプロファイルは保持されます。Codex を一度再起動する必要があります。",
+    retry: "再試行",
+    startupTitle: "Codex Web GPT を起動できませんでした",
+    startupDetail: "保存済みの設定と ChatGPT プロファイルを変更せずに、ランチャーを再起動します。",
+    startupCleanupFailed: "起動後のクリーンアップに失敗しました",
     catalogFailure: "Codex はランチャーに接続しましたが、モデル一覧を読み込めませんでした（HTTP {status}、{reason}）。「アクティビティ」で詳細を確認し、問題が続く場合は安全なログをエクスポートしてください。",
+  }),
+  "ko": Object.freeze({
+    openLauncher: "Codex Web GPT 열기",
+    quit: "종료",
+    exportDiagnostics: "개인정보가 보호된 진단 정보 내보내기",
+    cancel: "취소",
+    remove: "제거",
+    removeTitle: "Codex Web GPT 제거",
+    removeMessage: "Codex에서 ChatGPT Web 모델을 제거하고 이전 모델 경로를 복원할까요?",
+    removeDetail: "런처의 ChatGPT 로그인 프로필은 유지됩니다. Codex를 한 번 다시 시작해야 합니다.",
+    retry: "다시 시도",
+    startupTitle: "Codex Web GPT를 시작할 수 없습니다",
+    startupDetail: "저장된 설정이나 ChatGPT 프로필을 변경하지 않고 런처를 다시 시작합니다.",
+    startupCleanupFailed: "시작 정리에 실패했습니다",
+    catalogFailure: "Codex가 런처에 연결했지만 모델 목록을 불러오지 못했습니다(HTTP {status}; {reason}). 활동에서 세부 정보를 확인하고 문제가 계속되면 안전한 로그를 내보내 주세요.",
   }),
 });
 
@@ -508,6 +538,11 @@ function syncFreshConversationPreference(stateStore, config) {
 
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
+  handle("launcher:limits", () => limitsController.snapshot());
+  handle("launcher:limits-setup", async () => {
+    if (runtimeHost.currentOperation()) throw new Error("Finish the current launcher operation before checking Limits.");
+    return limitsController.setup(() => browserHost.inspectLimitsPlan());
+  });
   const refreshAccountsInBackground = () => {
     if (!accountSwitcher) return;
     void accountSwitcher.refreshUsage()
@@ -898,6 +933,20 @@ function registerIpc({ logger, stateStore }) {
     send("launcher:state-changed", state);
     return state;
   });
+  handle("launcher:fresh-conversation-per-turn", async (_event, enabled) => {
+    if (browserHost.activeTraceId || browserHost.currentOperation()) {
+      throw new Error("Finish or cancel active ChatGPT turns before changing browser conversation retention");
+    }
+    await runtimeHost.setFreshConversationPerTurn(enabled);
+    return syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config);
+  });
+  handle("launcher:use-saved-chats", async (_event, enabled) => {
+    if (browserHost.activeTraceId || browserHost.currentOperation()) {
+      throw new Error("Finish or cancel active ChatGPT turns before changing saved chats");
+    }
+    await runtimeHost.setUseSavedChats(enabled);
+    return syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config);
+  });
   handle("launcher:zero-risk-pro", async (_event, enabled) => {
     const browserOperation = browserHost.currentOperation();
     if (browserHost.activeTraceId || browserOperation) {
@@ -1199,6 +1248,7 @@ async function start() {
   officialCodexWallpaperController = createOfficialCodexWallpaperController({
     logger,
     onStatus: status => persistOfficialCodexWallpaperStatus({ stateStore, status }),
+    getCurrentUsage: async () => accountSwitcher?.currentUsage?.() ?? null,
   });
   accountSwitcher = createAccountSwitcher({
     platform: IS_DEV_PROFILE ? "dev" : process.platform,
@@ -1238,8 +1288,9 @@ async function start() {
   browserControl = await new BrowserControlServer({
     logger,
     getBrowserHost: () => browserHost,
-    getPreferences: () => stateStore.read(),
+    getPreferences: () => syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config),
     resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
+    limits: limitsController,
   }).start();
   runtimeSupervisor = new RuntimeSupervisor({
     app,

@@ -124,50 +124,19 @@ test("startup check runs once and exposes only a newer complete release", async 
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
 
-test("verified update is handed to one detached worker", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-update-test-"));
-  const oldAppImage = path.join(root, "versions", "1.1.4", "Codex Web GPT.AppImage");
-  const wrapper = path.join(root, "bin", "codex-web-gpt");
-  fs.mkdirSync(path.dirname(oldAppImage), { recursive: true });
-  fs.mkdirSync(path.dirname(wrapper), { recursive: true });
-  fs.writeFileSync(oldAppImage, "old");
-  fs.writeFileSync(wrapper, "old wrapper");
-  const assetBody = Buffer.from("new appimage");
-  const hash = require("node:crypto").createHash("sha256").update(assetBody).digest("hex");
-  let spawned = null;
-  const previousAppImage = process.env.CODEX_WEB_GPT_APPIMAGE;
-  const previousWrapper = process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE;
-  process.env.CODEX_WEB_GPT_APPIMAGE = oldAppImage;
-  process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE = wrapper;
-  try {
-    const controller = createUpdateController({
-      currentVersion: "1.1.4",
-      platform: "linux",
-      arch: "x64",
-      packaged: true,
-      executablePath: "/tmp/launcher",
-      runtimeExecutable: "/durable/bun",
-      logsDirectory: path.join(root, "logs"),
-      dependencies: {
-        fetchRelease: async () => ({
-          tag_name: "v1.2.0",
-          assets: [
-            {
-              name: "codex-web-gpt-1.2.0-linux-x64.AppImage",
-              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-x64.AppImage",
-            },
-            {
-              name: "checksums.txt",
-              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
-            },
-          ],
-        }),
-        downloadText: async () => `${hash}  codex-web-gpt-1.2.0-linux-x64.AppImage\n`,
-        downloadFile: async (_url, destination) => fs.writeFileSync(destination, assetBody),
-        sha256: (filePath) => require("node:crypto").createHash("sha256").update(fs.readFileSync(filePath)).digest("hex"),
-        spawnWorker: (runtime, worker, job) => {
-          spawned = { runtime, worker, job, data: JSON.parse(fs.readFileSync(job, "utf8")) };
-          return { pid: 123, unref() {}, kill() {} };
+test("preview and draft releases stay hidden until promoted, regardless of the version suffix", async () => {
+  for (const tag of ["1.2.0", "1.2.0-rc.1"]) {
+    for (const flags of [{ prerelease: true }, { draft: true }, { prerelease: false, draft: false }]) {
+      const controller = createUpdateController({
+        currentVersion: "1.1.4", platform: "linux", arch: "x64", packaged: true,
+        dependencies: {
+          fetchRelease: async () => ({
+            tag_name: `v${tag}`, ...flags,
+            assets: [`codex-web-gpt-${tag}-linux-x64.AppImage`, "checksums.txt"].map(name => ({
+              name,
+              browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v${tag}/${name}`,
+            })),
+          }),
         },
       });
       const hidden = flags.prerelease || flags.draft;
@@ -178,6 +147,7 @@ test("verified update is handed to one detached worker", async () => {
     }
   }
 });
+
 
 for (const arch of ["x64", "arm64"]) {
   test(`verified Linux ${arch} update is handed to one detached worker`, async () => {
@@ -210,11 +180,11 @@ for (const arch of ["x64", "arm64"]) {
             assets: [
               {
                 name: `codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
-                browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
+                browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
               },
               {
                 name: "checksums.txt",
-                browser_download_url: "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
+                browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
               },
             ],
           }),
@@ -248,6 +218,7 @@ for (const arch of ["x64", "arm64"]) {
     }
   });
 }
+
 
 test("detached worker replaces an installed Linux AppImage and removes the old version", {
   skip: process.platform === "win32" ? "Linux AppImage execution is not meaningful on Windows" : false,

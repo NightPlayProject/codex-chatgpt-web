@@ -73,15 +73,17 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
   return String.raw`(() => {
     const key = '__codexWebGptProviderRateLimitGate';
     let state = globalThis[key];
-    if (!state || state.version !== 3 || typeof state.sync !== 'function') {
+    if (!state || state.version !== 4 || typeof state.sync !== 'function') {
       try { state?.observer?.disconnect?.(); } catch {}
+      try { state?.disposeListeners?.(); } catch {}
       state = {
-        version: 3,
+        version: 4,
         nativeQuotaBlocked: false,
         scheduled: false,
         observer: null,
         sync: null,
         schedule: null,
+        disposeListeners: null,
       };
       const visible = element => {
         if (!(element instanceof Element)) return false;
@@ -126,16 +128,17 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
               'data-cw-chatgpt-web-quota-original-aria-disabled',
               originalAriaDisabled == null ? '__null__' : originalAriaDisabled,
             );
+            button.setAttribute('data-cw-chatgpt-web-quota-unlock', 'true');
           }
-          button.setAttribute('data-cw-chatgpt-web-quota-unlock', 'true');
-          button.disabled = false;
-          button.setAttribute('aria-disabled', 'false');
+          if (button.disabled === true) button.disabled = false;
+          if (button.getAttribute('aria-disabled') !== 'false') button.setAttribute('aria-disabled', 'false');
         } else if (!shouldUnlock && marked) {
-          button.disabled = button.getAttribute('data-cw-chatgpt-web-quota-original-disabled') === 'true';
+          const originalDisabled = button.getAttribute('data-cw-chatgpt-web-quota-original-disabled') === 'true';
+          if (button.disabled !== originalDisabled) button.disabled = originalDisabled;
           const originalAriaDisabled = button.getAttribute('data-cw-chatgpt-web-quota-original-aria-disabled');
           if (originalAriaDisabled === '__null__') {
-            button.removeAttribute('aria-disabled');
-          } else if (originalAriaDisabled != null) {
+            if (button.hasAttribute('aria-disabled')) button.removeAttribute('aria-disabled');
+          } else if (originalAriaDisabled != null && button.getAttribute('aria-disabled') !== originalAriaDisabled) {
             button.setAttribute('aria-disabled', originalAriaDisabled);
           }
           button.removeAttribute('data-cw-chatgpt-web-quota-unlock');
@@ -157,18 +160,43 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
           try { state.sync(); } catch {}
         });
       };
-      state.observer = new MutationObserver(state.schedule);
+      const gateScope = 'form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout], button[aria-haspopup="menu"]';
+      const mutationTouchesGate = mutation => {
+        const target = mutation.target?.nodeType === 1 ? mutation.target : mutation.target?.parentElement;
+        if (target?.matches?.(gateScope) || target?.closest?.(gateScope)) return true;
+        for (const node of mutation.addedNodes || []) {
+          if (node?.nodeType !== 1) continue;
+          if (node.matches?.(gateScope) || node.closest?.(gateScope) || node.querySelector?.(gateScope)) return true;
+        }
+        return false;
+      };
+      state.observer = new MutationObserver(records => {
+        if (records.some(mutationTouchesGate)) state.schedule();
+      });
       state.observer.observe(document.documentElement, {
         subtree: true,
         childList: true,
         characterData: true,
         attributes: true,
-        attributeFilter: ['aria-disabled', 'disabled', 'class'],
+        attributeFilter: ['aria-disabled', 'disabled', 'aria-haspopup', 'aria-label'],
       });
+      const onComposerInput = () => state.schedule();
+      document.addEventListener?.('input', onComposerInput, true);
+      document.addEventListener?.('change', onComposerInput, true);
+      state.disposeListeners = () => {
+        document.removeEventListener?.('input', onComposerInput, true);
+        document.removeEventListener?.('change', onComposerInput, true);
+      };
       globalThis[key] = state;
     }
     state.nativeQuotaBlocked = ${blocked};
-    return state.sync();
+    const result = state.sync();
+    if (state.nativeQuotaBlocked !== true) {
+      try { state.observer?.disconnect?.(); } catch {}
+      try { state.disposeListeners?.(); } catch {}
+      delete globalThis[key];
+    }
+    return result;
   })()`;
 }
 

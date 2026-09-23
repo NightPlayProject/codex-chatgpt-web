@@ -96,6 +96,10 @@ function makeProviderGateVmContext({
       return this.attrs.has(name) ? this.attrs.get(name) : null;
     }
 
+    hasAttribute(name) {
+      return this.attrs.has(name);
+    }
+
     setAttribute(name, value) {
       this.attrs.set(name, String(value));
     }

@@ -797,6 +797,11 @@ function registerIpc({ logger, stateStore }) {
     });
     send("launcher:state-changed", state);
     stopCatalogVerificationMonitor();
+    await officialCodexWallpaperController?.setProviderGateEnabled(false).catch(error => {
+      logger.warn("codex.web_provider_gate_disable_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
     return { cancelled: false, state };
   });
   handle("launcher:setup-core", async () => {
@@ -822,7 +827,7 @@ function registerIpc({ logger, stateStore }) {
       );
     }
     const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
-    stateStore.update({
+    const state = stateStore.update({
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
@@ -839,6 +844,14 @@ function registerIpc({ logger, stateStore }) {
         mcpGuideStep: 0,
       }),
     });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) {
+      void officialCodexWallpaperController?.setProviderGateEnabled(true).catch(error => {
+        logger.warn("codex.web_provider_gate_start_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     await browserHost.returnToIdle().catch((error) => {
       logger.warn("browser.idle_cleanup_failed", {
         message: error instanceof Error ? error.message : String(error),
@@ -880,6 +893,13 @@ function registerIpc({ logger, stateStore }) {
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
     });
     send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) {
+      void officialCodexWallpaperController?.setProviderGateEnabled(true).catch(error => {
+        logger.warn("codex.web_provider_gate_start_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     if (interactionModeChange) send("launcher:browser-state", browserHost.snapshot());
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout };
@@ -1261,7 +1281,9 @@ async function start() {
     logger,
     openExternal: openWebUrl,
     beforeOfficialRestart: async ({ identity }) => {
-      if (!officialCodexWallpaperController || stateStore.read().codexWallpapersEnabled !== true) return null;
+      if (!officialCodexWallpaperController) return null;
+      const state = stateStore.read();
+      if (state.codexWallpapersEnabled !== true && state.coreSetupComplete !== true) return null;
       return officialCodexWallpaperController.prepareExternalRestart({ identity });
     },
     afterOfficialRestart: async ({ identity, restartContext }) => {
@@ -1374,6 +1396,17 @@ async function start() {
   const trayAvailable = createTray(logger, stateStore.read().language);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
+  if (!launcherSmokeTest && !IS_DEV_PROFILE && stateStore.read().coreSetupComplete === true) {
+    void officialCodexWallpaperController.setProviderGateEnabled(true).then(result => {
+      logger.info("codex.web_provider_gate_started", {
+        restartRequired: result?.restartRequired === true,
+      });
+    }).catch(error => {
+      logger.warn("codex.web_provider_gate_start_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
   if (!launcherSmokeTest && stateStore.read().codexWallpapersEnabled === true) {
     void officialCodexWallpaperController.setEnabled(true).catch(error => {
       logger.warn("launcher.wallpapers_startup_failed", {

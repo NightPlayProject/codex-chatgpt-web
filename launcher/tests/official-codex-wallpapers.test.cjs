@@ -6,16 +6,83 @@ const path = require("node:path");
 const vm = require("node:vm");
 const {
   browserIdFromVersionPayload,
+  CdpContents,
   createOfficialCodexWallpaperController,
   discoverOfficialTargets,
   endpointRecordLooksValid,
+  installProviderAwareComposerQuotaPatch,
   officialAppTarget,
+  providerQuotaBreakpointSite,
+  providerAwareComposerQuotaRuntimeScript,
   providerAwareRateLimitGateScript,
   RATE_LIMIT_GATE_PROBE_SCRIPT,
   RATE_LIMIT_GATE_RECOVERY_SCRIPT,
   usageAllowsRateLimitRecovery,
   usageShowsNativeQuotaExhaustion,
 } = require("../electron/official-codex-wallpapers.cjs");
+
+test("official Codex quota breakpoint site is between the native quota term and submit aggregate", () => {
+  const source = 'before\nlet Rt=X(RK)&&et===`local`,zt=1;let cn=ye||$e||ot||nt||Rt;after';
+  const result = providerQuotaBreakpointSite(source);
+  assert.equal(result.found, true);
+  assert.equal(result.reason, null);
+  assert.deepEqual(result.candidate, { lineNumber: 1, columnNumber: 30 });
+  assert.deepEqual(result.submit, { lineNumber: 1, columnNumber: 36 });
+  assert.ok(result.candidateIndex < result.submitIndex);
+});
+
+test("official Codex quota breakpoint site fails closed when source shape changes", () => {
+  assert.deepEqual(providerQuotaBreakpointSite("no quota term"), {
+    found: false,
+    reason: "quota-source-needle-missing",
+  });
+  const repeated = 'Rt=X(RK)&&et===`local`;Rt=X(RK)&&et===`local`';
+  const result = providerQuotaBreakpointSite(repeated);
+  assert.equal(result.found, false);
+  assert.equal(result.reason, "quota-source-needle-ambiguous");
+  assert.equal(providerQuotaBreakpointSite('Rt=X(RK)&&et===`local`,changed=1;cn=ye||$e||ot||nt||Rt').reason, "quota-source-layout-changed");
+});
+
+test("provider-aware composer runtime hook tracks Web selection without patching Array methods", () => {
+  class FakeElement {
+    constructor(text = "") { this.innerText = text; this.textContent = text; }
+    getBoundingClientRect() { return { width: 100, height: 30 }; }
+    querySelectorAll() { return []; }
+  }
+  const root = new FakeElement();
+  const model = new FakeElement("ChatGPT Web — GPT-5.6 Sol");
+  root.querySelectorAll = selector => selector === "button" ? [model] : [];
+  const listeners = new Map();
+  const context = {
+    Element: FakeElement,
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    document: {
+      querySelectorAll(selector) {
+        if (selector.includes("unified-composer")) return [root];
+        if (selector === 'button[aria-haspopup="menu"]') return [model];
+        return [];
+      },
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type); },
+    },
+  };
+  context.globalThis = context;
+  context.__codexWebGptWebProviderSelected = true;
+  const before = vm.runInNewContext("({find:Array.prototype.find,some:Array.prototype.some,every:Array.prototype.every})", context);
+  vm.runInNewContext(providerAwareComposerQuotaRuntimeScript(true), context);
+  const after = vm.runInNewContext("({find:Array.prototype.find,some:Array.prototype.some,every:Array.prototype.every})", context);
+  assert.equal(after.find, before.find);
+  assert.equal(after.some, before.some);
+  assert.equal(after.every, before.every);
+  assert.equal(context.__codexWebGptWebProviderSelected, true);
+  assert.equal(vm.runInNewContext("[{name:'send'}].find(value=>value.name==='send')?.name", context), "send");
+  model.innerText = model.textContent = "GPT-5.6 Codex";
+  context.__codexWebGptWebProviderSelected = false;
+  assert.equal(context.__codexWebGptWebProviderSelected, false);
+  const restored = vm.runInNewContext(providerAwareComposerQuotaRuntimeScript(false), context);
+  assert.deepEqual(JSON.parse(JSON.stringify(restored)), { installed: false, restored: true });
+  assert.equal(listeners.size, 0);
+});
 
 const identity = Object.freeze({
   Version: "26.908.9136.0",
@@ -51,6 +118,86 @@ class FakeWebSocket {
   }
 }
 
+test("provider-aware composer quota patch installs a conditional breakpoint without live source editing", async () => {
+  const calls = [];
+  const breakpointParams = [];
+  const source = 'before\nrateLimitSendBlocked:ue,foo:1,selectedModel:xe,onModelChange:Le}=e;middle\nrateLimitSendBlocked:Oi,foo:1,selectedModel:Vn,onModelChange:zi}),t[1]=Vn;let Rt=X(RK)&&et===`local`,zt=1;let cn=ye||$e||ot||nt||Rt;after';
+  class RuntimeWebSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      calls.push(message.method);
+      const reply = result => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ id: message.id, result }),
+      }));
+      const emit = (method, params) => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ method, params }),
+      }));
+      if (message.method === "Debugger.enable") {
+        emit("Debugger.scriptParsed", {
+          scriptId: "primary_1",
+          url: "app://-/assets/app-primary-test123.js",
+        });
+        reply({});
+        return;
+      }
+      if (message.method === "Runtime.evaluate") {
+        reply({ result: { value: 0 } });
+        return;
+      }
+      if (message.method === "Debugger.getScriptSource") {
+        reply({ scriptSource: source });
+        return;
+      }
+      if (message.method === "Debugger.getPossibleBreakpoints") {
+        reply({ locations: [{ scriptId: "primary_1", ...message.params.start }] });
+        return;
+      }
+      if (message.method === "Debugger.setBreakpointByUrl") {
+        breakpointParams.push(message.params);
+        const modelBreakpoint = message.params.condition.includes('startsWith("chatgpt-web/")');
+        reply({
+          breakpointId: modelBreakpoint ? "provider_model_bp" : "provider_quota_bp",
+          locations: [{ scriptId: "primary_1", lineNumber: message.params.lineNumber, columnNumber: message.params.columnNumber }],
+        });
+        return;
+      }
+      throw new Error(`Unexpected CDP method: ${message.method}`);
+    }
+  }
+
+  const contents = new CdpContents("ws://127.0.0.1:9333/devtools/page/target", RuntimeWebSocket);
+  try {
+    const result = await installProviderAwareComposerQuotaPatch(contents);
+    assert.equal(result.applied, true);
+    assert.equal(result.reason, null);
+    assert.equal(result.breakpointId, "provider_quota_bp");
+    assert.equal(result.modelBreakpointId, "provider_model_bp");
+    assert.deepEqual(result.breakpointIds, ["provider_model_bp", "provider_quota_bp"]);
+    assert.equal(result.modelVariable, "Vn");
+    assert.equal(result.url, "app://-/assets/app-primary-test123.js");
+    assert.deepEqual(calls, [
+      "Debugger.enable",
+      "Runtime.evaluate",
+      "Debugger.getScriptSource",
+      "Runtime.evaluate",
+      "Runtime.evaluate",
+      "Debugger.setBreakpointByUrl",
+      "Debugger.getPossibleBreakpoints",
+      "Debugger.setBreakpointByUrl",
+    ]);
+    assert.equal(breakpointParams.length, 2);
+    assert.equal(breakpointParams[0].url, "app://-/assets/app-primary-test123.js");
+    assert.match(breakpointParams[0].condition, /slug\.startsWith\("chatgpt-web\/"\)/);
+    assert.match(breakpointParams[0].condition, /__codexWebGptWebProviderSelected/);
+    assert.match(breakpointParams[1].condition, /__codexWebGptNativeQuotaBlocked===true/);
+    assert.match(breakpointParams[1].condition, /__codexWebGptWebProviderSelected===true/);
+    assert.match(breakpointParams[1].condition, /Rt=false/);
+    assert.equal(calls.includes("Debugger.setScriptSource"), false);
+  } finally {
+    contents.close();
+  }
+});
+
 function scriptedWebSocket(responder) {
   return class ScriptedWebSocket extends FakeWebSocket {
     send(raw) {
@@ -75,11 +222,16 @@ function validEndpoint(port = 9333) {
 }
 
 function makeProviderGateVmContext({
+  sendButtonType = "submit",
+  sendAriaLabel = null,
+  nestedInnerComposer = false,
   disabled = true,
   ariaDisabled = "true",
+  reactDisabled = disabled,
+  reactAriaDisabled = ariaDisabled === "true" ? true : ariaDisabled === "false" ? false : ariaDisabled,
   providerInsideRoot = true,
   providerIsSelectedControl = !providerInsideRoot,
-  modelText = "ChatGPT Web — GPT-5.6 Sol",
+  modelText = "ChatGPT Web â€” GPT-5.6 Sol",
 } = {}) {
   class FakeElement {
     constructor({ text = "" } = {}) {
@@ -117,7 +269,23 @@ function makeProviderGateVmContext({
   }
 
   const submit = new FakeButton({ disabled });
-  submit.setAttribute("type", "submit");
+  const reactProps = {
+    disabled: reactDisabled,
+    "aria-disabled": reactAriaDisabled,
+    onClick() {},
+  };
+  const hostOnClick = reactProps.onClick;
+  const underlyingOnClick = () => {};
+  submit.__reactProps$test = reactProps;
+  submit.__reactFiber$test = {
+    memoizedProps: reactProps,
+    return: {
+      memoizedProps: { disabled: reactDisabled, onClick: underlyingOnClick },
+      return: null,
+    },
+  };
+  submit.setAttribute("type", sendButtonType);
+  if (sendAriaLabel != null) submit.setAttribute("aria-label", sendAriaLabel);
   if (ariaDisabled != null) submit.setAttribute("aria-disabled", ariaDisabled);
   const model = new FakeButton({ text: modelText });
   if (providerIsSelectedControl) model.setAttribute("aria-haspopup", "menu");
@@ -128,6 +296,13 @@ function makeProviderGateVmContext({
     : [];
   root.querySelector = selector => {
     if (selector === 'button[type="submit"]') return submit;
+    if (selector === '#prompt-textarea, [contenteditable="true"]') return editor;
+    if (selector === ".composer-attachment-surface") return null;
+    return null;
+  };
+  const innerRoot = new FakeElement();
+  innerRoot.querySelectorAll = selector => selector === "button" ? [] : [];
+  innerRoot.querySelector = selector => {
     if (selector === '#prompt-textarea, [contenteditable="true"]') return editor;
     if (selector === ".composer-attachment-surface") return null;
     return null;
@@ -147,13 +322,13 @@ function makeProviderGateVmContext({
         ? [model, submit]
         : selector === 'button[aria-haspopup="menu"]'
           ? (providerIsSelectedControl ? [model] : [])
-          : [root],
+          : nestedInnerComposer ? [root, innerRoot] : [root],
     },
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
     queueMicrotask,
   };
   context.globalThis = context;
-  return { context, submit };
+  return { context, submit, reactProps, hostOnClick, underlyingOnClick };
 }
 
 function makeTarget(id = "page_1", url = "app://codex/index.html") {
@@ -223,11 +398,28 @@ test("stale rate-limit recovery requires fresh usage headroom", () => {
   assert.equal(usageShowsNativeQuotaExhaustion({ available: true, primaryUsedPercent: 100, secondaryUsedPercent: 47 }), true);
 });
 
+test("stale rate-limit recovery reloads the current Codex disabled Send control", () => {
+  const { context } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: "true",
+    sendButtonType: "button",
+    sendAriaLabel: "Send",
+    nestedInnerComposer: true,
+  });
+  let reloads = 0;
+  context.location = { reload() { reloads += 1; } };
+
+  const recovered = vm.runInNewContext(RATE_LIMIT_GATE_RECOVERY_SCRIPT, context);
+  assert.equal(recovered, true);
+  assert.equal(reloads, 1);
+});
+
 test("ChatGPT Web provider gate handles a natively disabled quota button and restores it", () => {
-  const { context, submit } = makeProviderGateVmContext({
+  const { context, submit, reactProps, hostOnClick, underlyingOnClick } = makeProviderGateVmContext({
     disabled: true,
     ariaDisabled: "true",
   });
+  context.__codexWebGptWebProviderSelected = true;
 
   const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
   assert.equal(probe.rateLimitBlocked, true);
@@ -240,6 +432,11 @@ test("ChatGPT Web provider gate handles a natively disabled quota button and res
   assert.equal(submit.disabled, false);
   assert.equal(submit.getAttribute("aria-disabled"), "false");
   assert.equal(submit.getAttribute("data-cw-chatgpt-web-quota-original-disabled"), "true");
+  assert.equal(unlocked.reactUnlocked, true);
+  assert.equal(unlocked.reactClickBypassed, true);
+  assert.equal(reactProps.disabled, false);
+  assert.equal(reactProps["aria-disabled"], false);
+  assert.equal(reactProps.onClick, underlyingOnClick);
 
   const restored = vm.runInNewContext(providerAwareRateLimitGateScript(false), context);
   assert.equal(restored.managed, false);
@@ -247,15 +444,20 @@ test("ChatGPT Web provider gate handles a natively disabled quota button and res
   assert.equal(submit.disabled, true);
   assert.equal(submit.getAttribute("aria-disabled"), "true");
   assert.equal(submit.getAttribute("data-cw-chatgpt-web-quota-unlock"), null);
+  assert.equal(reactProps.disabled, true);
+  assert.equal(reactProps["aria-disabled"], true);
+  assert.equal(reactProps.onClick, hostOnClick);
 });
 
-test("ChatGPT Web provider gate detects the v6 provider control outside the composer", () => {
-  const { context, submit } = makeProviderGateVmContext({
+test("ChatGPT Web provider gate handles the current Codex type=button Send control", () => {
+  const { context, submit, reactProps, hostOnClick, underlyingOnClick } = makeProviderGateVmContext({
     disabled: true,
-    ariaDisabled: null,
-    providerInsideRoot: false,
-    modelText: "GPT-5.6 Sol (Web)",
+    ariaDisabled: "true",
+    sendButtonType: "button",
+    sendAriaLabel: "Send",
+    nestedInnerComposer: true,
   });
+  context.__codexWebGptWebProviderSelected = true;
 
   const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
   assert.equal(probe.rateLimitBlocked, true);
@@ -265,9 +467,42 @@ test("ChatGPT Web provider gate detects the v6 provider control outside the comp
   const unlocked = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
   assert.equal(unlocked.managed, true);
   assert.equal(unlocked.unlocked, true);
-  assert.equal(unlocked.selected, true);
   assert.equal(submit.disabled, false);
   assert.equal(submit.getAttribute("aria-disabled"), "false");
+
+  assert.equal(unlocked.reactUnlocked, true);
+  assert.equal(unlocked.reactClickBypassed, true);
+  assert.equal(reactProps.disabled, false);
+  assert.equal(reactProps["aria-disabled"], false);
+  assert.equal(reactProps.onClick, underlyingOnClick);
+  const restored = vm.runInNewContext(providerAwareRateLimitGateScript(false), context);
+  assert.equal(restored.managed, false);
+  assert.equal(restored.unlocked, false);
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.getAttribute("aria-disabled"), "true");
+  assert.equal(reactProps.disabled, true);
+  assert.equal(reactProps["aria-disabled"], true);
+  assert.equal(reactProps.onClick, hostOnClick);
+});
+
+test("visible Web model label cannot override a native authoritative model slug", () => {
+  const { context, submit } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: null,
+    providerInsideRoot: false,
+    modelText: "GPT-5.6 Sol (Web) High None Minimal Light Medium High Extra High Max Ultra Persistent",
+  });
+  context.__codexWebGptWebProviderSelected = false;
+
+  const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
+  assert.equal(probe.rateLimitBlocked, true);
+  assert.equal(probe.chatGptWebSelected, false);
+  assert.equal(probe.hasSendableContent, true);
+
+  const unlocked = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
+  assert.equal(unlocked.managed, false);
+  assert.equal(unlocked.selected, false);
+  assert.equal(submit.disabled, true);
 });
 
 test("native model labels without the Web suffix do not receive the quota override", () => {
@@ -308,7 +543,7 @@ test("ChatGPT Web menu options outside the composer do not impersonate the selec
   assert.equal(submit.getAttribute("aria-disabled"), "true");
 });
 
-test("ChatGPT Web provider gate unlocks send while native Codex quota is exhausted", async () => {
+test("ChatGPT Web exhausted quota path never force-unlocks the DOM submit control", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-web-gate-"));
   let unlocked = false;
   let gateCalls = 0;
@@ -358,14 +593,11 @@ test("ChatGPT Web provider gate unlocks send while native Codex quota is exhaust
     refreshIntervalMs: 10,
   });
   try {
-    await controller.setEnabled(true);
-    const deadline = Date.now() + 500;
-    while (!unlocked && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.equal(unlocked, true);
-    assert.ok(gateCalls >= 1);
-    assert.equal(usageCalls, 1);
+    await controller.setProviderGateEnabled(true);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(unlocked, false);
+    assert.equal(gateCalls, 0);
+    assert.ok(usageCalls >= 1);
     assert.equal(recoveryCalls, 0);
   } finally {
     controller.destroy();
@@ -417,7 +649,7 @@ test("native Codex models never receive the ChatGPT Web quota override", async (
     refreshIntervalMs: 10,
   });
   try {
-    await controller.setEnabled(true);
+    await controller.setProviderGateEnabled(true);
     await new Promise(resolve => setTimeout(resolve, 80));
     assert.equal(providerGateCalls, 0);
     assert.equal(recoveryCalls, 0);
@@ -468,7 +700,7 @@ test("stale native rate-limit gate refreshes only after authoritative usage says
     refreshIntervalMs: 10,
   });
   try {
-    await controller.setEnabled(true);
+    await controller.setProviderGateEnabled(true);
     const deadline = Date.now() + 500;
     while (recoveryCalls === 0 && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -523,11 +755,52 @@ test("genuine or attachment-bearing rate-limit states are never refreshed", asyn
     refreshIntervalMs: 10,
   });
   try {
-    await controller.setEnabled(true);
+    await controller.setProviderGateEnabled(true);
     await new Promise(resolve => setTimeout(resolve, 80));
     assert.ok(probeCount >= 3);
-    assert.equal(usageCalls, 1);
+    assert.ok(usageCalls >= 1);
     assert.equal(recoveryCalls, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider gate attaches to the official app without installing Wallpapers", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-provider-only-"));
+  const calls = { install: 0, dispose: 0 };
+  const controller = makeController({
+    root,
+    calls,
+    storedEndpoint: true,
+    processes: [{ ProcessId: 5678, ExecutablePath: identity.Executable }],
+    discoverTargets: async () => [makeTarget()],
+  });
+  try {
+    const result = await controller.setProviderGateEnabled(true);
+    assert.equal(result.enabled, true);
+    assert.equal(result.restartRequired, false);
+    assert.equal(calls.install, 0);
+    assert.equal(calls.dispose, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider gate waits for one normal restart when the official app lacks its endpoint", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-provider-restart-"));
+  let launched = 0;
+  const controller = makeController({
+    root,
+    processes: [{ ProcessId: 1234, ExecutablePath: identity.Executable }],
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    const result = await controller.setProviderGateEnabled(true);
+    assert.equal(result.enabled, true);
+    assert.equal(result.restartRequired, true);
+    assert.equal(launched, 0);
   } finally {
     controller.destroy();
     fs.rmSync(root, { recursive: true, force: true });

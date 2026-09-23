@@ -16,6 +16,214 @@ const ENDPOINT_POLL_INTERVAL_MS = 400;
 const POWERSHELL_TIMEOUT_MS = 12_000;
 const CDP_CALL_TIMEOUT_MS = 20_000;
 const TARGET_ID_RE = /^[A-Za-z0-9_-]+$/;
+const PROVIDER_QUOTA_STATE_KEY = "__codexWebGptNativeQuotaBlocked";
+const PROVIDER_SELECTED_STATE_KEY = "__codexWebGptWebProviderSelected";
+const PROVIDER_QUOTA_RUNTIME_KEY = "__codexWebGptProviderQuotaRuntime";
+const PROVIDER_QUOTA_SOURCE_NEEDLE = 'Rt=X(RK)&&et===`local`';
+const PROVIDER_QUOTA_NEXT_NEEDLE = ",zt=";
+const PROVIDER_QUOTA_SUBMIT_NEEDLE = "cn=ye||$e||ot||nt||Rt";
+const PROVIDER_MODEL_RENDER_NEEDLE = "rateLimitSendBlocked:";
+const PROVIDER_MODEL_SELECTED_NEEDLE = "selectedModel:";
+const PROVIDER_MODEL_CHANGE_NEEDLE = ",onModelChange:";
+const PROVIDER_QUOTA_BREAKPOINT_CONDITION = `globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true&&(Rt=false)`;
+
+function providerSelectionBreakpointCondition(modelVariable) {
+  return `(globalThis.${PROVIDER_SELECTED_STATE_KEY}=!!(${modelVariable}&&typeof ${modelVariable}.slug===\"string\"&&${modelVariable}.slug.startsWith(\"chatgpt-web/\")),false)`;
+}
+
+function sourceLocationForIndex(source, index) {
+  const before = source.slice(0, index);
+  const lastLineBreak = before.lastIndexOf("\n");
+  return {
+    lineNumber: (before.match(/\n/g) || []).length,
+    columnNumber: index - lastLineBreak - 1,
+  };
+}
+
+function providerQuotaBreakpointSite(source) {
+  const text = String(source ?? "");
+  const first = text.indexOf(PROVIDER_QUOTA_SOURCE_NEEDLE);
+  if (first < 0) {
+    return { found: false, reason: "quota-source-needle-missing" };
+  }
+  if (text.indexOf(PROVIDER_QUOTA_SOURCE_NEEDLE, first + PROVIDER_QUOTA_SOURCE_NEEDLE.length) >= 0) {
+    return { found: false, reason: "quota-source-needle-ambiguous" };
+  }
+  const next = first + PROVIDER_QUOTA_SOURCE_NEEDLE.length;
+  if (text.slice(next, next + PROVIDER_QUOTA_NEXT_NEEDLE.length) !== PROVIDER_QUOTA_NEXT_NEEDLE) {
+    return { found: false, reason: "quota-source-layout-changed" };
+  }
+  const submit = text.indexOf(PROVIDER_QUOTA_SUBMIT_NEEDLE, next);
+  if (submit < 0) return { found: false, reason: "quota-submit-needle-missing" };
+  const candidateIndex = next + PROVIDER_QUOTA_NEXT_NEEDLE.length;
+  return {
+    found: true,
+    reason: null,
+    candidateIndex,
+    candidate: sourceLocationForIndex(text, candidateIndex),
+    submitIndex: submit,
+    submit: sourceLocationForIndex(text, submit),
+  };
+}
+
+function providerAuthoritativeModelBreakpointSite(source) {
+  const text = String(source ?? "");
+  const renders = [];
+  let render = -1;
+  while ((render = text.indexOf(PROVIDER_MODEL_RENDER_NEEDLE, render + 1)) >= 0) renders.push(render);
+  if (renders.length === 0) return { found: false, reason: "model-render-needle-missing" };
+
+  const candidates = [];
+  for (let index = 0; index < renders.length; index += 1) {
+    const renderIndex = renders[index];
+    const nextRenderIndex = renders[index + 1] ?? text.length;
+    const selected = text.indexOf(PROVIDER_MODEL_SELECTED_NEEDLE, renderIndex + PROVIDER_MODEL_RENDER_NEEDLE.length);
+    if (selected < 0 || selected >= nextRenderIndex) continue;
+    const change = text.indexOf(PROVIDER_MODEL_CHANGE_NEEDLE, selected + PROVIDER_MODEL_SELECTED_NEEDLE.length);
+    if (change < 0 || change >= nextRenderIndex || change - selected > 20_000) continue;
+    const valueIndex = selected + PROVIDER_MODEL_SELECTED_NEEDLE.length;
+    const modelMatch = text.slice(valueIndex, valueIndex + 128).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
+    if (!modelMatch) continue;
+    const memoBoundary = text.indexOf("}),t[", change + PROVIDER_MODEL_CHANGE_NEEDLE.length);
+    if (memoBoundary < 0 || memoBoundary >= nextRenderIndex || memoBoundary - change > 20_000) continue;
+    const breakpointIndex = memoBoundary + 3;
+    candidates.push({ renderIndex, change, valueIndex, breakpointIndex, modelVariable: modelMatch[1] });
+  }
+  if (candidates.length === 0) return { found: false, reason: "model-render-layout-changed" };
+
+  const quotaIndex = text.indexOf(PROVIDER_QUOTA_SOURCE_NEEDLE);
+  const beforeQuota = quotaIndex < 0 ? candidates : candidates.filter(candidate => candidate.renderIndex < quotaIndex);
+  const chosen = (beforeQuota.length > 0 ? beforeQuota : candidates).at(-1);
+  return {
+    found: true,
+    reason: null,
+    modelVariable: chosen.modelVariable,
+    candidateCount: candidates.length,
+    candidateIndex: chosen.breakpointIndex,
+    candidate: sourceLocationForIndex(text, chosen.breakpointIndex),
+    endIndex: chosen.breakpointIndex + 256,
+    end: sourceLocationForIndex(text, Math.min(text.length, chosen.breakpointIndex + 256)),
+  };
+}
+
+function providerAwareComposerQuotaRuntimeScript(enabled = true) {
+  const shouldEnable = enabled === true ? "true" : "false";
+  return String.raw`(() => {
+    const key = '${PROVIDER_QUOTA_RUNTIME_KEY}';
+    const selectedKey = '${PROVIDER_SELECTED_STATE_KEY}';
+    const existing = globalThis[key];
+    if (!${shouldEnable}) {
+      delete globalThis[key];
+      globalThis[selectedKey] = false;
+      return { installed: false, restored: existing != null };
+    }
+    if (typeof globalThis[selectedKey] !== 'boolean') globalThis[selectedKey] = false;
+    globalThis[key] = { version: 4, source: 'authoritative-model-breakpoint' };
+    return { installed: true, restored: false };
+  })()`;
+}
+
+function providerAuthoritativeModelStateScript() {
+  return String.raw`(() => {
+    const selectedKey = '${PROVIDER_SELECTED_STATE_KEY}';
+    const visible = element => {
+      if (!(element instanceof Element)) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const roots = [...document.querySelectorAll(
+      'form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]'
+    )].filter(root => visible(root) && root.querySelector('#prompt-textarea, [contenteditable="true"]'));
+    const root = roots.find(candidate => candidate.hasAttribute('data-composer-surface-variant')) || roots.at(-1) || null;
+    if (!(root instanceof Element)) {
+      globalThis[selectedKey] = false;
+      return { found: false, ambiguous: false, slug: null, webSelected: false, source: null };
+    }
+    const normalizeModel = value => {
+      if (typeof value === 'string' && value.trim() !== '') return value.trim();
+      if (value != null && typeof value === 'object') {
+        if (typeof value.slug === 'string' && value.slug.trim() !== '') return value.slug.trim();
+        if (typeof value.model === 'string' && value.model.trim() !== '') return value.model.trim();
+      }
+      return null;
+    };
+    const selectedModels = [];
+    const pickerModels = [];
+    const seenFibers = new Set();
+    const elements = [root, ...root.querySelectorAll('button, #prompt-textarea, [contenteditable="true"]')];
+    for (const element of elements) {
+      const fiberKey = Object.keys(element).find(key => key.startsWith('__reactFiber$'));
+      let fiber = fiberKey == null ? null : element[fiberKey];
+      for (let depth = 0; fiber != null && depth < 90; depth += 1, fiber = fiber.return) {
+        if (seenFibers.has(fiber)) continue;
+        seenFibers.add(fiber);
+        const props = fiber.memoizedProps;
+        if (props == null || typeof props !== 'object') continue;
+        const selected = normalizeModel(props.selectedModel);
+        if (selected != null) selectedModels.push(selected);
+        const isModelPicker = Object.prototype.hasOwnProperty.call(props, 'modelPickerTriggerConfig')
+          || Object.prototype.hasOwnProperty.call(props, 'modelOptions');
+        if (isModelPicker) {
+          const model = normalizeModel(props.model);
+          if (model != null) pickerModels.push(model);
+        }
+      }
+    }
+    const preferred = selectedModels.length > 0 ? selectedModels : pickerModels;
+    const unique = [...new Set(preferred)];
+    const slug = unique.length === 1 ? unique[0] : null;
+    const webSelected = typeof slug === 'string' && slug.startsWith('chatgpt-web/');
+    globalThis[selectedKey] = webSelected;
+    return {
+      found: slug != null,
+      ambiguous: unique.length > 1,
+      slug,
+      webSelected,
+      source: selectedModels.length > 0 ? 'selectedModel' : pickerModels.length > 0 ? 'modelPicker' : null,
+    };
+  })()`;
+}
+
+function providerComposerQuotaRerenderScript() {
+  return String.raw`(async () => {
+    const visible = element => {
+      if (!(element instanceof Element)) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const roots = [...document.querySelectorAll(
+      'form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]'
+    )].filter(root => visible(root) && root.querySelector('#prompt-textarea, [contenteditable="true"]'));
+    const root = roots.find(candidate => candidate.hasAttribute('data-composer-surface-variant')) || roots.at(-1) || null;
+    if (!(root instanceof Element)) return { dispatched: false, reason: 'composer-missing' };
+    const button = [...root.querySelectorAll('button')].find(candidate => candidate instanceof HTMLButtonElement
+      && (candidate.getAttribute('type') === 'submit'
+        || candidate.getAttribute('data-testid') === 'send-button'
+        || /^(?:send|submit)(?:\\s|$)/i.test((candidate.getAttribute('aria-label') || '').trim()))) || null;
+    if (!(button instanceof HTMLButtonElement)) return { dispatched: false, reason: 'send-button-missing' };
+    const fiberKey = Object.keys(button).find(key => key.startsWith('__reactFiber$'));
+    let fiber = fiberKey == null ? null : button[fiberKey];
+    for (let depth = 0; fiber != null && depth < 90; depth += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (props == null || typeof props !== 'object' || props.submitDisabled !== false) continue;
+      let hook = fiber.memoizedState;
+      for (let hookIndex = 0; hook != null && hookIndex < 300; hookIndex += 1, hook = hook.next) {
+        if (!(hook.memoizedState instanceof Set) || typeof hook.queue?.dispatch !== 'function') continue;
+        const beforeSize = hook.memoizedState.size;
+        hook.queue.dispatch(previous => previous instanceof Set ? new Set(previous) : previous);
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return { dispatched: true, reason: null, depth, hookIndex, beforeSize };
+      }
+    }
+    return { dispatched: false, reason: 'safe-rerender-hook-missing' };
+  })()`;
+}
+
+function nativeQuotaStateScript(blocked) {
+  return `globalThis.${PROVIDER_QUOTA_STATE_KEY}=${blocked === true ? "true" : "false"}; true`;
+}
 
 const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
   const roots = [...document.querySelectorAll('form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]')];
@@ -25,19 +233,20 @@ const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
     const style = getComputedStyle(element);
     return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
   };
-  const root = roots.filter(visible).at(-1) || null;
-  const button = root?.querySelector('button[type="submit"]') || null;
-  const selectedModelButtons = [
-    ...document.querySelectorAll('button[aria-haspopup="menu"]'),
-    ...(root instanceof Element ? root.querySelectorAll('button') : []),
-  ];
-  const isChatGptWebModelControl = candidate => {
-    const label = (candidate?.innerText || candidate?.textContent || '').replace(/\s+/g, ' ').trim();
-    return /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test(label) || /\(Web\)\s*$/i.test(label);
+  const findSendButton = composer => {
+    if (!(composer instanceof Element)) return null;
+    return [...composer.querySelectorAll('button')].find(candidate => candidate instanceof HTMLButtonElement
+      && (candidate.getAttribute('type') === 'submit'
+        || candidate.getAttribute('data-testid') === 'send-button'
+        || /^(?:send|submit)(?:\s|$)/i.test((candidate.getAttribute('aria-label') || '').trim()))) || null;
   };
-  const chatGptWebSelected = [...new Set(selectedModelButtons)]
-    .filter(candidate => candidate !== button && visible(candidate))
-    .some(isChatGptWebModelControl);
+  const visibleRoots = roots.filter(visible);
+  const managedComposer = [...visibleRoots].reverse()
+    .map(candidate => ({ root: candidate, button: findSendButton(candidate) }))
+    .find(candidate => candidate.button instanceof HTMLButtonElement) || null;
+  const root = managedComposer?.root || visibleRoots.at(-1) || null;
+  const button = managedComposer?.button || null;
+  const chatGptWebSelected = globalThis.${PROVIDER_SELECTED_STATE_KEY} === true;
   const editor = root?.querySelector('#prompt-textarea, [contenteditable="true"]') || null;
   const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
   const hasAttachments = root instanceof Element && root.querySelector('.composer-attachment-surface') != null;
@@ -60,9 +269,29 @@ const RATE_LIMIT_GATE_RECOVERY_SCRIPT = String.raw`(() => {
     const style = getComputedStyle(element);
     return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
   };
-  const root = roots.filter(visible).at(-1) || null;
-  const button = root?.querySelector('button[type="submit"][aria-disabled="true"]') || null;
-  const stillRateLimited = button instanceof HTMLButtonElement && button.disabled === false;
+  const visibleRoots = roots.filter(visible);
+  const managedComposer = [...visibleRoots].reverse()
+    .map(candidate => ({
+      root: candidate,
+      button: [...candidate.querySelectorAll('button')].find(button => button instanceof HTMLButtonElement
+        && (button.getAttribute('type') === 'submit'
+          || button.getAttribute('data-testid') === 'send-button'
+          || /^(?:send|submit)(?:\s|$)/i.test((button.getAttribute('aria-label') || '').trim()))) || null,
+    }))
+    .find(candidate => candidate.button instanceof HTMLButtonElement) || null;
+  const root = managedComposer?.root || visibleRoots.at(-1) || null;
+  const button = managedComposer?.button instanceof HTMLButtonElement
+    && managedComposer.button.getAttribute('aria-disabled') === 'true'
+    ? managedComposer.button
+    : root instanceof Element
+      ? [...root.querySelectorAll('button')].find(candidate => candidate instanceof HTMLButtonElement
+      && candidate.getAttribute('aria-disabled') === 'true'
+      && (candidate.getAttribute('type') === 'submit'
+        || candidate.getAttribute('data-testid') === 'send-button'
+        || /^(?:send|submit)(?:\s|$)/i.test((candidate.getAttribute('aria-label') || '').trim()))) || null
+      : null;
+  const stillRateLimited = button instanceof HTMLButtonElement
+    && (button.disabled === true || button.getAttribute('aria-disabled') === 'true');
   if (!stillRateLimited || root.querySelector('.composer-attachment-surface') != null) return false;
   location.reload();
   return true;
@@ -73,17 +302,18 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
   return String.raw`(() => {
     const key = '__codexWebGptProviderRateLimitGate';
     let state = globalThis[key];
-    if (!state || state.version !== 4 || typeof state.sync !== 'function') {
+    if (!state || state.version !== 7 || typeof state.sync !== 'function') {
       try { state?.observer?.disconnect?.(); } catch {}
       try { state?.disposeListeners?.(); } catch {}
       state = {
-        version: 4,
+        version: 7,
         nativeQuotaBlocked: false,
         scheduled: false,
         observer: null,
         sync: null,
         schedule: null,
         disposeListeners: null,
+        reactPropsOriginals: new WeakMap(),
       };
       const visible = element => {
         if (!(element instanceof Element)) return false;
@@ -91,24 +321,89 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
         const style = getComputedStyle(element);
         return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
       };
+      const reactPropsFor = button => {
+        const key = Object.keys(button).find(key => key.startsWith('__reactProps$'));
+        const props = key == null ? null : button[key];
+        return props != null && typeof props === 'object' ? props : null;
+      };
+      const reactBypassClickFor = (button, hostProps) => {
+        const key = Object.keys(button).find(key => key.startsWith('__reactFiber$'));
+        let fiber = key == null ? null : button[key]?.return;
+        for (let depth = 0; fiber != null && depth < 8; depth += 1, fiber = fiber.return) {
+          const props = fiber.memoizedProps;
+          if (props != null && typeof props === 'object'
+            && typeof props.onClick === 'function'
+            && props.onClick !== hostProps?.onClick) {
+            return props.onClick;
+          }
+        }
+        return null;
+      };
+      const unlockReactProps = button => {
+        const props = reactPropsFor(button);
+        if (props == null) return { propsUnlocked: true, clickBypassed: true };
+        if (!state.reactPropsOriginals.has(props)) {
+          state.reactPropsOriginals.set(props, {
+            hadDisabled: Object.prototype.hasOwnProperty.call(props, 'disabled'),
+            disabled: props.disabled,
+            hadAriaDisabled: Object.prototype.hasOwnProperty.call(props, 'aria-disabled'),
+            ariaDisabled: props['aria-disabled'],
+            hadOnClick: Object.prototype.hasOwnProperty.call(props, 'onClick'),
+            onClick: props.onClick,
+          });
+        }
+        const bypassOnClick = reactBypassClickFor(button, props);
+        try { props.disabled = false; } catch {}
+        try { props['aria-disabled'] = false; } catch {}
+        if (typeof bypassOnClick === 'function') {
+          try { props.onClick = bypassOnClick; } catch {}
+        }
+        return {
+          propsUnlocked: props.disabled !== true
+            && props['aria-disabled'] !== true
+            && props['aria-disabled'] !== 'true',
+          clickBypassed: typeof props.onClick !== 'function'
+            || typeof bypassOnClick === 'function' && props.onClick === bypassOnClick,
+        };
+      };
+      const restoreReactProps = button => {
+        const props = reactPropsFor(button);
+        if (props == null) return;
+        const original = state.reactPropsOriginals.get(props);
+        if (original == null) return;
+        try {
+          if (original.hadDisabled) props.disabled = original.disabled;
+          else delete props.disabled;
+          if (original.hadAriaDisabled) props['aria-disabled'] = original.ariaDisabled;
+          else delete props['aria-disabled'];
+          if (original.hadOnClick) props.onClick = original.onClick;
+          else delete props.onClick;
+        } catch {}
+        state.reactPropsOriginals.delete(props);
+      };
       state.sync = () => {
         const roots = [...document.querySelectorAll('form[data-type="unified-composer"], [data-composer-surface-variant], [data-composer-layout]')];
-        const root = roots.filter(visible).at(-1) || null;
-        const button = root?.querySelector('button[type="submit"]') || null;
+        const visibleRoots = roots.filter(visible);
+        const managedComposer = [...visibleRoots].reverse()
+          .map(candidate => ({
+            root: candidate,
+            button: [...candidate.querySelectorAll('button')].find(button => button instanceof HTMLButtonElement
+              && (button.getAttribute('type') === 'submit'
+                || button.getAttribute('data-testid') === 'send-button'
+                || /^(?:send|submit)(?:\s|$)/i.test((button.getAttribute('aria-label') || '').trim()))) || null,
+          }))
+          .find(candidate => candidate.button instanceof HTMLButtonElement) || null;
+        const root = managedComposer?.root || visibleRoots.at(-1) || null;
+        const button = managedComposer?.button || (root instanceof Element
+          ? [...root.querySelectorAll('button')].find(candidate => candidate instanceof HTMLButtonElement
+            && (candidate.getAttribute('type') === 'submit'
+              || candidate.getAttribute('data-testid') === 'send-button'
+              || /^(?:send|submit)(?:\s|$)/i.test((candidate.getAttribute('aria-label') || '').trim()))) || null
+          : null);
         if (!(root instanceof Element) || !(button instanceof HTMLButtonElement)) {
           return { managed: false, unlocked: false, selected: false, sendable: false };
         }
-        const selectedModelButtons = [
-          ...document.querySelectorAll('button[aria-haspopup="menu"]'),
-          ...root.querySelectorAll('button'),
-        ];
-        const isChatGptWebModelControl = candidate => {
-          const label = (candidate?.innerText || candidate?.textContent || '').replace(/\s+/g, ' ').trim();
-          return /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test(label) || /\(Web\)\s*$/i.test(label);
-        };
-        const selected = [...new Set(selectedModelButtons)]
-          .filter(candidate => candidate !== button && visible(candidate))
-          .some(isChatGptWebModelControl);
+        const selected = globalThis.${PROVIDER_SELECTED_STATE_KEY} === true;
         const editor = root.querySelector('#prompt-textarea, [contenteditable="true"]');
         const editorText = editor instanceof HTMLElement ? (editor.innerText || editor.textContent || '') : '';
         const hasAttachments = root.querySelector('.composer-attachment-surface') != null;
@@ -117,6 +412,8 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
         const shouldUnlock = state.nativeQuotaBlocked === true
           && selected
           && sendable;
+        let reactUnlocked = false;
+        let reactClickBypassed = false;
         if (shouldUnlock) {
           if (!marked) {
             button.setAttribute(
@@ -132,6 +429,9 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
           }
           if (button.disabled === true) button.disabled = false;
           if (button.getAttribute('aria-disabled') !== 'false') button.setAttribute('aria-disabled', 'false');
+          const reactGate = unlockReactProps(button);
+          reactUnlocked = reactGate.propsUnlocked;
+          reactClickBypassed = reactGate.clickBypassed;
         } else if (!shouldUnlock && marked) {
           const originalDisabled = button.getAttribute('data-cw-chatgpt-web-quota-original-disabled') === 'true';
           if (button.disabled !== originalDisabled) button.disabled = originalDisabled;
@@ -144,10 +444,17 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
           button.removeAttribute('data-cw-chatgpt-web-quota-unlock');
           button.removeAttribute('data-cw-chatgpt-web-quota-original-disabled');
           button.removeAttribute('data-cw-chatgpt-web-quota-original-aria-disabled');
+          restoreReactProps(button);
+        } else {
+          restoreReactProps(button);
         }
         return {
           managed: button.getAttribute('data-cw-chatgpt-web-quota-unlock') === 'true',
-          unlocked: button.disabled === false && button.getAttribute('aria-disabled') !== 'true',
+          unlocked: button.disabled === false
+            && button.getAttribute('aria-disabled') !== 'true'
+            && (!shouldUnlock || reactUnlocked && reactClickBypassed),
+          reactUnlocked,
+          reactClickBypassed,
           selected,
           sendable,
         };
@@ -454,6 +761,8 @@ class CdpContents {
     this.connecting = null;
     this.sequence = 0;
     this.pending = new Map();
+    this.eventListeners = new Map();
+    this.parsedScripts = new Map();
   }
 
   isDestroyed() {
@@ -484,6 +793,19 @@ class CdpContents {
       socket.onmessage = event => {
         let message;
         try { message = JSON.parse(String(event.data)); } catch { return; }
+        if (typeof message?.method === "string") {
+          if (message.method === "Debugger.globalObjectCleared") this.parsedScripts.clear();
+          if (message.method === "Debugger.scriptParsed" && typeof message.params?.scriptId === "string") {
+            this.parsedScripts.set(message.params.scriptId, message.params);
+          }
+          const listeners = this.eventListeners.get(message.method);
+          if (listeners) {
+            for (const listener of [...listeners]) {
+              try { listener(message.params ?? {}, message); } catch {}
+            }
+          }
+          return;
+        }
         if (!Number.isInteger(message?.id)) return;
         const pending = this.pending.get(message.id);
         if (!pending) return;
@@ -496,7 +818,7 @@ class CdpContents {
     return this.connecting;
   }
 
-  async executeJavaScript(expression) {
+  async sendCommand(method, params = {}) {
     await this.connect();
     const socket = this.socket;
     if (!socket || socket.readyState !== 1) throw new Error("Official Codex CDP target is unavailable");
@@ -510,15 +832,43 @@ class CdpContents {
       this.pending.set(id, { resolve, reject, timer });
       socket.send(JSON.stringify({
         id,
-        method: "Runtime.evaluate",
-        params: { expression, awaitPromise: true, returnByValue: true, userGesture: true },
+        method,
+        params,
       }));
+    });
+    return result;
+  }
+
+  async executeJavaScript(expression) {
+    const result = await this.sendCommand("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
     });
     if (result?.exceptionDetails) {
       const description = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "JavaScript evaluation failed";
       throw new Error(description);
     }
     return result?.result?.value;
+  }
+
+  onEvent(method, listener) {
+    if (typeof method !== "string" || typeof listener !== "function") return () => {};
+    let listeners = this.eventListeners.get(method);
+    if (!listeners) {
+      listeners = new Set();
+      this.eventListeners.set(method, listeners);
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) this.eventListeners.delete(method);
+    };
+  }
+
+  knownScripts() {
+    return [...this.parsedScripts.values()];
   }
 
   close() {
@@ -530,9 +880,86 @@ class CdpContents {
       pending.reject(error);
     }
     this.pending.clear();
+    this.eventListeners.clear();
+    this.parsedScripts.clear();
     try { this.socket?.close(); } catch {}
     this.socket = null;
   }
+}
+
+async function installProviderAwareComposerQuotaPatch(contents) {
+  await contents.sendCommand("Debugger.enable");
+  await contents.executeJavaScript("0");
+  const primaryScripts = contents.knownScripts().filter(script => (
+    typeof script?.url === "string"
+    && /^app:\/\/-\/assets\/app-primary-[^/?]+\.js(?:\?.*)?$/.test(script.url)
+  ));
+  if (primaryScripts.length !== 1) {
+    return { applied: false, reason: primaryScripts.length === 0 ? "app-primary-script-missing" : "app-primary-script-ambiguous" };
+  }
+  const script = primaryScripts[0];
+  const sourceResult = await contents.sendCommand("Debugger.getScriptSource", { scriptId: script.scriptId });
+  const source = String(sourceResult?.scriptSource ?? "");
+  const site = providerQuotaBreakpointSite(source);
+  if (!site.found) return { applied: false, reason: site.reason };
+  const modelSite = providerAuthoritativeModelBreakpointSite(source);
+  if (!modelSite.found) return { applied: false, reason: modelSite.reason };
+  await contents.executeJavaScript(providerAwareComposerQuotaRuntimeScript(true));
+  const initialModelState = await contents.executeJavaScript(providerAuthoritativeModelStateScript());
+
+  const modelBreakpoint = await contents.sendCommand("Debugger.setBreakpointByUrl", {
+    url: script.url,
+    lineNumber: modelSite.candidate.lineNumber,
+    columnNumber: modelSite.candidate.columnNumber,
+    condition: providerSelectionBreakpointCondition(modelSite.modelVariable),
+  });
+  if (typeof modelBreakpoint?.breakpointId !== "string") {
+    return { applied: false, reason: "model-breakpoint-install-failed" };
+  }
+
+  const possibleResult = await contents.sendCommand("Debugger.getPossibleBreakpoints", {
+    start: { scriptId: script.scriptId, ...site.candidate },
+    end: { scriptId: script.scriptId, ...site.submit },
+    restrictToFunction: false,
+  });
+  const location = (possibleResult?.locations || []).find(candidate => (
+    Number.isInteger(candidate?.lineNumber)
+    && Number.isInteger(candidate?.columnNumber)
+    && (candidate.lineNumber > site.candidate.lineNumber
+      || candidate.lineNumber === site.candidate.lineNumber && candidate.columnNumber >= site.candidate.columnNumber)
+    && (candidate.lineNumber < site.submit.lineNumber
+      || candidate.lineNumber === site.submit.lineNumber && candidate.columnNumber < site.submit.columnNumber)
+  ));
+  if (!location) {
+    await contents.sendCommand("Debugger.removeBreakpoint", { breakpointId: modelBreakpoint.breakpointId }).catch(() => {});
+    return { applied: false, reason: "quota-breakpoint-location-missing" };
+  }
+  const breakpoint = await contents.sendCommand("Debugger.setBreakpointByUrl", {
+    url: script.url,
+    lineNumber: location.lineNumber,
+    columnNumber: location.columnNumber,
+    condition: PROVIDER_QUOTA_BREAKPOINT_CONDITION,
+  });
+  if (typeof breakpoint?.breakpointId !== "string") {
+    await contents.sendCommand("Debugger.removeBreakpoint", { breakpointId: modelBreakpoint.breakpointId }).catch(() => {});
+    return { applied: false, reason: "quota-breakpoint-install-failed" };
+  }
+  const rerender = initialModelState?.webSelected === true
+    ? await contents.executeJavaScript(providerComposerQuotaRerenderScript())
+    : { dispatched: false, reason: "web-model-not-selected" };
+  return {
+    applied: true,
+    reason: null,
+    breakpointId: breakpoint.breakpointId,
+    breakpointIds: [modelBreakpoint.breakpointId, breakpoint.breakpointId],
+    modelBreakpointId: modelBreakpoint.breakpointId,
+    modelVariable: modelSite.modelVariable,
+    initialModelState,
+    rerender,
+    url: script.url,
+    location: { lineNumber: location.lineNumber, columnNumber: location.columnNumber },
+    modelLocation: { lineNumber: modelSite.candidate.lineNumber, columnNumber: modelSite.candidate.columnNumber },
+  };
 }
 
 function readEndpointRecord(filePath) {
@@ -565,7 +992,8 @@ function createOfficialCodexWallpaperController({
   const resolvedDataRoot = path.resolve(dataRoot);
   const endpointPath = path.join(resolvedDataRoot, "endpoint.json");
   const sessions = new Map();
-  let enabled = false;
+  let wallpapersEnabled = false;
+  let providerGateEnabled = false;
   let endpoint = null;
   let identity = null;
   let refreshTimer = null;
@@ -577,6 +1005,8 @@ function createOfficialCodexWallpaperController({
   let restartRequired = false;
   let lastError = null;
   let restartBaseline = null;
+
+  const integrationActive = () => wallpapersEnabled || providerGateEnabled;
 
   const readRateLimitUsage = async (entry, targetId, checkedAt) => {
     if ((entry.rateLimitUsageCheckedAt || 0) > 0
@@ -614,18 +1044,8 @@ function createOfficialCodexWallpaperController({
     if (providerGateCandidate) {
       usage = await readRateLimitUsage(entry, targetId, checkedAt);
       if (entry.nativeQuotaBlocked === true) {
-        const gate = await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(true));
         entry.rateLimitBlockedSince = null;
-        if (gate?.managed === true && entry.providerGateActive !== true) {
-          entry.providerGateActive = true;
-          logger.info("wallpapers.official_codex_chatgpt_web_rate_limit_gate_unlocked", {
-            targetId,
-            usageFetchedAt: usage?.fetchedAt ?? null,
-            primaryUsedPercent: usage?.primaryUsedPercent ?? null,
-            secondaryUsedPercent: usage?.secondaryUsedPercent ?? null,
-          });
-        }
-        return gate?.unlocked === true;
+        return false;
       }
       if (probe.providerGateUnlocked === true) {
         await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false));
@@ -674,7 +1094,7 @@ function createOfficialCodexWallpaperController({
       lastError = patch.error == null ? null : String(patch.error);
     }
     try {
-      onStatus({ enabled, status, restartRequired, error: lastError, ...patch });
+      onStatus({ enabled: wallpapersEnabled, status, restartRequired, error: lastError, ...patch });
     } catch {}
   };
 
@@ -699,7 +1119,7 @@ function createOfficialCodexWallpaperController({
   };
 
   const refreshTargets = async () => {
-    if (!enabled || !endpoint || refreshInFlight) return 0;
+    if (!integrationActive() || !endpoint || refreshInFlight) return 0;
     refreshInFlight = true;
     try {
       const targets = await discoverTargets(endpoint);
@@ -717,6 +1137,10 @@ function createOfficialCodexWallpaperController({
           entry = {
             contents: new CdpContents(target.webSocketUrl, WebSocketImpl),
             generation: null,
+            providerQuotaPatchApplied: false,
+            providerQuotaPatchAttemptedAt: 0,
+            providerQuotaBreakpointIds: [],
+            providerQuotaBreakpointUrl: null,
             rateLimitBlockedSince: null,
             rateLimitUsageCheckedAt: 0,
             rateLimitUsage: null,
@@ -729,17 +1153,66 @@ function createOfficialCodexWallpaperController({
         try {
           const generation = await entry.contents.executeJavaScript("String(performance.timeOrigin)");
           if (generation !== entry.generation) {
-            const result = await wallpaperManager.install(entry.contents);
+            if (entry.providerQuotaBreakpointIds?.length) {
+              await Promise.all(entry.providerQuotaBreakpointIds.map(breakpointId => (
+                entry.contents.sendCommand("Debugger.removeBreakpoint", { breakpointId }).catch(() => {})
+              )));
+              entry.providerQuotaBreakpointIds = [];
+              entry.providerQuotaBreakpointUrl = null;
+            }
+            const result = wallpapersEnabled
+              ? await wallpaperManager.install(entry.contents)
+              : { libraryCount: 0, transferred: 0, injected: false };
             entry.generation = generation;
-            applied += 1;
-            logger.info("wallpapers.official_codex_applied", {
-              targetId: target.id,
-              libraryCount: result?.libraryCount ?? 0,
-              transferred: result?.transferred ?? 0,
-              injected: result?.injected === true,
-            });
+            entry.providerQuotaPatchApplied = false;
+            entry.providerQuotaPatchAttemptedAt = 0;
+            if (wallpapersEnabled) {
+              applied += 1;
+              logger.info("wallpapers.official_codex_applied", {
+                targetId: target.id,
+                libraryCount: result?.libraryCount ?? 0,
+                transferred: result?.transferred ?? 0,
+                injected: result?.injected === true,
+              });
+            }
           }
-          await maybeRecoverStaleRateLimit(entry, target.id);
+          if (providerGateEnabled) {
+            const checkedAt = now();
+            if (!entry.providerQuotaPatchApplied
+              && checkedAt - entry.providerQuotaPatchAttemptedAt >= 5_000) {
+              entry.providerQuotaPatchAttemptedAt = checkedAt;
+              const patch = await installProviderAwareComposerQuotaPatch(entry.contents);
+              if (patch.applied) {
+                entry.providerQuotaPatchApplied = true;
+                entry.providerQuotaBreakpointIds = patch.breakpointIds ?? [patch.breakpointId].filter(Boolean);
+                entry.providerQuotaBreakpointUrl = patch.url;
+                logger.info("wallpapers.official_codex_provider_quota_state_patch_applied", {
+                  targetId: target.id,
+                  url: patch.url,
+                  lineNumber: patch.location?.lineNumber ?? null,
+                  columnNumber: patch.location?.columnNumber ?? null,
+                  modelLineNumber: patch.modelLocation?.lineNumber ?? null,
+                  modelColumnNumber: patch.modelLocation?.columnNumber ?? null,
+                  modelVariable: patch.modelVariable ?? null,
+                });
+              } else {
+                logger.warn("wallpapers.official_codex_provider_quota_state_patch_unavailable", {
+                  targetId: target.id,
+                  reason: patch.reason,
+                });
+              }
+            }
+            await readRateLimitUsage(entry, target.id, checkedAt);
+            await entry.contents.executeJavaScript(nativeQuotaStateScript(entry.nativeQuotaBlocked === true));
+            await entry.contents.executeJavaScript(providerAuthoritativeModelStateScript());
+            await maybeRecoverStaleRateLimit(entry, target.id);
+          } else {
+            await entry.contents.executeJavaScript(nativeQuotaStateScript(false));
+            if (entry.providerGateActive === true) {
+              await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false));
+              entry.providerGateActive = false;
+            }
+          }
         } catch (error) {
           logger.warn("wallpapers.official_codex_target_failed", {
             targetId: target.id,
@@ -757,7 +1230,7 @@ function createOfficialCodexWallpaperController({
         failures: endpointFailures,
         message: error instanceof Error ? error.message : String(error),
       });
-      if (endpointFailures >= 3 && enabled && identity) {
+      if (endpointFailures >= 3 && integrationActive() && identity) {
         const processes = await listProcesses(identity).catch(() => []);
         stopRefresh();
         beginRestartWait(identity, processes);
@@ -775,7 +1248,7 @@ function createOfficialCodexWallpaperController({
     identity = nextIdentity;
     endpoint = nextEndpoint;
     const applied = await refreshTargets();
-    if (enabled && endpoint && !refreshTimer) {
+    if (integrationActive() && endpoint && !refreshTimer) {
       refreshTimer = setInterval(() => { void refreshTargets(); }, refreshIntervalMs);
       refreshTimer.unref?.();
     }
@@ -797,24 +1270,24 @@ function createOfficialCodexWallpaperController({
     const port = await findPort();
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Could not allocate a loopback port for the official Codex app");
     await launchApp(nextIdentity, port);
-    if (!enabled) return { enabled: false, restartRequired: false, applied: 0, status, error: lastError };
+    if (!integrationActive()) return { enabled: wallpapersEnabled, restartRequired: false, applied: 0, status, error: lastError };
     const nextEndpoint = await waitForEndpoint(nextIdentity, port, { validateEndpoint });
     if (!nextEndpoint) {
       beginRestartWait(nextIdentity);
       publish({ status: "restart-required", restartRequired: true, error: null });
-      return { enabled: true, restartRequired: true, applied: 0, status, error: lastError };
+      return { enabled: wallpapersEnabled, restartRequired: true, applied: 0, status, error: lastError };
     }
     writeEndpoint(nextEndpoint);
     const applied = await startRefresh(nextIdentity, nextEndpoint);
-    return { enabled: true, restartRequired: false, applied, status, error: lastError };
+    return { enabled: wallpapersEnabled, restartRequired: false, applied, status, error: lastError };
   };
 
   function beginRestartWait(nextIdentity, baselineProcesses = null) {
     identity = nextIdentity;
-    if (!enabled || restartTimer) return;
+    if (!integrationActive() || restartTimer) return;
     restartBaseline = processIdentitySet(baselineProcesses);
     restartTimer = setInterval(async () => {
-      if (!enabled || restartTimer === null) return;
+      if (!integrationActive() || restartTimer === null) return;
       try {
         const stored = await attachStoredEndpoint(nextIdentity);
         if (stored) {
@@ -840,7 +1313,7 @@ function createOfficialCodexWallpaperController({
         logger.warn("wallpapers.official_codex_restart_wait_failed", {
           message: error instanceof Error ? error.message : String(error),
         });
-        if (enabled && restartTimer === null) {
+        if (integrationActive() && restartTimer === null) {
           beginRestartWait(nextIdentity);
         }
       }
@@ -849,7 +1322,7 @@ function createOfficialCodexWallpaperController({
   }
 
   async function prepareExternalRestart() {
-    if (!enabled) return null;
+    if (!integrationActive()) return null;
     const nextIdentity = identity || await resolveIdentity();
     stopRestartWait();
     stopRefresh();
@@ -859,13 +1332,13 @@ function createOfficialCodexWallpaperController({
   }
 
   async function resumeExternalRestart() {
-    if (!enabled) return null;
+    if (!integrationActive()) return null;
     const nextIdentity = identity || await resolveIdentity();
     return launchAndAttach(nextIdentity);
   }
 
   async function abortExternalRestart() {
-    if (!enabled) return null;
+    if (!integrationActive()) return null;
     const nextIdentity = identity || await resolveIdentity();
     const stored = await attachStoredEndpoint(nextIdentity);
     if (stored) {
@@ -880,15 +1353,15 @@ function createOfficialCodexWallpaperController({
   const setEnabledNow = async next => {
     if (platform !== "win32") {
       if (next) throw new Error("Codex Wallpapers official-app integration is currently available on Windows only");
-      enabled = false;
+      wallpapersEnabled = false;
       stopRestartWait();
       stopRefresh();
       publish({ status: "disabled", restartRequired: false, error: null });
       return { enabled: false, restartRequired: false, applied: 0 };
     }
     if (!next) {
-      enabled = false;
-      stopRestartWait();
+      wallpapersEnabled = false;
+      if (!providerGateEnabled) stopRestartWait();
       const activeSessions = [...sessions.values()];
       if (activeSessions.length === 0) {
         try {
@@ -908,12 +1381,13 @@ function createOfficialCodexWallpaperController({
           message: error instanceof Error ? error.message : String(error),
         });
       })));
-      stopRefresh();
+      if (!providerGateEnabled) stopRefresh();
       publish({ status: "disabled", restartRequired: false, error: null });
       return { enabled: false, restartRequired: false, applied: 0, status, error: lastError };
     }
 
-    enabled = true;
+    wallpapersEnabled = true;
+    for (const entry of sessions.values()) entry.generation = null;
     publish({ status: "starting", restartRequired: false, error: null });
     await wallpaperManager.checkLibrary();
     identity = await resolveIdentity();
@@ -933,6 +1407,56 @@ function createOfficialCodexWallpaperController({
     return launchAndAttach(identity);
   };
 
+  const setProviderGateEnabledNow = async next => {
+    if (platform !== "win32") {
+      providerGateEnabled = false;
+      if (!wallpapersEnabled) {
+        stopRestartWait();
+        stopRefresh();
+      }
+      return { enabled: false, restartRequired: false, applied: 0 };
+    }
+
+    if (!next) {
+      providerGateEnabled = false;
+      await Promise.all([...sessions.values()].map(async entry => {
+        if (entry.contents.isDestroyed?.()) return;
+        await entry.contents.executeJavaScript(nativeQuotaStateScript(false)).catch(() => {});
+        await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false)).catch(() => {});
+        await entry.contents.executeJavaScript(providerAwareComposerQuotaRuntimeScript(false)).catch(() => {});
+        if (entry.providerQuotaBreakpointIds?.length) {
+          await Promise.all(entry.providerQuotaBreakpointIds.map(breakpointId => (
+            entry.contents.sendCommand("Debugger.removeBreakpoint", { breakpointId }).catch(() => {})
+          )));
+        }
+        entry.providerQuotaPatchApplied = false;
+        entry.providerQuotaBreakpointIds = [];
+        entry.providerQuotaBreakpointUrl = null;
+        entry.providerGateActive = false;
+      }));
+      if (!wallpapersEnabled) {
+        stopRestartWait();
+        stopRefresh();
+      }
+      return { enabled: false, restartRequired: false, applied: 0 };
+    }
+
+    providerGateEnabled = true;
+    identity = await resolveIdentity();
+    const stored = await attachStoredEndpoint(identity);
+    if (stored) {
+      const applied = await startRefresh(identity, stored);
+      return { enabled: true, restartRequired: false, applied, status, error: lastError };
+    }
+    const processes = await listProcesses(identity);
+    if (processes.length > 0) {
+      beginRestartWait(identity, processes);
+      return { enabled: true, restartRequired: true, applied: 0, status: "restart-required", error: null };
+    }
+    const result = await launchAndAttach(identity);
+    return { ...result, enabled: true };
+  };
+
   return {
     setEnabled(next) {
       const requested = next === true;
@@ -944,6 +1468,11 @@ function createOfficialCodexWallpaperController({
         });
         throw error;
       });
+      return operation;
+    },
+    setProviderGateEnabled(next) {
+      const requested = next === true;
+      operation = operation.catch(() => {}).then(() => setProviderGateEnabledNow(requested));
       return operation;
     },
     destroy() {
@@ -977,6 +1506,11 @@ module.exports = {
   launchOfficialCodexApplication,
   listOfficialCodexProcesses,
   officialAppTarget,
+  installProviderAwareComposerQuotaPatch,
+  providerQuotaBreakpointSite,
+  providerAwareComposerQuotaRuntimeScript,
+  providerAuthoritativeModelStateScript,
+  providerComposerQuotaRerenderScript,
   providerAwareRateLimitGateScript,
   resolveOfficialCodexIdentity,
   usageAllowsRateLimitRecovery,

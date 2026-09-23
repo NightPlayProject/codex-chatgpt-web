@@ -74,7 +74,12 @@ function validEndpoint(port = 9333) {
   return { port, browserId: "browser_1", version: identity.Version };
 }
 
-function makeProviderGateVmContext({ disabled = true, ariaDisabled = "true" } = {}) {
+function makeProviderGateVmContext({
+  disabled = true,
+  ariaDisabled = "true",
+  providerInsideRoot = true,
+  providerIsSelectedControl = !providerInsideRoot,
+} = {}) {
   class FakeElement {
     constructor({ text = "" } = {}) {
       this.innerText = text;
@@ -110,9 +115,12 @@ function makeProviderGateVmContext({ disabled = true, ariaDisabled = "true" } = 
   submit.setAttribute("type", "submit");
   if (ariaDisabled != null) submit.setAttribute("aria-disabled", ariaDisabled);
   const model = new FakeButton({ text: "ChatGPT Web — GPT-5.6 Sol" });
+  if (providerIsSelectedControl) model.setAttribute("aria-haspopup", "menu");
   const editor = new FakeElement({ text: "hello" });
   const root = new FakeElement();
-  root.querySelectorAll = selector => selector === "button" ? [model, submit] : [];
+  root.querySelectorAll = selector => selector === "button"
+    ? (providerInsideRoot ? [model, submit] : [submit])
+    : [];
   root.querySelector = selector => {
     if (selector === 'button[type="submit"]') return submit;
     if (selector === '#prompt-textarea, [contenteditable="true"]') return editor;
@@ -130,7 +138,11 @@ function makeProviderGateVmContext({ disabled = true, ariaDisabled = "true" } = 
     },
     document: {
       documentElement: root,
-      querySelectorAll: () => [root],
+      querySelectorAll: selector => selector === "button"
+        ? [model, submit]
+        : selector === 'button[aria-haspopup="menu"]'
+          ? (providerIsSelectedControl ? [model] : [])
+          : [root],
     },
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
     queueMicrotask,
@@ -230,6 +242,45 @@ test("ChatGPT Web provider gate handles a natively disabled quota button and res
   assert.equal(submit.disabled, true);
   assert.equal(submit.getAttribute("aria-disabled"), "true");
   assert.equal(submit.getAttribute("data-cw-chatgpt-web-quota-unlock"), null);
+});
+
+test("ChatGPT Web provider gate detects the v6 provider control outside the composer", () => {
+  const { context, submit } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: null,
+    providerInsideRoot: false,
+  });
+
+  const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
+  assert.equal(probe.rateLimitBlocked, true);
+  assert.equal(probe.chatGptWebSelected, true);
+  assert.equal(probe.hasSendableContent, true);
+
+  const unlocked = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
+  assert.equal(unlocked.managed, true);
+  assert.equal(unlocked.unlocked, true);
+  assert.equal(unlocked.selected, true);
+  assert.equal(submit.disabled, false);
+  assert.equal(submit.getAttribute("aria-disabled"), "false");
+});
+
+test("ChatGPT Web menu options outside the composer do not impersonate the selected provider", () => {
+  const { context, submit } = makeProviderGateVmContext({
+    disabled: true,
+    ariaDisabled: "true",
+    providerInsideRoot: false,
+    providerIsSelectedControl: false,
+  });
+
+  const probe = vm.runInNewContext(RATE_LIMIT_GATE_PROBE_SCRIPT, context);
+  assert.equal(probe.chatGptWebSelected, false);
+
+  const gate = vm.runInNewContext(providerAwareRateLimitGateScript(true), context);
+  assert.equal(gate.managed, false);
+  assert.equal(gate.unlocked, false);
+  assert.equal(gate.selected, false);
+  assert.equal(submit.disabled, true);
+  assert.equal(submit.getAttribute("aria-disabled"), "true");
 });
 
 test("ChatGPT Web provider gate unlocks send while native Codex quota is exhausted", async () => {

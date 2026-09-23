@@ -27,7 +27,11 @@ const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
   };
   const root = roots.filter(visible).at(-1) || null;
   const button = root?.querySelector('button[type="submit"]') || null;
-  const chatGptWebSelected = root instanceof Element && [...root.querySelectorAll('button')]
+  const selectedModelButtons = [
+    ...document.querySelectorAll('button[aria-haspopup="menu"]'),
+    ...(root instanceof Element ? root.querySelectorAll('button') : []),
+  ];
+  const chatGptWebSelected = [...new Set(selectedModelButtons)]
     .filter(candidate => candidate !== button && visible(candidate))
     .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
   const editor = root?.querySelector('#prompt-textarea, [contenteditable="true"]') || null;
@@ -35,7 +39,7 @@ const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
   const hasAttachments = root instanceof Element && root.querySelector('.composer-attachment-surface') != null;
   return {
     rateLimitBlocked: button instanceof HTMLButtonElement
-      && button.getAttribute('aria-disabled') === 'true',
+      && (button.disabled === true || button.getAttribute('aria-disabled') === 'true'),
     providerGateUnlocked: button instanceof HTMLButtonElement
       && button.getAttribute('data-cw-chatgpt-web-quota-unlock') === 'true',
     chatGptWebSelected,
@@ -65,10 +69,10 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
   return String.raw`(() => {
     const key = '__codexWebGptProviderRateLimitGate';
     let state = globalThis[key];
-    if (!state || state.version !== 2 || typeof state.sync !== 'function') {
+    if (!state || state.version !== 3 || typeof state.sync !== 'function') {
       try { state?.observer?.disconnect?.(); } catch {}
       state = {
-        version: 2,
+        version: 3,
         nativeQuotaBlocked: false,
         scheduled: false,
         observer: null,
@@ -88,7 +92,11 @@ function providerAwareRateLimitGateScript(nativeQuotaBlocked) {
         if (!(root instanceof Element) || !(button instanceof HTMLButtonElement)) {
           return { managed: false, unlocked: false, selected: false, sendable: false };
         }
-        const selected = [...root.querySelectorAll('button')]
+        const selectedModelButtons = [
+          ...document.querySelectorAll('button[aria-haspopup="menu"]'),
+          ...root.querySelectorAll('button'),
+        ];
+        const selected = [...new Set(selectedModelButtons)]
           .filter(candidate => candidate !== button && visible(candidate))
           .some(candidate => /^ChatGPT Web(?:\s*[—-]|\s|$)/i.test((candidate.innerText || candidate.textContent || '').replace(/\s+/g, ' ').trim()));
         const editor = root.querySelector('#prompt-textarea, [contenteditable="true"]');

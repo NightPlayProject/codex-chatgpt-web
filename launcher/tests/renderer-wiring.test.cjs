@@ -14,6 +14,25 @@ const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "prelo
 const accountSwitcherSource = fs.readFileSync(path.join(launcherRoot, "electron", "account-switcher.cjs"), "utf8");
 const launcherHtml = fs.readFileSync(path.join(launcherRoot, "index.html"), "utf8");
 
+test("update availability cannot be lost while the initial account snapshot is pending", () => {
+  const initialization = appSource.slice(appSource.indexOf("export function App()"), appSource.indexOf("const updateState = useCallback"));
+  const subscribe = initialization.indexOf("api.onUpdateState(");
+  const requestSnapshot = initialization.indexOf("void api.snapshot()");
+  assert.ok(subscribe >= 0 && requestSnapshot > subscribe, "subscribe before requesting the initial snapshot");
+  assert.match(initialization, /latestUpdate = update;/);
+  assert.match(initialization, /setSnapshot\(\{ \.\.\.next, update: latestUpdate \?\? next\.update \}\)/);
+
+  const snapshotHandler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:snapshot"'),
+    electronMain.indexOf('handle("launcher:set-language"'),
+  );
+  assert.ok(
+    snapshotHandler.indexOf("accounts: accountSwitcher ? await accountSwitcher.snapshot() : null")
+      < snapshotHandler.indexOf("update: updateController?.getState()"),
+    "read update state after the slow account lookup",
+  );
+});
+
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
   assert.match(appSource, /setBrowserSurfaceActive\(browserSurfaceActive\)\.then\(\(\) => \{/);

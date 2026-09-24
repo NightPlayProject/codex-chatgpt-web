@@ -580,8 +580,8 @@ function registerIpc({ logger, stateStore }) {
     version: app.getVersion(),
     smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(stateStore.read()),
     operation: lastOperation,
-    update: updateController?.getState() ?? { status: "disabled" },
     accounts: accountSwitcher ? await accountSwitcher.snapshot() : null,
+    update: updateController?.getState() ?? { status: "disabled" },
   }));
 
   handle("launcher:set-language", (_event, language) => {

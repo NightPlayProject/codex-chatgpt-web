@@ -56,16 +56,7 @@ export function App() {
   useEffect(() => {
     if (!api) return;
     let cancelled = false;
-    void api.snapshot().then((next) => {
-      if (cancelled) return;
-      setSnapshot(next);
-      setBrowser(next.browser);
-      setLogs(next.logs);
-      setOperation(next.operation);
-      if (next.operation?.status === "failed" && next.operation.name !== "mcp-verification") {
-        setError(next.operation.message);
-      }
-    }).catch((cause) => setError(messageOf(cause)));
+    let latestUpdate: LauncherSnapshot["update"] | null = null;
     const unsubscribeState = api.onStateChanged((state) => {
       setSnapshot((current) => current
         ? {
@@ -83,7 +74,20 @@ export function App() {
     });
     const unsubscribeLog = api.onLog((record) => setLogs((current) => [...current.slice(-299), record]));
     const unsubscribeUpdate = api.onUpdateState((update) => {
+      latestUpdate = update;
       setSnapshot((current) => current ? { ...current, update } : current);
+    });
+    void api.snapshot().then((next) => {
+      if (cancelled) return;
+      setSnapshot({ ...next, update: latestUpdate ?? next.update });
+      setBrowser(next.browser);
+      setLogs(next.logs);
+      setOperation(next.operation);
+      if (next.operation?.status === "failed" && next.operation.name !== "mcp-verification") {
+        setError(next.operation.message);
+      }
+    }).catch((cause) => {
+      if (!cancelled) setError(messageOf(cause));
     });
     return () => {
       cancelled = true;

@@ -1423,7 +1423,11 @@ async function start() {
     });
   }
   await loadRenderer(mainWindow);
-  if (!launcherSmokeTest) void updateController.checkOnce();
+  if (!launcherSmokeTest) {
+    void updateController.checkOnce();
+    const updatePollTimer = setInterval(() => void updateController.checkAgain(), 5 * 60_000);
+    updatePollTimer.unref?.();
+  }
   if (launcherSmokeTest) {
     const smokeRuntimeRoot = runtimeRootProvider();
     if (app.isPackaged && !smokeRuntimeRoot) {

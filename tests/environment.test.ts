@@ -1503,6 +1503,62 @@ describe("trusted Codex task environment continuity", () => {
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
   });
 
+  test.each(["goal", "ordinary"])("replayed untagged root environment stays historical during a %s turn", kind => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const historicalEnvironment = {
+      type: "message", role: "user", id: "msg_historical_environment",
+      content: [{ type: "input_text", text: environmentXml }],
+    };
+    const previousTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    const currentInstruction = kind === "goal"
+      ? {
+        type: "message", role: "user", id: "msg_current_goal",
+        content: [{ type: "input_text", text: '<codex_internal_context source="goal"><objective>Continue the task</objective></codex_internal_context>' }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId, content_item_kinds: ["goal.internal_context"],
+        },
+      }
+      : {
+        type: "message", role: "user", id: "msg_current_instruction",
+        content: [{ type: "input_text", text: "Continue the task" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId, content_item_kinds: ["user.text"],
+        },
+      };
+    body.input = [
+      historicalEnvironment,
+      {
+        type: "message", role: "user", id: "msg_previous_instruction",
+        content: [{ type: "input_text", text: "Original task" }],
+        internal_chat_message_metadata_passthrough: { turn_id: previousTurnId, content_item_kinds: ["user.text"] },
+      },
+      currentInstruction,
+    ];
+    const session = { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } };
+    writeFileSync(rolloutPath, [
+      session,
+      { type: "response_item", payload: historicalEnvironment },
+      { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } },
+      childTurnContext(),
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
+    expect(store.resolve(request).cwd).toBe(root);
+
+    // A current malformed update is not a historical message even if the workspace is unchanged.
+    body.input.push({
+      type: "message", role: "user", id: "msg_current_malformed_environment",
+      content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
+    });
+    expect(() => store.resolve(request)).toThrow("missing cwd");
+    body.input.pop();
+    const historicalPart = historicalEnvironment.content[0]!;
+    historicalPart.text = environmentXml.replace(root, resolve(root, "different-workspace"));
+    expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
+  });
+
   test("proven steering may recover the exact current rollout when contextual user items break environment adjacency", () => {
     const { codexHome, request } = resumedRootFixture();
     const body = request._rawBody as { input: Array<Record<string, unknown>> };

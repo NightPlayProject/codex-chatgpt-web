@@ -165,8 +165,12 @@ export class ChatGptThreadEnvironmentStore {
       const currentCompaction = hasCurrentFilesystemContext && isChatGptCompactionContinuation(parsed);
       const currentGoal = hasCurrentFilesystemContext && isChatGptGoalContinuation(parsed);
       const currentContinuation = currentCompaction || currentGoal;
-      const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && lineage
-        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+      const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      // A replayed, untagged environment can look current after native compaction removes the
+      // intervening assistant output. Root tasks have the same exact-rollout proof as subagents:
+      // accept that message only when its id and content precede this turn's native task boundary.
+      const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && rolloutIdentity
+        ? unattributedChatGptEnvironmentMessages(parsed, !lineage) : undefined;
       const steeringClaim = hasCurrentFilesystemContext && !currentContinuation
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentFilesystemContext && !currentContinuation
@@ -178,7 +182,6 @@ export class ChatGptThreadEnvironmentStore {
         && !calendarDelta;
       if (blockedCurrentFilesystemFallback && !options.allowCurrentFilesystemRolloutRecovery) throw error;
       const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
-      const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
       const compactionSourceTurnId = parsed._compactionRequest

@@ -226,6 +226,7 @@ export interface ChatGptUnattributedEnvironmentMessage {
 /** These are claims to locate in native history, never a source of filesystem authority. */
 export function unattributedChatGptEnvironmentMessages(
   parsed: CodexParsedRequest,
+  requireUnambiguousCwd = false,
 ): ChatGptUnattributedEnvironmentMessage[] | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
@@ -240,6 +241,11 @@ export function unattributedChatGptEnvironmentMessages(
     if (owner !== undefined && owner !== currentTurnId) continue;
     if (owner !== undefined || item.role !== "user"
       || typeof item.id !== "string" || !item.id) return undefined;
+    // Root-task replay must not relabel a malformed current cwd update as old authority.
+    if (requireUnambiguousCwd
+      && environmentCwdMatches(rawMessageText(item), clientMetadataWorkspaceRoots(parsed)).length !== 1) {
+      return undefined;
+    }
     messages.push({ id: item.id, content: item.content });
   }
   return messages.length > 0 ? messages : undefined;

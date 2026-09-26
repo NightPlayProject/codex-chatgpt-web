@@ -162,6 +162,28 @@ test("diagnostic export preserves source logs through links and a destination re
   }
 });
 
+test("diagnostic export distinguishes Windows file IDs beyond Number precision", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-export-file-id-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "export.jsonl");
+  const stat = fs.statSync;
+  try {
+    fs.writeFileSync(filePath, `${JSON.stringify({ at: "2026-09-25T00:00:00Z", level: "info", event: "test", detail: {} })}\n`);
+    fs.writeFileSync(destinationPath, "previous export");
+    fs.statSync = (target, options) => {
+      const result = stat(target, options);
+      if (target !== filePath && target !== destinationPath) return result;
+      const exactId = target === filePath ? 9007199254740993n : 9007199254740992n;
+      return Object.assign(result, { ino: options?.bigint ? exactId : Number(exactId) });
+    };
+    assert.equal(exportSanitizedLogs({ filePath, destinationPath }), 1);
+    assert.match(fs.readFileSync(destinationPath, "utf8"), /"event":"test"/);
+  } finally {
+    fs.statSync = stat;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a closed Windows diagnostic pipe is recorded without becoming an uncaught process error", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-process-pipe-"));
   const filePath = path.join(root, "process-stream-errors.log");

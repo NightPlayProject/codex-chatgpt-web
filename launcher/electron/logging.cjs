@@ -75,13 +75,15 @@ function sanitizeForExport(value, seen = new WeakSet()) {
 function exportSanitizedLogs({ filePath, destinationPath }) {
   const sourcePaths = [`${filePath}.1`, filePath];
   const destination = path.resolve(destinationPath);
-  const destinationStat = fs.statSync(destination, { throwIfNoEntry: false });
+  // Windows file IDs can exceed Number.MAX_SAFE_INTEGER. Read exact inode IDs
+  // so two distinct files never compare equal after number rounding.
+  const destinationStat = fs.statSync(destination, { throwIfNoEntry: false, bigint: true });
   if (sourcePaths.some(sourcePath => {
     if (path.resolve(sourcePath) === destination) return true;
     if (!destinationStat) return false;
-    const sourceStat = fs.statSync(sourcePath, { throwIfNoEntry: false });
+    const sourceStat = fs.statSync(sourcePath, { throwIfNoEntry: false, bigint: true });
     return sourceStat && (
-      (sourceStat.ino !== 0 && sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino)
+      (sourceStat.ino !== 0n && sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino)
       || fs.realpathSync(sourcePath) === fs.realpathSync(destination)
     );
   })) {

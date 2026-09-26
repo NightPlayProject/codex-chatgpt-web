@@ -149,7 +149,9 @@ export async function activateChatGptEffortMenu(
 
   const settleMs = options.settleMs ?? 3_000;
   await clearGhostEffortState(page, control);
-  await control.click({ force: true, timeout: Math.max(1, settleMs) });
+  // The effort trigger opens an in-page menu. Playwright's navigation wait can
+  // outlive that menu transition on ChatGPT's SPA and fail a successful click.
+  await control.click({ force: true, noWaitAfter: true, timeout: Math.max(1, settleMs) });
   const clickedSurface = await waitForEffortSurface(page, control, settleMs);
   if (clickedSurface) return { method: "click", ...clickedSurface };
 

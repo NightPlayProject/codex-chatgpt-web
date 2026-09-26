@@ -73,14 +73,20 @@ export function chatGptModelFamilyMatches(
   // Latest uses 5.6 for the existing lower-effort multipart acknowledgements and 6 for Pro.
   // Never interpret a future Latest Pro model as 6, or a lower effort as the final Pro response.
   const expected = family === "6" && effort !== "max" ? "5.6" : family;
+  const expectedMode = {
+    low: "Instant", medium: "Medium", high: "High", xhigh: "Extra High", max: "Pro",
+  }[effort];
   const states = descriptions.flatMap(text => {
-    const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^,，]+)(?:[,，]|$)/i
-      .exec(text.replace(/\s+/g, " ").trim());
-    return match ? [{ version: match[1], name: match[2]?.toLowerCase(), mode: match[3]!.trim() }] : [];
+    const announcement = text.replace(/\s+/g, " ").trim();
+    const match = /^(?:(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+)?(Instant|Medium|High|Extra High|Pro)\s*[,，]\s*\d+\s+of\s+\d+\.?$/i
+      .exec(announcement);
+    return match ? [{ version: match[1], name: match[2]?.toLowerCase(), mode: match[3] }] : [];
   });
-  return states.length > 0 && states.every(state => state.version === expected
-    && (!state.name || state.name === (expected === "5.6" ? "sol" : "astra"))
-    && (effort === "max" ? /^Pro$/i.test(state.mode) : !/^Pro$/i.test(state.mode)));
+  return states.length > 0 && states.every(state => state.mode?.toLowerCase() === expectedMode.toLowerCase()
+    // The current picker announces only "High, 3 of 3" for non-Pro efforts. The caller
+    // separately requires the exact model radio row to be checked and the slider index to match.
+    && (state.version ? state.version === expected
+      && (!state.name || state.name === (expected === "5.6" ? "sol" : "astra")) : effort !== "max"));
 }
 
 export async function assertChatGptModelFamily(

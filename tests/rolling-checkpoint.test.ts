@@ -55,6 +55,22 @@ function request(
   });
 }
 
+function solRequest(
+  threadId: string,
+  turnId: string,
+  input: Record<string, unknown>[],
+) {
+  return parseRequest({
+    model: "gpt-5.6-sol",
+    input,
+    stream: true,
+    reasoning: { effort: "high" },
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+  });
+}
+
 test("Luna checkpoint stream hides a marker split across arbitrary DOM deltas", () => {
   const stream = new ChatGptLunaCheckpointStream();
   const checkpointText = "Objective:\nFinish the requested repository audit.\nPending:\n- Inspect remaining files.";
@@ -118,6 +134,55 @@ test("Luna checkpoint treats a malformed quoted payload as opaque semantic state
   });
 });
 
+test("Luna checkpoint finalizes from the last matching raw snapshot when tool activity replaces the final DOM", () => {
+  const stream = new ChatGptLunaCheckpointStream();
+  const checkpointText = "Objective:\nPreserve continuity across automatic compaction.\nMarker:\nORBIT-742";
+  const raw = `Visible answer.\n\n${CHATGPT_LUNA_CHECKPOINT_MARKER}\n${checkpointText}`;
+  stream.push(raw);
+  stream.observeRawResponse(raw);
+
+  expect(stream.finish("Visible answer after tool activity.")).toEqual({
+    answer: "Visible answer.",
+    captured: {
+      checkpoint: { version: 2, summary: checkpointText },
+      answerHash: hashChatGptLunaAnswer("Visible answer."),
+    },
+  });
+});
+
+test("Luna checkpoint rejects a stale raw snapshot when streamed checkpoint content changes afterward", () => {
+  const stream = new ChatGptLunaCheckpointStream();
+  const raw = `Visible answer.\n\n${CHATGPT_LUNA_CHECKPOINT_MARKER}\nState:\n- First snapshot`;
+  stream.push(raw);
+  stream.observeRawResponse(raw);
+  stream.push("\n- Later checkpoint state");
+
+  expect(() => stream.finish("Visible answer after tool activity."))
+    .toThrow("response must contain exactly one raw rolling checkpoint marker");
+});
+
+test("Luna checkpoint still rejects duplicate raw markers before a later DOM revision removes them", () => {
+  const stream = new ChatGptLunaCheckpointStream();
+  const raw = `Visible answer.\n\n${CHATGPT_LUNA_CHECKPOINT_MARKER}\nState:\n- valid`;
+  stream.push(raw);
+  stream.observeRawResponse(
+    `${raw}\n${CHATGPT_LUNA_CHECKPOINT_MARKER}\nState:\n- duplicate`,
+  );
+
+  expect(() => stream.finish("Visible answer after tool activity."))
+    .toThrow("response must contain exactly one raw rolling checkpoint marker");
+});
+
+test("Luna checkpoint rejects an empty trusted raw checkpoint", () => {
+  const stream = new ChatGptLunaCheckpointStream();
+  const raw = `Visible answer.\n\n${CHATGPT_LUNA_CHECKPOINT_MARKER}`;
+  stream.push(raw);
+  stream.observeRawResponse(raw);
+
+  expect(() => stream.finish("Visible answer after tool activity."))
+    .toThrow("response must contain exactly one raw rolling checkpoint marker");
+});
+
 test("Luna checkpoint stream preserves the answer and skips the cache when the model omits its private tail", () => {
   const stream = new ChatGptLunaCheckpointStream();
   const visible = stream.push("A normal answer without a checkpoint.");
@@ -147,6 +212,25 @@ test("Luna prompt requests the strict private checkpoint only when capture is en
   expect(rolling.text).toContain("never permit an empty checkpoint");
   expect(rolling.text).toContain("Objective:");
   expect(rolling.text).toContain(`${CHATGPT_LUNA_CHECKPOINT_MAX_TOKENS.toLocaleString("en-US")} tokens`);
+});
+
+test("Sol rolling checkpoint capture is limited to normal automatic turns", () => {
+  const parsed = solRequest("thread_sol_prompt", "turn_sol_prompt", [
+    message("user", "Inspect the Sol turn.", "turn_sol_prompt"),
+  ]);
+  const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
+  const normal = compileChatGptWebPrompt(parsed, capabilities, undefined, { captureLunaCheckpoint: true });
+  expect(normal.text).toContain(CHATGPT_LUNA_CHECKPOINT_MARKER);
+  expect(normal.text).toContain("private rolling task checkpoint for the next Sol turn");
+
+  const compact = structuredClone(parsed);
+  compact._compactionRequest = true;
+  expect(() => compileChatGptWebPrompt(
+    compact,
+    capabilities,
+    undefined,
+    { captureLunaCheckpoint: true },
+  )).toThrow("Rolling checkpoints are supported only for normal automatic ChatGPT Web turns");
 });
 
 test("Luna checkpoint replaces only exact-parent history and preserves the current native turn", () => {
@@ -260,4 +344,71 @@ test("Luna checkpoint preserves the server-resolved backend model when the raw b
   expect(applied.applied).toBeTrue();
   expect(applied.parsed.modelId).toBe("gpt-5.6-luna");
   expect(applied.parsed.options.reasoning).toBe("low");
+});
+
+test("Sol checkpoint replaces only exact-parent history while preserving current-turn evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-sol-checkpoint-"));
+  roots.push(root);
+  const path = join(root, "sol-checkpoints.json");
+  const threadId = "thread_sol_checkpoint";
+  const sourceTurnId = "turn_sol_source";
+  const originalTask = `Original Sol task ${"s".repeat(40_000)}`;
+  const source = solRequest(threadId, sourceTurnId, [
+    message("developer", "Original Sol contract", sourceTurnId),
+    message("user", originalTask, sourceTurnId),
+  ]);
+  const answer = "Sol completed the first step.";
+  const store = new ChatGptLunaCheckpointStore(path, Date.now, "Sol");
+  store.commit(source, {
+    checkpoint: {
+      version: 2,
+      summary: "Objective:\nFinish the Sol task.\nPending:\n- Continue from the exact parent answer.",
+    },
+    answerHash: hashChatGptLunaAnswer(answer),
+  }, answer);
+
+  const nextTurnId = "turn_sol_next";
+  const next = solRequest(threadId, nextTurnId, [
+    message("developer", "Original Sol contract", sourceTurnId),
+    message("user", originalTask, sourceTurnId),
+    message("assistant", answer, sourceTurnId),
+    message("developer", "Fresh Sol contract", nextTurnId),
+    message("user", "Continue the Sol task", nextTurnId),
+    message("assistant", "Current Sol progress", nextTurnId),
+    {
+      type: "function_call",
+      call_id: "call_sol_current",
+      name: "exec_command",
+      arguments: JSON.stringify({ cmd: "pwd" }),
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_sol_current",
+      output: "current Sol tool evidence",
+    },
+  ]);
+  const applied = store.apply(next);
+  expect(applied.applied).toBeTrue();
+  expect(extractChatGptTurnUserRevision(applied.parsed)).toEqual(extractChatGptTurnUserRevision(next));
+  const encoded = JSON.stringify(applied.parsed.context.messages);
+  expect(encoded).toContain("Compressed Sol task history");
+  expect(encoded).toContain("Fresh Sol contract");
+  expect(encoded).toContain("Continue the Sol task");
+  expect(encoded).toContain("Current Sol progress");
+  expect(encoded).toContain("current Sol tool evidence");
+  expect(encoded).not.toContain("Original Sol contract");
+  expect(encoded).not.toContain("Original Sol task");
+
+  const wrongParent = solRequest(threadId, "turn_sol_branch", [
+    message("assistant", "A different Sol parent.", sourceTurnId),
+    message("user", "Continue another branch", "turn_sol_branch"),
+  ]);
+  const rejected = store.apply(wrongParent);
+  expect(rejected.applied).toBeFalse();
+  expect(rejected.reason).toContain("exact parent");
+
+  const missing = new ChatGptLunaCheckpointStore(join(root, "missing-sol-checkpoints.json"), Date.now, "Sol")
+    .apply(next);
+  expect(missing.applied).toBeFalse();
+  expect(JSON.stringify(missing.parsed.context.messages)).toContain("Original Sol task");
 });

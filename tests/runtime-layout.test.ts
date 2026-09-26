@@ -99,6 +99,22 @@ test("default setup uses the fixed production connector identities", () => {
   expect(defaultConfig("full").subagentProtocol).toBe("compatibility-v1");
   expect(defaultConfig("full").browserInteractionMode).toBe("automatic");
   expect(defaultConfig("full").zeroRiskProEnabled).toBe(false);
+  expect(defaultConfig("full").autoApproveToolCalls).toBe(true);
+  expect(defaultConfig("browser-only").autoApproveToolCalls).toBe(false);
+});
+
+test("Full automatic provider access upgrades stale approval settings while Zero Risk stays manual", () => {
+  const staleFull = { ...defaultConfig("full"), autoApproveToolCalls: false };
+  expect(providerConfig(staleFull).chatgptWeb).toMatchObject({
+    localToolsEnabled: true,
+    autoApproveToolCalls: true,
+  });
+
+  const zeroRisk = { ...staleFull, browserInteractionMode: "manual" as const };
+  expect(providerConfig(zeroRisk).chatgptWeb).toMatchObject({
+    localToolsEnabled: true,
+    autoApproveToolCalls: false,
+  });
 });
 
 test.each([
@@ -281,39 +297,6 @@ test("manual provider configuration preserves a distinct backend without guessin
   });
 });
 
-test("conversation preferences survive reload; saved chats also apply to Zero Risk", () => {
-  const root = join(tmpdir(), `codex-web-fresh-config-${process.pid}-${Date.now()}`);
-  roots.push(root);
-  process.env.CODEX_CHATGPT_WEB_HOME = root;
-  mkdirSync(root, { recursive: true });
-  const config: Record<string, unknown> = { ...defaultConfig("browser-only") };
-  const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
-  expect(config.experimentalFreshConversationPerTurn).toBe(false);
-  expect(config.useSavedChats).toBe(false);
-  delete config.useSavedChats;
-  delete config.experimentalFreshConversationPerTurn;
-  persist();
-  expect(loadConfig()!.experimentalFreshConversationPerTurn).toBe(false);
-  expect(loadConfig()!.useSavedChats).toBe(false);
-  config.useSavedChats = true;
-  config.experimentalFreshConversationPerTurn = true;
-  persist();
-  const loaded = loadConfig()!;
-  expect(providerConfig(loaded).chatgptWeb!.useSavedChats).toBe(true);
-  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" }).chatgptWeb!.useSavedChats).toBe(true);
-  expect(providerConfig(loaded).chatgptWeb!.experimentalFreshConversationPerTurn).toBe(true);
-  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" })
-    .chatgptWeb!.experimentalFreshConversationPerTurn).toBe(false);
-  expect(loaded.experimentalFreshConversationPerTurn).toBe(true);
-  config.experimentalFreshConversationPerTurn = "true";
-  persist();
-  expect(() => loadConfig()).toThrow("experimentalFreshConversationPerTurn");
-  config.experimentalFreshConversationPerTurn = false;
-  config.useSavedChats = "true";
-  persist();
-  expect(() => loadConfig()).toThrow("useSavedChats");
-});
-
 test("skill attachments config defaults off, reaches the adapter, and rejects invalid/manual settings", () => {
   const root = join(tmpdir(), `codex-skills-config-${process.pid}-${Date.now()}`);
   roots.push(root);
@@ -322,8 +305,14 @@ test("skill attachments config defaults off, reaches the adapter, and rejects in
   const config: Record<string, unknown> = { ...defaultConfig("full") };
   config.browserHost = "launcher";
   config.browserHostDescriptorPath = join(root, "launcher.json");
-  config.tunnel = { binaryPath: join(root, "tunnel"), runtimeKeyFile: join(root, "key"),
-    profileDir: root, tunnelId: `tunnel_${"a".repeat(32)}`, profileName: "test", alias: "test" };
+  config.tunnel = {
+    binaryPath: join(root, "tunnel"),
+    runtimeKeyFile: join(root, "key"),
+    profileDir: root,
+    tunnelId: `tunnel_${"a".repeat(32)}`,
+    profileName: "test",
+    alias: "test",
+  };
   expect(config.experimentalSkillAttachments).toBe(false);
   const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
   delete config.experimentalSkillAttachments;

@@ -49,6 +49,17 @@ export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
   );
 }
 
+/** Keep the public cancellation shape stable while allowing the adapter to distinguish this
+ * deliberate owner replacement from a user-closing/cancelling the browser turn. */
+export function isChatGptTurnSupersededError(error: unknown): error is ChatGptWebAdapterError {
+  return error instanceof ChatGptWebAdapterError
+    && error.status === 499
+    && error.errorType === "client_closed_request"
+    && error.code === "client_cancelled"
+    && error.retryable === false
+    && error.message === "A newer Codex instruction superseded this ChatGPT response.";
+}
+
 export function chatGptStoppedThinkingError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "ChatGPT displayed 'Stopped thinking' and could not continue this response. "

@@ -99,7 +99,10 @@ test("daemon streams browser lifecycle through the real helper process", async (
       capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
       prepare: async () => ({
         text: "inspect", images: [],
-        skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
+        skillFiles: [selectedSkillFile({
+          role: "user",
+          origin: "codex_skill",
+          timestamp: 0,
           content: "<skill>\n<name>ipc</name>\n<path>/skills/ipc/SKILL.md</path>\ncheck IPC\n</skill>",
         })],
         multipart: { parts: ["part one", "part two", "part three", "part four", "part five", "part six"], commit: "inspect" },
@@ -416,8 +419,14 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
 
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
-    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useSavedChats: false,
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused.json",
+    chromeExecutablePath: "/durable/chrome",
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
   });
   const internal = client as unknown as {
     child: unknown;
@@ -432,18 +441,30 @@ test("an older helper cannot silently drop selected skill files and releases the
   internal.send = async message => {
     sent.push(String(message.type));
     if (message.type === "run") queueMicrotask(() => internal.handleLine(child, JSON.stringify({
-      type: "event", id: message.id, event: "prepared_selected", reused: false,
+      type: "event",
+      id: message.id,
+      event: "prepared_selected",
+      reused: false,
     })));
     if (message.type === "abort") queueMicrotask(() => internal.handleLine(child, JSON.stringify({
-      type: "error", id: message.id, message: "aborted",
+      type: "error",
+      id: message.id,
+      message: "aborted",
     })));
   };
   let released = false;
   await expect(client.run({
-    traceId: "skill-old-helper", modelId: "gpt-5.6-sol", reasoning: "high",
-    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
-    prepare: async () => ({ text: "inspect", images: [],
-      skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
+    traceId: "skill-old-helper",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    prepare: async () => ({
+      text: "inspect",
+      images: [],
+      skillFiles: [selectedSkillFile({
+        role: "user",
+        origin: "codex_skill",
+        timestamp: 0,
         content: "<skill>\n<name>test</name>\n<path>/test</path>\ncheck\n</skill>",
       })],
       release() { released = true; },

@@ -60,7 +60,7 @@ test("unsupported Linux launches reject updates before downloading or changing s
             tag_name: "v1.2.0",
             assets: ["codex-web-gpt-1.2.0-linux-x64.AppImage", "checksums.txt"].map(name => ({
               name,
-              browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/${name}`,
+              browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/${name}`,
             })),
           }),
           downloadText: async () => { calls.push("checksums"); throw new Error("Unexpected download"); },
@@ -87,6 +87,11 @@ test("release comparison and platform assets are strict", () => {
   assert.equal(compareVersions("1.1.4", "1.1.4"), 0);
   assert.equal(compareVersions("1.1.3", "1.1.4"), -1);
   assert.equal(compareVersions("1.2.0", "1.1.99"), 1);
+  assert.equal(compareVersions("5.0.8", "5.0.7030-sol500k.19"), 1);
+  assert.equal(compareVersions("5.0.7030", "5.0.7029"), 1);
+  for (const previous of ["5.0.7030", "5.0.8", "5.0.9", "6.0.0"]) {
+    assert.equal(compareVersions("6.0.1", previous), 1);
+  }
   assert.equal(releaseAssetName("1.2.0", "darwin", "arm64"), "codex-web-gpt-1.2.0-mac-arm64.zip");
   assert.equal(releaseAssetName("1.2.0", "darwin", "x64"), "codex-web-gpt-1.2.0-mac-x64.zip");
   assert.equal(releaseAssetName("1.2.0", "win32", "x64"), "codex-web-gpt-1.2.0-win-x64.exe");
@@ -102,11 +107,19 @@ test("checksums and release URLs bind the exact expected asset", () => {
   assert.throws(() => expectedChecksum(`${hash}  other.zip\n`, "launcher.zip"), /no entry/);
   assert.equal(
     validateReleaseAssetUrl(
+      "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/launcher.zip",
+      "1.2.0",
+      "launcher.zip",
+    ),
+    "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/launcher.zip",
+  );
+  assert.throws(
+    () => validateReleaseAssetUrl(
       "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/launcher.zip",
       "1.2.0",
       "launcher.zip",
     ),
-    "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/launcher.zip",
+    /unexpected release asset URL/,
   );
   assert.throws(
     () => validateReleaseAssetUrl("https://example.com/launcher.zip", "1.2.0", "launcher.zip"),
@@ -142,11 +155,11 @@ test("startup check runs once and exposes only a newer complete release", async 
           assets: [
             {
               name: "codex-web-gpt-1.2.0-linux-x64.AppImage",
-              browser_download_url: "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-x64.AppImage",
+              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-x64.AppImage",
             },
             {
               name: "checksums.txt",
-              browser_download_url: "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
+              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
             },
           ],
         };
@@ -159,6 +172,77 @@ test("startup check runs once and exposes only a newer complete release", async 
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
 
+test("newer Windows-only releases fail closed on platforms without a matching asset", async () => {
+  for (const [platform, arch, expectedAsset] of [
+    ["darwin", "arm64", "codex-web-gpt-6.0.0-mac-arm64.zip"],
+    ["linux", "x64", "codex-web-gpt-6.0.0-linux-x64.AppImage"],
+  ]) {
+    const controller = createUpdateController({
+      currentVersion: "5.0.9",
+      platform,
+      arch,
+      packaged: true,
+      dependencies: {
+        fetchRelease: async () => ({
+          tag_name: "v6.0.0",
+          assets: [
+            {
+              name: "codex-web-gpt-6.0.0-win-x64.exe",
+              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.0.0/codex-web-gpt-6.0.0-win-x64.exe",
+            },
+            {
+              name: "checksums.txt",
+              browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.0.0/checksums.txt",
+            },
+          ],
+        }),
+      },
+    });
+
+    assert.deepEqual(await controller.checkOnce(), {
+      status: "error",
+      message: `Release v6.0.0 is missing ${expectedAsset} or checksums.txt`,
+    });
+    await assert.rejects(controller.beginInstall(), /No launcher update/);
+  }
+});
+
+test("background recheck discovers a release published after startup", async () => {
+  let calls = 0;
+  const controller = createUpdateController({
+    currentVersion: "1.1.4",
+    platform: "win32",
+    arch: "x64",
+    packaged: true,
+    executablePath: "C:/Codex Web GPT/Codex Web GPT.exe",
+    runtimeExecutable: "C:/runtime/node.exe",
+    logsDirectory: "C:/logs",
+    dependencies: {
+      fetchRelease: async () => {
+        calls += 1;
+        const version = calls === 1 ? "1.1.4" : "1.2.0";
+        return {
+          tag_name: `v${version}`,
+          assets: [
+            {
+              name: `codex-web-gpt-${version}-win-x64.exe`,
+              browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v${version}/codex-web-gpt-${version}-win-x64.exe`,
+            },
+            {
+              name: "checksums.txt",
+              browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v${version}/checksums.txt`,
+            },
+          ],
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(await controller.checkOnce(), { status: "up-to-date" });
+  assert.deepEqual(await controller.checkAgain(), { status: "available", version: "1.2.0" });
+  assert.equal(calls, 2);
+});
+
 test("preview and draft releases stay hidden until promoted, regardless of the version suffix", async () => {
   for (const tag of ["1.2.0", "1.2.0-rc.1"]) {
     for (const flags of [{ prerelease: true }, { draft: true }, { prerelease: false, draft: false }]) {
@@ -169,7 +253,7 @@ test("preview and draft releases stay hidden until promoted, regardless of the v
             tag_name: `v${tag}`, ...flags,
             assets: [`codex-web-gpt-${tag}-linux-x64.AppImage`, "checksums.txt"].map(name => ({
               name,
-              browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v${tag}/${name}`,
+              browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v${tag}/${name}`,
             })),
           }),
         },
@@ -182,6 +266,7 @@ test("preview and draft releases stay hidden until promoted, regardless of the v
     }
   }
 });
+
 
 for (const arch of ["x64", "arm64"]) {
   test(`verified Linux ${arch} update is handed to one detached worker`, async () => {
@@ -214,11 +299,11 @@ for (const arch of ["x64", "arm64"]) {
             assets: [
               {
                 name: `codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
-                browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
+                browser_download_url: `https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-${arch}.AppImage`,
               },
               {
                 name: "checksums.txt",
-                browser_download_url: "https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
+                browser_download_url: "https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
               },
             ],
           }),
@@ -252,6 +337,7 @@ for (const arch of ["x64", "arm64"]) {
     }
   });
 }
+
 
 test("detached worker replaces an installed Linux AppImage and removes the old version", {
   skip: process.platform === "win32" ? "Linux AppImage execution is not meaningful on Windows" : false,

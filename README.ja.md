@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">すべてのリリース</a>
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest">すべてのリリース</a>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="#get-started">使い始める</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases">更新内容</a> · <a href="docs/architecture.md">アーキテクチャ</a> · <a href="TROUBLESHOOTING.md">トラブルシューティング</a>
+  <a href="#get-started">使い始める</a> · <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases">更新内容</a> · <a href="docs/architecture.md">アーキテクチャ</a> · <a href="TROUBLESHOOTING.md">トラブルシューティング</a>
 </p>
 
 アカウントで利用可能な Pro を含む ChatGPT Web モデルを、Codex のネイティブモデル選択画面から使えます。ChatGPT Web の独立した利用枠を使うため、Work や Codex の利用枠は消費しません。UI、タスク、画像、ストリーミングはそのままです。
@@ -49,13 +49,13 @@ Full ハーネスモードでは、MCP を通じて ChatGPT を現在のタス�
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 </details>
@@ -73,7 +73,11 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 自動 | MCP 経由で利用可能 |
 | **Zero Risk** | 手動で貼り付けて送信 | 専用 MCP コネクタ経由で利用可能 |
 
-Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
+```bash
+git clone https://github.com/NightPlayProject/codex-chatgpt-web.git && \
+cd codex-chatgpt-web && \
+bun run app
+```
 
 <a id="full-harness"></a>
 
@@ -101,6 +105,20 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
    **Allow low-risk actions** では、コマンドとパッチがこのランタイムへ到達する前にブロックされます。
    外側の Codex ハーネスでは、引き続きサンドボックスと承認が適用されます。
 6. **ランタイムを検証**を実行し、**Codex Native2** が接続済みで利用可能であることを確認します。
+
+デスクトップ操作は任意です。Full モードは、ネイティブ Codex の MCP／プラグインツールを同じ
+**Codex Native2** コネクタ経由で転送できます。Windows では、
+[`open-computer-use`](https://www.npmjs.com/package/open-computer-use) を利用できます。
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+登録後は Codex を完全に終了して再起動してください。新しいタスクでは、ネイティブの `tool_search` を通じて
+遅延読み込みされた `open-computer-use` ツールを検出できます。追加のデスクトップ操作用トンネルやコネクタは
+不要です。デスクトップ操作用 MCP をインストールしていない場合でも、Full モードの他の Codex ハーネス機能は
+通常どおり利用できます。
 
 書き込み／変更操作には、ChatGPT ワークスペースと管理者ポリシー側での許可も必要です。
 [Developer Mode と MCP アプリ](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)を参照してください。

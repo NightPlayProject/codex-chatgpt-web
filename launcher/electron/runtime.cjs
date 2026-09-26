@@ -2,7 +2,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
 const { randomBytes } = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
   connectorNameForDevSetup,
@@ -14,7 +14,7 @@ const {
   validateConnectorName,
 } = require("./connector-identity.cjs");
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
-const { redactText } = require("./logging.cjs");
+const { redactText, createDiagnosticLineRedactor } = require("./logging.cjs");
 const { DETACH_OWNED_CHILD, terminateOwnedProcessTree } = require("./process-tree.cjs");
 
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
@@ -26,28 +26,95 @@ const MAX_CHECKPOINT_FILE_BYTES = 16 * 1024 * 1024;
 const PASSKEY_LOGIN_TIMEOUT_MS = 10 * 60_000;
 const MAX_PASSKEY_STATE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_PASSKEY_MARKER_FILE_BYTES = 64 * 1024;
+const NATIVE_COMPUTER_USE_PACKAGE = "open-computer-use@0.3.4";
+const WINDOWS_EXECUTABLE_EXTENSIONS = new Set([".com", ".exe", ".bat", ".cmd"]);
+
+function commandOnPath(command, platform = process.platform) {
+  const lookup = platform === "win32" ? "where.exe" : "which";
+  const result = spawnSync(lookup, [command], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) return null;
+  const candidates = String(result.stdout || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    // `where codex` can return an extensionless npm shim before codex.cmd. Node can
+    // resolve that shim from a shell, but child_process.spawn cannot execute it.
+    const variants = platform === "win32" && !path.win32.extname(candidate)
+      ? [candidate, ...[...WINDOWS_EXECUTABLE_EXTENSIONS].map(extension => `${candidate}${extension}`)]
+      : [candidate];
+    const usable = variants.find(item => usableExecutable(item, platform));
+    if (usable) return usable;
+  }
+  return null;
+}
+
+function firstCommandOnPath(commands, platform = process.platform) {
+  for (const command of commands) {
+    const resolved = commandOnPath(command, platform);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function nativeCodexDesktopExecutable(platform = process.platform, localAppData = process.env.LOCALAPPDATA) {
+  if (platform !== "win32" || typeof localAppData !== "string" || !localAppData.trim()) return null;
+  const binRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+  let entries;
+  try {
+    entries = fs.readdirSync(binRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [path.join(binRoot, "codex.exe")];
+  for (const entry of entries) {
+    if (entry.isDirectory()) candidates.push(path.join(binRoot, entry.name, "codex.exe"));
+  }
+  return candidates
+    .filter(candidate => usableExecutable(candidate, platform))
+    .map(candidate => ({ candidate, mtimeMs: fs.statSync(candidate).mtimeMs }))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.candidate || null;
+}
 function collect(stream, chunks, onLine, onError) {
+  const redactLine = createDiagnosticLineRedactor();
+  const emit = line => onLine(redactLine(line));
+  let discardingLine = false;
+  let discardedTail = "";
   let buffered = "";
   let bytes = 0;
   stream.on("data", (chunk) => {
     bytes += chunk.length;
     if (bytes <= MAX_CAPTURE_BYTES) chunks.push(chunk);
-    buffered += chunk.toString("utf8");
+    let text = chunk.toString("utf8");
+    if (discardingLine) {
+      const end = text.indexOf("\n");
+      if (end < 0) { redactLine(discardedTail + text); discardedTail = (discardedTail + text).slice(-128); return; }
+      redactLine(discardedTail + text.slice(0, end));
+      discardedTail = "";
+      text = text.slice(end + 1);
+      discardingLine = false;
+    }
+    buffered += text;
     for (;;) {
       const newline = buffered.indexOf("\n");
       if (newline < 0) break;
       const line = buffered.slice(0, newline).trimEnd();
       buffered = buffered.slice(newline + 1);
-      if (line) onLine(line);
+      if (line) emit(line);
     }
     if (buffered.length > MAX_RUNTIME_LOG_LINE_CHARS) {
-      onLine(`${buffered.slice(0, MAX_RUNTIME_LOG_LINE_CHARS)}…[truncated]`);
+      emit(buffered);
+      discardingLine = true;
+      discardedTail = buffered.slice(-128);
       buffered = "";
     }
   });
   stream.on("end", () => {
     const line = buffered.trim();
-    if (line) onLine(line);
+    if (line) emit(line);
   });
   stream.on("error", (error) => onError?.(error));
 }
@@ -64,6 +131,9 @@ function usableExecutable(candidate, platform = process.platform) {
   if (typeof candidate !== "string" || !candidate) return false;
   const absolute = platform === "win32" ? path.win32.isAbsolute(candidate) : path.posix.isAbsolute(candidate);
   if (!absolute) return false;
+  if (platform === "win32" && !WINDOWS_EXECUTABLE_EXTENSIONS.has(path.win32.extname(candidate).toLowerCase())) {
+    return false;
+  }
   try {
     if (!fs.statSync(candidate).isFile()) return false;
     if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
@@ -71,6 +141,57 @@ function usableExecutable(candidate, platform = process.platform) {
   } catch {
     return false;
   }
+}
+
+function quoteWindowsCommandArg(value) {
+  const text = String(value);
+  if (text && !/[\s"&|<>^]/.test(text)) return text;
+  return `"${text.replace(/["^]/g, character => `^${character}`)}"`;
+}
+
+function systemCommandInvocation(executable, args, platform = process.platform) {
+  if (platform !== "win32") return { executable, args: [...args] };
+  const extension = path.win32.extname(executable).toLowerCase();
+  if (extension !== ".cmd" && extension !== ".bat") return { executable, args: [...args] };
+  const commandLine = [executable, ...args].map(quoteWindowsCommandArg).join(" ");
+  return {
+    executable: process.env.ComSpec || "cmd.exe",
+    args: [
+      "/d",
+      "/s",
+      "/c",
+      `"${commandLine}"`,
+    ],
+    windowsVerbatimArguments: true,
+  };
+}
+
+function parseMcpRegistration(stdout) {
+  try {
+    const parsed = JSON.parse(String(stdout || ""));
+    return parsed?.transport && typeof parsed.transport === "object" ? parsed.transport : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedExecutablePath(value, platform = process.platform) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const candidate = value.trim();
+  return platform === "win32"
+    ? path.win32.normalize(candidate).toLowerCase()
+    : path.resolve(candidate);
+}
+
+function mcpRegistrationMatches(stdout, executable, platform = process.platform) {
+  const transport = parseMcpRegistration(stdout);
+  if (transport?.type !== "stdio"
+    || !Array.isArray(transport.args)
+    || transport.args.length !== 1
+    || transport.args[0] !== "mcp") return false;
+  const actual = normalizedExecutablePath(transport.command, platform);
+  const expected = normalizedExecutablePath(executable, platform);
+  return Boolean(actual && expected && actual === expected);
 }
 
 function captureRegularFile(filePath, { followSymlink = false } = {}) {
@@ -174,8 +295,11 @@ class RuntimeHost {
     launcherProfile = "production",
     launchAgentsDir,
     platform = process.platform,
+    arch = process.arch,
+    resourcesPath = process.resourcesPath,
     publishOperation,
     supervisor,
+    commandResolver = firstCommandOnPath,
     getBrowserInteractionMode = () => "automatic",
   }) {
     this.app = app;
@@ -193,6 +317,8 @@ class RuntimeHost {
       throw new Error("Runtime host DEV profile requires its isolated home");
     }
     this.platform = platform;
+    this.arch = arch;
+    this.resourcesPath = resourcesPath;
     this.codexHome = codexHome
       ? resolveUserPath(codexHome)
       : process.env.CODEX_HOME?.trim()
@@ -203,6 +329,7 @@ class RuntimeHost {
       : path.join(os.homedir(), "Library", "LaunchAgents");
     this.publishOperation = publishOperation;
     this.supervisor = supervisor;
+    this.commandResolver = commandResolver;
     this.getBrowserInteractionMode = getBrowserInteractionMode;
     this.active = null;
     this.activeChild = null;
@@ -389,6 +516,39 @@ class RuntimeHost {
       installedRuntimeRoot: this.installedRuntimeRoot,
       args,
     });
+  }
+
+  runSystemCommand(name, executable, args, options = {}) {
+    const { cwd, ...runOptions } = options;
+    return this.run(name, args, {
+      ...runOptions,
+      invocation: {
+        ...systemCommandInvocation(executable, args, this.platform),
+        cwd: cwd || this.codexHome,
+      },
+    });
+  }
+
+  bundledNativeComputerUseExecutable() {
+    if (this.platform !== "win32") return null;
+    const target = this.arch === "arm64"
+      ? "win32-arm64"
+      : this.arch === "x64"
+        ? "win32-x64"
+        : null;
+    if (!target) return null;
+    const root = this.app?.isPackaged
+      ? this.resourcesPath
+      : path.join(this.sourceRoot, "launcher");
+    if (!root) return null;
+    const candidate = path.join(
+      root,
+      "native",
+      "open-computer-use",
+      target,
+      "open-computer-use.exe",
+    );
+    return usableExecutable(candidate, this.platform) ? candidate : null;
   }
 
   launcherControlEnvironment() {
@@ -612,9 +772,10 @@ class RuntimeHost {
     this.publishOperation?.({ name, status: "running", message: options.message || name });
     this.logger.info("runtime.operation_started", { name, args: args.map((arg) => /key|token/i.test(arg) ? "[redacted]" : arg) });
     try {
-      const invocation = options.embedded
-        ? embeddedRuntimeInvocation({ app: this.app, sourceRoot: this.sourceRoot, args })
-        : this.command(args);
+      const invocation = options.invocation
+        || (options.embedded
+          ? embeddedRuntimeInvocation({ app: this.app, sourceRoot: this.sourceRoot, args })
+          : this.command(args));
       const result = await new Promise((resolve, reject) => {
         const environment = options.environment
           ? { ...options.environment }
@@ -629,6 +790,7 @@ class RuntimeHost {
           env: environment,
           stdio: [options.controlStdin ? "pipe" : "ignore", "pipe", "pipe"],
           windowsHide: true,
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
         });
         this.activeChild = child;
         const stdout = [];
@@ -911,6 +1073,105 @@ class RuntimeHost {
     return this.launcherProfile === "development"
       ? connectorNameForDevSetup(current.config?.appName)
       : requireCurrentRuntimeConnectorName(current.config?.appName);
+  }
+
+  async setupNativeComputerUse() {
+    this.assertProductionProfile("Native Windows Computer Use setup");
+    if (this.platform !== "win32") {
+      throw new Error("The guided native Computer Use setup is currently available only on Windows");
+    }
+    const name = "native-computer-use-setup";
+    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    this.lifecycleOperation = name;
+    try {
+      const codex = nativeCodexDesktopExecutable(this.platform)
+        || this.commandResolver(["codex.exe", "codex.cmd", "codex"], this.platform);
+      if (!codex) {
+        throw new Error("The Codex command is unavailable on PATH; install or repair Codex before setting up native Computer Use");
+      }
+
+      let computerUse = this.bundledNativeComputerUseExecutable();
+      if (!computerUse) {
+        computerUse = this.commandResolver(["open-computer-use.exe", "open-computer-use.cmd", "open-computer-use"], this.platform);
+      }
+      if (!computerUse) {
+        const npm = this.commandResolver(["npm.cmd", "npm"], this.platform);
+        if (!npm) {
+          throw new Error("The native Computer Use component is missing from this launcher build and npm is unavailable on PATH");
+        }
+        await this.runSystemCommand(name, npm, ["install", "--global", NATIVE_COMPUTER_USE_PACKAGE], {
+          message: "Installing the native Computer Use MCP",
+          successMessage: "Native Computer Use MCP package installed",
+          timeoutMs: 5 * 60_000,
+        });
+        computerUse = this.commandResolver(["open-computer-use.exe", "open-computer-use.cmd", "open-computer-use"], this.platform);
+        if (!computerUse) {
+          const prefix = await this.runSystemCommand(name, npm, ["prefix", "--global"], {
+            message: "Locating the native Computer Use MCP",
+            successMessage: "Native Computer Use MCP location found",
+            timeoutMs: 30_000,
+          });
+          const globalPrefix = prefix.stdout.trim().split(/\r?\n/).map(line => line.trim()).find(Boolean);
+          const candidates = globalPrefix
+            ? [path.join(globalPrefix, "open-computer-use.cmd"), path.join(globalPrefix, "open-computer-use")]
+            : [];
+          computerUse = candidates.find(candidate => usableExecutable(candidate, this.platform)) || null;
+        }
+        if (!computerUse) {
+          throw new Error("The native Computer Use MCP package installed, but its command is not available on PATH");
+        }
+      }
+
+      const existing = await this.runSystemCommand(name, codex, ["mcp", "get", "open-computer-use", "--json"], {
+        acceptedExitCodes: [0, 1],
+        message: "Checking the Codex native Computer Use registration",
+        successMessage: "Codex native Computer Use registration checked",
+        timeoutMs: 30_000,
+      });
+      const alreadyMatches = existing.code === 0
+        && mcpRegistrationMatches(existing.stdout, computerUse, this.platform);
+      let registered = alreadyMatches;
+      if (!alreadyMatches) {
+        if (existing.code === 0) {
+          await this.runSystemCommand(name, codex, ["mcp", "remove", "open-computer-use"], {
+            message: "Replacing the existing native Computer Use registration",
+            successMessage: "Existing native Computer Use registration removed",
+            timeoutMs: 30_000,
+          });
+        }
+        await this.runSystemCommand(name, codex, [
+          "mcp",
+          "add",
+          "open-computer-use",
+          "--",
+          computerUse,
+          "mcp",
+        ], {
+          message: "Registering native Computer Use with Codex",
+          successMessage: "Native Computer Use registered with Codex",
+          timeoutMs: 30_000,
+        });
+        registered = true;
+      }
+
+      const verified = await this.runSystemCommand(name, codex, ["mcp", "get", "open-computer-use", "--json"], {
+        acceptedExitCodes: [0, 1],
+        message: "Verifying the Codex native Computer Use registration",
+        successMessage: "Codex native Computer Use registration verified",
+        timeoutMs: 30_000,
+      });
+      if (verified.code !== 0 || !mcpRegistrationMatches(verified.stdout, computerUse, this.platform)) {
+        throw new Error("Codex did not report the native Computer Use MCP after setup");
+      }
+      return {
+        ok: true,
+        registered,
+        restartRequired: !alreadyMatches,
+        stdout: "",
+      };
+    } finally {
+      this.lifecycleOperation = null;
+    }
   }
 
   browserConnectorName() {
@@ -1502,4 +1763,16 @@ class RuntimeHost {
   }
 }
 
-module.exports = { CURRENT_CONNECTOR_NAME, RuntimeHost };
+module.exports = {
+  CURRENT_CONNECTOR_NAME,
+  NATIVE_COMPUTER_USE_PACKAGE,
+  RuntimeHost,
+  commandOnPath,
+  firstCommandOnPath,
+  mcpRegistrationMatches,
+  nativeCodexDesktopExecutable,
+  parseMcpRegistration,
+  quoteWindowsCommandArg,
+  systemCommandInvocation,
+  usableExecutable,
+};

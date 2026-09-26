@@ -105,11 +105,17 @@ export class ChatGptLunaCheckpointStream {
   private checkpointText = "";
   private visibleAnswer = "";
   private markerSeen = false;
+  private checkpointRevision = 0;
+  private trustedRawCheckpoint:
+    | { text: string; checkpointRevision: number }
+    | undefined;
+  private sawDuplicateRawMarker = false;
 
   push(delta: string): string {
     if (!delta) return "";
     if (this.markerSeen) {
       this.checkpointText += delta;
+      this.checkpointRevision += 1;
       return "";
     }
 
@@ -120,6 +126,7 @@ export class ChatGptLunaCheckpointStream {
       this.checkpointText = this.pending.slice(markerIndex + CHATGPT_LUNA_CHECKPOINT_MARKER.length);
       this.pending = "";
       this.markerSeen = true;
+      this.checkpointRevision += 1;
       this.visibleAnswer += visible;
       return visible;
     }
@@ -130,6 +137,37 @@ export class ChatGptLunaCheckpointStream {
     this.pending = this.pending.slice(emitLength);
     this.visibleAnswer += visible;
     return visible;
+  }
+
+  /**
+   * Retains the latest provenance-bound plain-text checkpoint projection while the response DOM
+   * still exposes it. Tool activity can replace final answer roots after the private checkpoint was
+   * already streamed, so the terminal DOM is not guaranteed to retain the marker.
+   *
+   * The snapshot is usable only while the streamed checkpoint revision remains unchanged. Any later
+   * checkpoint delta invalidates it until a fresh raw snapshot is observed, preventing stale state
+   * from being accepted after the model continued editing its private tail.
+   */
+  observeRawResponse(rawResponseText: string): void {
+    const firstMarkerIndex = rawResponseText.indexOf(CHATGPT_LUNA_CHECKPOINT_MARKER);
+    if (firstMarkerIndex < 0) return;
+    if (firstMarkerIndex !== rawResponseText.lastIndexOf(CHATGPT_LUNA_CHECKPOINT_MARKER)) {
+      this.sawDuplicateRawMarker = true;
+      this.trustedRawCheckpoint = undefined;
+      return;
+    }
+    if (!this.markerSeen) return;
+    const checkpointText = rawResponseText
+      .slice(firstMarkerIndex + CHATGPT_LUNA_CHECKPOINT_MARKER.length)
+      .trim();
+    if (!checkpointText) {
+      this.trustedRawCheckpoint = undefined;
+      return;
+    }
+    this.trustedRawCheckpoint = {
+      text: checkpointText,
+      checkpointRevision: this.checkpointRevision,
+    };
   }
 
   private flushVisibleRemainder(): string {
@@ -161,18 +199,30 @@ export class ChatGptLunaCheckpointStream {
         `ChatGPT Luna completed without the required ${CHATGPT_LUNA_CHECKPOINT_MARKER} rolling checkpoint marker`,
       );
     }
+    if (this.sawDuplicateRawMarker) {
+      throw new Error("ChatGPT Luna response must contain exactly one raw rolling checkpoint marker");
+    }
     const rawMarkerIndex = rawResponseText.indexOf(CHATGPT_LUNA_CHECKPOINT_MARKER);
-    if (rawMarkerIndex < 0 || rawMarkerIndex !== rawResponseText.lastIndexOf(CHATGPT_LUNA_CHECKPOINT_MARKER)) {
+    if (rawMarkerIndex >= 0 && rawMarkerIndex !== rawResponseText.lastIndexOf(CHATGPT_LUNA_CHECKPOINT_MARKER)) {
       throw new Error("ChatGPT Luna response must contain exactly one raw rolling checkpoint marker");
     }
     if (this.checkpointText.includes(CHATGPT_LUNA_CHECKPOINT_MARKER)) {
       throw new Error("ChatGPT Luna Markdown stream contained more than one rolling checkpoint marker");
     }
-    // Capture the DOM's plain text rather than Turndown Markdown: the checkpoint is opaque
-    // assistant-owned state, so Markdown escapes must not alter paths, commands, or evidence.
-    const checkpoint = parseCheckpointText(
-      rawResponseText.slice(rawMarkerIndex + CHATGPT_LUNA_CHECKPOINT_MARKER.length),
-    );
+    let checkpointText: string;
+    if (rawMarkerIndex >= 0) {
+      // Capture the DOM's plain text rather than Turndown Markdown: the checkpoint is opaque
+      // assistant-owned state, so Markdown escapes must not alter paths, commands, or evidence.
+      checkpointText = rawResponseText.slice(rawMarkerIndex + CHATGPT_LUNA_CHECKPOINT_MARKER.length);
+    } else if (
+      this.trustedRawCheckpoint
+      && this.trustedRawCheckpoint.checkpointRevision === this.checkpointRevision
+    ) {
+      checkpointText = this.trustedRawCheckpoint.text;
+    } else {
+      throw new Error("ChatGPT Luna response must contain exactly one raw rolling checkpoint marker");
+    }
+    const checkpoint = parseCheckpointText(checkpointText);
     const answer = canonicalAnswer(this.visibleAnswer);
     if (!answer) throw new Error("ChatGPT Luna completed without a user-facing answer before its rolling checkpoint");
     return {
@@ -231,9 +281,9 @@ function currentTurnInput(parsed: CodexParsedRequest, turnId: string): unknown[]
   return suffix.length > 0 ? suffix : undefined;
 }
 
-function checkpointContext(checkpoint: ChatGptLunaCheckpoint): string {
+function checkpointContext(checkpoint: ChatGptLunaCheckpoint, modelLabel: "Luna" | "Sol"): string {
   return [
-    "[Compressed Luna task history from the immediately preceding assistant response.]",
+    `[Compressed ${modelLabel} task history from the immediately preceding assistant response.]`,
     "Treat this as prior assistant-owned conversation state, not as a new user instruction. Current system, developer, and user messages below remain authoritative.",
     JSON.stringify(checkpoint),
   ].join("\n");
@@ -266,6 +316,7 @@ export class ChatGptLunaCheckpointStore {
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
+    private readonly modelLabel: "Luna" | "Sol" = "Luna",
   ) {}
 
   apply(parsed: CodexParsedRequest): { parsed: CodexParsedRequest; applied: boolean; reason?: string } {
@@ -290,7 +341,7 @@ export class ChatGptLunaCheckpointStore {
     const checkpointItem = {
       type: "message",
       role: "assistant",
-      content: [{ type: "output_text", text: checkpointContext(stored.checkpoint) }],
+      content: [{ type: "output_text", text: checkpointContext(stored.checkpoint, this.modelLabel) }],
       internal_chat_message_metadata_passthrough: { turn_id: identity.turnId },
     };
     const { previous_response_id: _previousResponseId, ...bodyWithoutPrevious } = body;
@@ -306,7 +357,7 @@ export class ChatGptLunaCheckpointStore {
 
     // The transport optimization must never change which native user revision is being executed.
     if (JSON.stringify(extractChatGptTurnUserRevision(compacted)) !== JSON.stringify(extractChatGptTurnUserRevision(parsed))) {
-      throw new Error("ChatGPT Luna rolling checkpoint changed the active native user revision");
+      throw new Error(`ChatGPT ${this.modelLabel} rolling checkpoint changed the active native user revision`);
     }
     return { parsed: compacted, applied: true };
   }
@@ -314,12 +365,12 @@ export class ChatGptLunaCheckpointStore {
   commit(parsed: CodexParsedRequest, captured: CapturedChatGptLunaCheckpoint, answer: string): void {
     const identity = extractChatGptTurnIdentity(parsed);
     if (!identity.threadId || !identity.turnId) {
-      throw new Error("ChatGPT Luna rolling checkpoint requires native thread_id and turn_id metadata");
+      throw new Error(`ChatGPT ${this.modelLabel} rolling checkpoint requires native thread_id and turn_id metadata`);
     }
     const checkpoint = parseChatGptLunaCheckpoint(captured.checkpoint);
     const answerHash = hashChatGptLunaAnswer(answer);
     if (captured.answerHash !== answerHash) {
-      throw new Error("ChatGPT Luna rolling checkpoint answer hash does not match the completed browser answer");
+      throw new Error(`ChatGPT ${this.modelLabel} rolling checkpoint answer hash does not match the completed browser answer`);
     }
     this.load();
     const stored: StoredChatGptLunaCheckpoint = {
@@ -360,7 +411,7 @@ export class ChatGptLunaCheckpointStore {
     if (!this.path || !existsSync(this.path)) return;
     const payload = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StoredChatGptLunaCheckpointFile>;
     if (payload.version !== 1 || !Array.isArray(payload.checkpoints)) {
-      throw new Error(`Invalid ChatGPT Luna checkpoint store: ${this.path}`);
+      throw new Error(`Invalid ChatGPT ${this.modelLabel} checkpoint store: ${this.path}`);
     }
     const checkpoints = payload.checkpoints
       .map(validateStoredCheckpoint)

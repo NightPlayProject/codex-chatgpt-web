@@ -98,11 +98,12 @@ test("Interrupt hook command is absolute, quoted, and bound to the exact applica
     "'/Applications/Codex Web GPT.app/runtime/bun' '/Applications/Codex Web GPT.app/app/cli.js'"
       + " '--home' '/Users/test/Application Support/Codex Web GPT' 'hook' 'interrupt'",
   );
-  expect(codexInterruptHookCommand(
+  const windowsCommand = codexInterruptHookCommand(
     { runtimeCommand: ["C:\\Program Files\\Codex Web GPT\\bun.exe", "C:\\Program Files\\Codex Web GPT\\cli.js"] },
     "C:\\Users\\test\\Codex Web GPT",
     "win32",
-  )).toBe(
+  );
+  expect(windowsCommand).toBe(
     '"C:\\Program Files\\Codex Web GPT\\bun.exe" "C:\\Program Files\\Codex Web GPT\\cli.js"'
       + ' "--home" "C:\\Users\\test\\Codex Web GPT" "hook" "interrupt"',
   );

@@ -148,8 +148,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: before.proAvailable,
     experimentalBiggerContext: before.experimentalBiggerContext,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
-    experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
-    useSavedChats: before.useSavedChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
@@ -179,8 +177,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: after.proAvailable,
     experimentalBiggerContext: after.experimentalBiggerContext,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
-    experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
-    useSavedChats: after.useSavedChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
@@ -276,15 +272,18 @@ function baseConfig(
     delete config.browserHostDescriptorPath;
   }
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
+  if (config.mode === "full") {
+    config.autoApproveToolCalls = config.browserInteractionMode === "manual" ? false : true;
+  }
+  if (options.experimentalBiggerContext !== undefined) {
+    config.experimentalBiggerContext = options.experimentalBiggerContext;
+  }
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }
   if (options.useSavedChats !== undefined) config.useSavedChats = options.useSavedChats;
   if (options.experimentalFreshConversationPerTurn !== undefined) {
     config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
-  }
-  if (options.experimentalBiggerContext !== undefined) {
-    config.experimentalBiggerContext = options.experimentalBiggerContext;
   }
   if (options.zeroRiskProEnabled !== undefined) {
     if (config.browserInteractionMode !== "manual") {

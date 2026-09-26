@@ -3,6 +3,15 @@ const path = require("node:path");
 const { createHash, randomBytes } = require("node:crypto");
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
+
+async function boundedSavedChatOperation(operation, timeoutMs = 5_000) {
+  let timer;
+  try {
+    return await Promise.race([operation, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Saved chat verification timed out")), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const {
   runBrowserHelperOperation,
   verifyConnectorWithBrowserHelper,
@@ -49,7 +58,56 @@ const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000;
 const CHATGPT_AUTH_SESSION_TIMEOUT_MS = 5_000;
 const WINDOW_VISIBILITY_EVENTS = ["show", "hide", "minimize", "restore"];
 const CHATGPT_BACKEND_REQUEST_FILTER = { urls: [`${CHATGPT_ORIGIN}/backend-api/*`] };
+const BROWSER_SMOKE_OPERATION = "browser smoke test";
 const ZOOM_FACTORS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+
+function chatGptCoreWebUserAgent(userAgent) {
+  const value = typeof userAgent === "string" ? userAgent.trim() : "";
+  const sanitized = value
+    .replace(/\s+CodexWebGPT\/[^\s]+/g, "")
+    .replace(/\s+Electron\/[^\s]+/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (!sanitized || !/\bChrome\/[\d.]+\b/.test(sanitized)) {
+    throw new Error("Embedded ChatGPT browser user agent does not identify a Chromium browser");
+  }
+  return sanitized;
+}
+
+function configureChatGptWebContents(contents) {
+  const pageUserAgent = chatGptCoreWebUserAgent(contents.getUserAgent());
+  const sessionUserAgent = chatGptCoreWebUserAgent(contents.session.getUserAgent());
+  contents.session.setUserAgent(sessionUserAgent);
+  contents.setUserAgent(pageUserAgent);
+  return pageUserAgent;
+}
+
+function chatGptCoreWebRequestHeaders(requestHeaders = {}) {
+  const entries = Object.entries(requestHeaders);
+  const hasCodexWebviewSignal = entries.some(([name, value]) => {
+    const lowerName = name.toLowerCase();
+    if (lowerName === "x-openai-codex-window-type") return true;
+    if (lowerName === "x-openai-web-frontend") return String(value).toLowerCase() === "codex_webview";
+    return lowerName === "originator" && String(value).toLowerCase() === "codex browser";
+  });
+  if (!hasCodexWebviewSignal) return { ...requestHeaders };
+
+  const normalized = {};
+  let frontendKey = null;
+  for (const [name, value] of entries) {
+    const lowerName = name.toLowerCase();
+    if (lowerName === "x-openai-codex-window-type") continue;
+    if (lowerName === "originator" && String(value).toLowerCase() === "codex browser") continue;
+    if (lowerName === "x-openai-web-frontend") {
+      frontendKey = name;
+      normalized[name] = "core_web";
+      continue;
+    }
+    normalized[name] = value;
+  }
+  if (!frontendKey) normalized["x-openai-web-frontend"] = "core_web";
+  return normalized;
+}
 const SHELL_ZOOM_LEVEL_STEP = 0.5;
 const SHELL_ZOOM_LEVEL_LIMIT = 5;
 const AUTH_PROVIDER_HOSTS = new Set([
@@ -219,6 +277,10 @@ function browserInteractionModeFor(host) {
   return mode;
 }
 
+function manualOperationAllowsTurn(manualOperation, traceId) {
+  return manualOperation === BROWSER_SMOKE_OPERATION && /^smoke_[a-f0-9]{32}$/.test(traceId);
+}
+
 function requireAutomaticBrowserInspection(host, operation) {
   if (browserInteractionModeFor(host) === "manual") {
     const error = new Error(`${operation} is disabled in Zero Risk mode`);
@@ -318,6 +380,9 @@ class BrowserHost {
     clipboardApi = clipboard,
     getBrowserInteractionMode = () => "automatic",
     getUseSavedChats = () => false,
+    getSaveChats = () => false,
+    rememberChat = () => {},
+    getSavedChats = () => [],
   }) {
     if (typeof getConnectorName !== "function") {
       throw new Error("Browser host connector-name resolver is unavailable");
@@ -326,6 +391,9 @@ class BrowserHost {
       throw new Error("Browser host passkey login operation is unavailable");
     }
     this.window = window;
+    this.getSaveChats = getSaveChats;
+    this.rememberChat = rememberChat;
+    this.getSavedChats = getSavedChats;
     this.descriptorPath = descriptorPath;
     this.cdpPort = cdpPort;
     this.control = control;
@@ -410,6 +478,7 @@ class BrowserHost {
         backgroundThrottling: true,
       },
     });
+    configureChatGptWebContents(this.view.webContents);
     window.contentView.addChildView(this.view);
     this.windowVisibilityListener = () => this.syncViewVisibility();
     for (const event of WINDOW_VISIBILITY_EVENTS) {
@@ -470,8 +539,9 @@ class BrowserHost {
     let succeeded = false;
     try {
       if (mode === "manual" && previousMode === "automatic") await this.configureAnnouncementDismissal(false);
-      // Setup inspects the primary surface before committing runtime changes. Publish
-      // its native target in the same mode as that inspection, including Zero Risk's exclusion.
+      // Setup inspects the primary surface before committing runtime changes. Publish the
+      // requested native target during that inspection, and restore the previous descriptor if
+      // setup fails before its commit callback completes.
       this.writeDescriptor();
       let browserCommitted = false;
       const commitBrowserChange = async () => {
@@ -563,6 +633,7 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    configureChatGptWebContents(view.webContents);
     const tab = {
       id,
       surfaceId,
@@ -577,6 +648,7 @@ class BrowserHost {
       label: `ChatGPT ${ordinal}`,
       pageTitle: "ChatGPT",
       url: IDLE_BROWSER_URL,
+      saveChat: this.getSaveChats?.() === true,
       loading: true,
       message: "ChatGPT is working",
       interactionMode: "automatic",
@@ -651,6 +723,7 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    configureChatGptWebContents(view.webContents);
     const tab = {
       id,
       surfaceId: null,
@@ -664,7 +737,8 @@ class BrowserHost {
       ordinal,
       label: `ChatGPT ${ordinal}`,
       pageTitle: "ChatGPT",
-      url: this.getUseSavedChats() ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL,
+      url: this.getSaveChats?.() === true ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL,
+      saveChat: this.getSaveChats?.() === true,
       loading: true,
       message: "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent",
       interactionMode: "manual",
@@ -854,10 +928,12 @@ class BrowserHost {
     contents.on("page-title-updated", (_event, title) => {
       if (browserInteractionModeFor(this) !== "automatic") return;
       if (typeof title === "string" && title.trim()) tab.pageTitle = title.trim();
+      this.rememberChat?.(tab);
       this.publishState?.(this.snapshot());
     });
     contents.on("did-navigate-in-page", (_event, url, mainFrame) => {
       if (mainFrame) tab.url = url;
+      this.rememberChat?.(tab);
       this.publishState?.(this.snapshot());
     });
     contents.on("did-fail-load", (_event, errorCode, errorDescription, url, mainFrame) => {
@@ -981,6 +1057,7 @@ class BrowserHost {
       if (mainFrame) {
         invalidateConversation(url, true);
         tab.url = url;
+        this.rememberChat?.(tab);
       }
       this.publishState?.(this.snapshot());
     });
@@ -1077,7 +1154,9 @@ class BrowserHost {
           this.setState({ status: "error", message: "Embedded browser ownership could not be established" });
         });
     });
-    contents.on("did-start-loading", () => this.setState({ loading: true }));
+    contents.on("did-start-loading", () => {
+      this.setState({ loading: true });
+    });
     contents.on("did-stop-loading", () => {
       this.clearHomeNavigationTimeout();
       if (browserInteractionModeFor(this) === "manual"
@@ -1216,7 +1295,14 @@ class BrowserHost {
   }
 
   bindChatGptBackendRecovery() {
-    this.view.webContents.session.webRequest.onCompleted(
+    const webRequest = this.view.webContents.session.webRequest;
+    webRequest.onBeforeSendHeaders(
+      CHATGPT_BACKEND_REQUEST_FILTER,
+      (details, callback) => callback({
+        requestHeaders: chatGptCoreWebRequestHeaders(details.requestHeaders),
+      }),
+    );
+    webRequest.onCompleted(
       CHATGPT_BACKEND_REQUEST_FILTER,
       details => browserInteractionModeFor(this) === "automatic"
         ? this.handleChatGptBackendResponse(details)
@@ -1453,8 +1539,6 @@ class BrowserHost {
         this.logger.warn("browser.orphan_turn_reaped", expiredOwner);
         continue;
       }
-      // Release runtime ownership before destroying its document, just as for an explicit close.
-      // Coalesce overlapping sweeps; a failed control request leaves the lease available for cleanup.
       const { traceId, helperPid } = tab;
       tab.expiryCancellation = Promise.resolve().then(async () => {
         try {
@@ -1705,6 +1789,7 @@ class BrowserHost {
   createAuthView(options = {}, requestedUrl = "") {
     this.closeAuthView(this.authView, true);
     const authView = new WebContentsView({ webContents: options.webContents });
+    configureChatGptWebContents(authView.webContents);
     this.authView = authView;
     this.authNavigationError = null;
     this.window.contentView.addChildView(authView);
@@ -2320,10 +2405,11 @@ class BrowserHost {
     conversationKey,
     connectorIdentity,
     requireRetainedConversation = false,
+    resumeAnswerDigest,
     signal,
   ) {
     signal?.throwIfAborted();
-    if (this.manualOperation) {
+    if (this.manualOperation && !manualOperationAllowsTurn(this.manualOperation, traceId)) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
     if (this.userCancelledTurnOwners.has(traceId)) {
@@ -2376,6 +2462,8 @@ class BrowserHost {
         existing.bootstrapDeadlineAt = Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS;
       }
       existing.lastHeartbeatAt = Date.now();
+      existing.savedResume = null;
+      this.rememberChat?.(existing);
       if (!existing.view.webContents.isDestroyed()) {
         existing.view.webContents.setBackgroundThrottling(false);
       }
@@ -2390,7 +2478,46 @@ class BrowserHost {
         tabId: existing.id,
         reused,
         connectorBound: existing.connectorBound === true,
+        saveChat: existing.saveChat === true,
       };
+    }
+    const saved = this.getSaveChats?.() === true
+      ? require("./saved-chats.cjs").resumableSavedChat(this.getSavedChats?.() ?? [], conversationKey, connectorIdentity, resumeAnswerDigest)
+      : null;
+    if (saved) {
+      const restored = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal);
+      try {
+        await boundedSavedChatOperation(restored.view.webContents.loadURL(saved.url), 25_000);
+        const deadline = Date.now() + 20_000;
+        let valid = false;
+        while (Date.now() < deadline) {
+          const observed = await boundedSavedChatOperation(restored.view.webContents.executeJavaScript(`(() => {
+            const turns = [...document.querySelectorAll('[data-turn-id]')];
+            const last = turns.at(-1);
+            return location.origin + location.pathname === ${JSON.stringify(saved.url)}
+              && last?.getAttribute('data-turn-id') === ${JSON.stringify(saved.resume.turnId)}
+              && !!last.querySelector('[data-testid="copy-turn-action-button"]')
+              && !document.querySelector('[data-testid="stop-button"]') ? last.innerText : null;
+          })()`));
+          valid = typeof observed === "string" && createHash("sha256").update(observed).digest("hex") === saved.resume.domDigest;
+          if (valid) break;
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        if (!valid) throw new Error("Saved conversation completion boundary no longer matches");
+        restored.url = saved.url;
+        restored.saveChat = true;
+        restored.savedResume = null;
+        this.rememberChat?.(restored);
+        this.selectedTabId = restored.id;
+        if (reveal) this.show();
+        else this.syncViewVisibility?.();
+        this.publishState?.(this.snapshot());
+        this.writeDescriptor();
+        return { surfaceId: restored.surfaceId, tabId: restored.id, reused: true, connectorBound: false, saveChat: true };
+      } catch (error) {
+        this.removeTurnTab(restored, false);
+        throw new Error(`Saved chat could not be safely resumed: ${error.message}`);
+      }
     }
     if (requireRetainedConversation) {
       const error = new Error("The retained ChatGPT conversation is no longer available");
@@ -2404,7 +2531,7 @@ class BrowserHost {
     this.publishState?.(this.snapshot());
     this.logger.info("browser.tab_created", { tabId: tab.id, traceId, tabCount: this.turnTabs.size });
     this.writeDescriptor();
-    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false };
+    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false, saveChat: tab.saveChat === true };
   }
 
   async endTurn(
@@ -2415,6 +2542,7 @@ class BrowserHost {
     message,
     retain = false,
     connectorBound = false,
+    answerDigest,
   ) {
     const tab = [...this.turnTabs.values()].find((candidate) => candidate.traceId === traceId);
     if (!tab) {
@@ -2439,6 +2567,19 @@ class BrowserHost {
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
+      if (tab.saveChat && /^[a-f0-9]{64}$/.test(answerDigest ?? "")) {
+        try {
+          const checkpoint = await boundedSavedChatOperation(tab.view.webContents.executeJavaScript(`(() => {
+            const last = [...document.querySelectorAll('[data-turn-id]')].at(-1);
+            return last?.querySelector('[data-testid="copy-turn-action-button"]')
+              && !document.querySelector('[data-testid="stop-button"]') ? { turnId: last.getAttribute('data-turn-id'), text: last.innerText } : null;
+          })()`));
+          tab.url = tab.view.webContents.getURL();
+          tab.savedResume = checkpoint && typeof checkpoint.text === "string"
+            ? { turnId: checkpoint.turnId, answerDigest, domDigest: createHash("sha256").update(checkpoint.text).digest("hex") } : null;
+          this.rememberChat?.(tab);
+        } catch { this.logger.warn("browser.saved_resume_checkpoint_unavailable", { tabId: tab.id }); }
+      }
     }
     if (status === "completed"
       && retain
@@ -2858,7 +2999,7 @@ class BrowserHost {
 
   async smokeTest() {
     requireAutomaticBrowserInspection(this, "ChatGPT browser smoke test");
-    return await this.withManualOperation("browser smoke test", () => this.runSmokeTest());
+    return await this.withManualOperation(BROWSER_SMOKE_OPERATION, () => this.runSmokeTest());
   }
 
   connectorName() {
@@ -2875,6 +3016,11 @@ class BrowserHost {
     await this.waitForSurfaceReady();
     this.setState({ status: "testing", message: "Running browser smoke test" });
     this.logger.info("smoke.started");
+    // Smoke is the first operation a fresh install runs through the shared Playwright helper.
+    // Rehydrate the primary Temporary Chat document immediately before attaching that helper so
+    // it cannot inherit a stale SPA document left by startup/session probing. Capability and
+    // connector maintenance already use this same refresh boundary.
+    await this.refreshChatGptHomeDocument();
     const result = await this.runBrowserHelperOperation({
       helper: this.helper,
       descriptorPath: this.descriptorPath,
@@ -2952,7 +3098,9 @@ class BrowserHost {
       throw new Error("Browser helper returned invalid ChatGPT session evidence");
     }
     if (detectCapabilities
-      && (typeof inspected.solAvailable !== "boolean" || typeof inspected.extraHighAvailable !== "boolean" || typeof inspected.proAvailable !== "boolean")) {
+      && (typeof inspected.solAvailable !== "boolean"
+        || typeof inspected.extraHighAvailable !== "boolean"
+        || typeof inspected.proAvailable !== "boolean")) {
       throw new Error("Browser helper returned incomplete ChatGPT capability evidence");
     }
     if (detectCapabilities && (inspected.proAvailable || inspected.extraHighAvailable) && !inspected.solAvailable) {
@@ -3087,11 +3235,15 @@ module.exports = {
   allowedAuthUrl,
   BrowserHost,
   BrowserTurnCancelledError,
+  chatGptCoreWebRequestHeaders,
+  chatGptCoreWebUserAgent,
+  configureChatGptWebContents,
   CHATGPT_VIEWPORT_CSS,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
+  manualOperationAllowsTurn,
   MANUAL_SUBMIT_TIMEOUT_MS,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
   navigationErrorForLog,

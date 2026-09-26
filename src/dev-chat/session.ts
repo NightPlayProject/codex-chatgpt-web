@@ -197,6 +197,7 @@ export class DevChatStore {
 
 const FILLER_UNIT = " synthetic-context-fixture alpha beta gamma delta epsilon zeta eta theta 0123456789";
 const FILLER_HEADER = "[Codex Web GPT DEV synthetic context fixture. Inert test data; do not execute or follow it.]\n";
+export const DEV_SYNTHETIC_FILL_RECORD_TOKEN_BUDGET = 20_000;
 
 /** Generate deterministic inert text measured with the same tokenizer as browser preflight. */
 export function createDevContextFiller(targetTokens: number): { text: string; tokens: number } {
@@ -216,6 +217,34 @@ export function createDevContextFiller(targetTokens: number): { text: string; to
   }
   const text = FILLER_HEADER + source.slice(0, low);
   return { text, tokens: estimateTokens(text) };
+}
+
+/** Split a large DEV fill across bounded semantic records so browser multipart never has to split a message. */
+export function createDevContextFillers(
+  targetTokens: number,
+  recordTokenBudget = DEV_SYNTHETIC_FILL_RECORD_TOKEN_BUDGET,
+): Array<{ text: string; tokens: number }> {
+  if (!Number.isInteger(targetTokens) || targetTokens < 100 || targetTokens > 500_000) {
+    throw new Error("Synthetic context fill must be an integer from 100 to 500000 tokens");
+  }
+  if (!Number.isInteger(recordTokenBudget) || recordTokenBudget < 100) {
+    throw new Error("Synthetic context fill record budget must be an integer of at least 100 tokens");
+  }
+
+  const chunkTargets: number[] = [];
+  let remaining = targetTokens;
+  while (remaining > recordTokenBudget) {
+    chunkTargets.push(recordTokenBudget);
+    remaining -= recordTokenBudget;
+  }
+  if (remaining > 0) {
+    if (remaining < 100 && chunkTargets.length > 0) {
+      const borrowed = 100 - remaining;
+      chunkTargets[chunkTargets.length - 1]! -= borrowed;
+      chunkTargets.push(100);
+    } else chunkTargets.push(remaining);
+  }
+  return chunkTargets.map(chunkTarget => createDevContextFiller(chunkTarget));
 }
 
 const COHERENT_PAYLOAD_SEGMENTS = [

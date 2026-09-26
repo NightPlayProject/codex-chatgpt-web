@@ -4,7 +4,7 @@ import type { LimitsSnapshot } from "./limits-types";
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
-export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "settings";
+export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "accounts" | "settings";
 
 export interface LauncherState {
   version: 1;
@@ -15,12 +15,18 @@ export interface LauncherState {
   autoStart: boolean;
   keepRunningOnClose: boolean;
   showBrowserDuringTurns: boolean;
+  saveChats: boolean;
+  savedChats: Array<{ url: string; title: string; conversationKey: string | null; updatedAt: string }>;
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
   useSavedChats: boolean;
   zeroRiskProEnabled: boolean;
+  codexWallpapersEnabled: boolean;
+  codexWallpapersRestartRequired: boolean;
+  codexWallpapersStatus: string | null;
+  codexWallpapersError: string | null;
   sidebarOpen: boolean;
   sidebarWidth: number;
   browserSmokePassed?: boolean;
@@ -78,6 +84,7 @@ export interface DoctorCheck {
   status: "ok" | "warning" | "error";
   message: string;
   detail?: string;
+  nextStep?: string;
 }
 
 export interface DoctorReport {
@@ -116,6 +123,7 @@ export interface LauncherSnapshot {
     connectors: string;
     tunnels: string;
     keys: string;
+    codexSwitcher: string;
   };
   platform: string;
   packaged: boolean;
@@ -123,6 +131,110 @@ export interface LauncherSnapshot {
   smokePassed: boolean;
   operation: OperationState | null;
   update: UpdateState;
+  accounts: AccountSwitcherSnapshot;
+}
+
+export type AccountHealth = "active" | "ready" | "expired" | "unavailable";
+
+export interface CodexAccountSummary {
+  id: string;
+  shortId: string | null;
+  name: string;
+  email: string | null;
+  avatarUrl: string | null;
+  plan: string | null;
+  authMode: "chatgpt" | "api-key" | "unknown";
+  accountId: string | null;
+  isActive: boolean;
+  createdAt: string | null;
+  lastUsedAt: string | null;
+  subscriptionExpiresAt: string | null;
+  usage: AccountUsageSnapshot | null;
+  stats: AccountUsageStats | null;
+  status: AccountHealth;
+}
+
+export interface AccountUsageSnapshot {
+  available: boolean;
+  fetchedAt: string | null;
+  primaryUsedPercent: number | null;
+  primaryWindowMinutes: number | null;
+  primaryResetsAt: string | null;
+  secondaryUsedPercent: number | null;
+  secondaryWindowMinutes: number | null;
+  secondaryResetsAt: string | null;
+  hasCredits: boolean | null;
+  unlimitedCredits: boolean | null;
+  creditsBalance: string | null;
+  error: string | null;
+}
+
+export interface AccountUsageStats {
+  available: boolean;
+  fetchedAt: string | null;
+  generatedAt: string | null;
+  statsAsOf: string | null;
+  lifetimeTokens: number | null;
+  peakDailyTokens: number | null;
+  longestTaskSeconds: number | null;
+  currentStreakDays: number | null;
+  longestStreakDays: number | null;
+  fastModePercent: number | null;
+  reasoningEffort: string | null;
+  reasoningEffortPercent: number | null;
+  skillsExplored: number | null;
+  totalSkillsUsed: number | null;
+  totalThreads: number | null;
+  resetCreditsAvailable: number | null;
+  resetCreditsNextExpiresAt: string | null;
+  daily: Array<{ date: string; tokens: number }>;
+  error: string | null;
+}
+
+export interface AccountActivityEvent {
+  at: string;
+  accountId: string;
+  accountName: string;
+  kind: "switch" | "import";
+}
+
+export interface AccountActivitySummary {
+  totalSwitches: number;
+  switchesToday: number;
+  activeDays: number;
+  lastSwitchAt: string | null;
+  daily: Array<{ date: string; count: number }>;
+  recent: AccountActivityEvent[];
+}
+
+export interface OfficialCodexAppState {
+  supported: boolean;
+  installed: boolean;
+  running: boolean;
+  processCount: number;
+  version: string | null;
+  canSwitch: boolean;
+  message: string;
+}
+
+export interface AccountCurrentSession {
+  present: boolean;
+  managed: boolean;
+  email: string | null;
+  plan: string | null;
+  authMode: "chatgpt" | "api-key" | null;
+}
+
+export interface AccountSwitcherSnapshot {
+  supported: boolean;
+  configured: boolean;
+  source: "codex-switcher" | "official-codex";
+  storePath: string;
+  activeAccountId: string | null;
+  accounts: CodexAccountSummary[];
+  currentSession: AccountCurrentSession;
+  officialApp: OfficialCodexAppState;
+  activity: AccountActivitySummary;
 }
 
 export interface LauncherApi {
@@ -160,6 +272,12 @@ export interface LauncherApi {
     replace?: boolean;
     interactionMode?: BrowserInteractionMode;
   }): Promise<{ ok: boolean; stdout: string }>;
+  setupNativeComputerUse(): Promise<{
+    ok: boolean;
+    registered: boolean;
+    restartRequired: boolean;
+    stdout: string;
+  }>;
   setMcpStep(step: number): Promise<LauncherState>;
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
   setBiggerContext(enabled: boolean): Promise<LauncherState>;
@@ -167,13 +285,22 @@ export interface LauncherApi {
   setFreshConversationPerTurn(enabled: boolean): Promise<LauncherState>;
   setUseSavedChats(enabled: boolean): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
+  setWallpapersEnabled(enabled: boolean): Promise<LauncherState>;
+  accounts(options?: { refreshUsage?: boolean }): Promise<AccountSwitcherSnapshot>;
+  addAccount(): Promise<AccountSwitcherSnapshot | null>;
+  addCurrentAccount(): Promise<AccountSwitcherSnapshot>;
+  startAccountLogin(accountName?: string): Promise<{ authUrl: string; callbackPort: number }>;
+  completeAccountLogin(): Promise<AccountSwitcherSnapshot>;
+  cancelAccountLogin(): Promise<boolean>;
+  switchAccount(accountId: string): Promise<AccountSwitcherSnapshot>;
+  removeAccount(accountId: string): Promise<AccountSwitcherSnapshot>;
   setBrowserInteractionMode(mode: BrowserInteractionMode): Promise<{
     state: LauncherState;
     credentialsRequired: boolean;
     targetMode: BrowserInteractionMode;
   }>;
   setPreference(
-    key: "keepRunningOnClose" | "showBrowserDuringTurns",
+    key: "keepRunningOnClose" | "showBrowserDuringTurns" | "saveChats",
     value: boolean,
   ): Promise<LauncherState>;
   setSidebarState(state: { open: boolean; width: number }): Promise<LauncherState>;
@@ -186,6 +313,7 @@ export interface LauncherApi {
   onStateChanged(listener: (state: LauncherState) => void): () => void;
   onBrowserState(listener: (state: BrowserState) => void): () => void;
   onOperation(listener: (state: OperationState) => void): () => void;
+  onAccountsState(listener: (state: AccountSwitcherSnapshot) => void): () => void;
   onLog(listener: (record: LogRecord) => void): () => void;
   onUpdateState(listener: (state: UpdateState) => void): () => void;
 }

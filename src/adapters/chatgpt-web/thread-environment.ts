@@ -11,11 +11,12 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
-  hasCurrentChatGptEnvironmentContext,
   hasChatGptCalendarEnvironmentDelta,
-  hasRawChatGptEnvironmentContext,
+  hasCurrentChatGptFilesystemEnvironmentContext,
+  hasRawChatGptFilesystemEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
+  isChatGptGoalContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
@@ -148,7 +149,10 @@ export class ChatGptThreadEnvironmentStore {
     private readonly sqliteHome?: string,
   ) {}
 
-  resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
+  resolve(
+    parsed: CodexParsedRequest,
+    options: { allowCurrentFilesystemRolloutRecovery?: boolean } = {},
+  ): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
     try {
       const environment = extractChatGptTurnEnvironment(parsed);
@@ -156,17 +160,28 @@ export class ChatGptThreadEnvironmentStore {
       return environment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
-      const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
+      const hasCurrentFilesystemContext = hasCurrentChatGptFilesystemEnvironmentContext(parsed);
       const lineage = extractChatGptThreadSpawnLineage(parsed);
-      const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
-      const historicalMessages = hasCurrentContext && !currentCompaction && lineage
-        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      const steeringClaim = hasCurrentContext && !currentCompaction
-        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
-      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
-      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
+      const currentCompaction = hasCurrentFilesystemContext && isChatGptCompactionContinuation(parsed);
+      const currentGoal = hasCurrentFilesystemContext && isChatGptGoalContinuation(parsed);
+      const currentContinuation = currentCompaction || currentGoal;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      // A replayed, untagged environment can look current after native compaction removes the
+      // intervening assistant output. Root tasks have the same exact-rollout proof as subagents:
+      // accept that message only when its id and content precede this turn's native task boundary.
+      const historicalMessages = hasCurrentFilesystemContext && !currentContinuation && rolloutIdentity
+        ? unattributedChatGptEnvironmentMessages(parsed, !lineage) : undefined;
+      const steeringClaim = hasCurrentFilesystemContext && !currentContinuation
+        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
+      const calendarDelta = hasCurrentFilesystemContext && !currentContinuation
+        && hasChatGptCalendarEnvironmentDelta(parsed);
+      const blockedCurrentFilesystemFallback = hasCurrentFilesystemContext
+        && !currentContinuation
+        && !historicalMessages
+        && !steeringClaim
+        && !calendarDelta;
+      if (blockedCurrentFilesystemFallback && !options.allowCurrentFilesystemRolloutRecovery) throw error;
+      const currentClaim = currentContinuation ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
       const compactionSourceTurnId = parsed._compactionRequest
@@ -192,17 +207,26 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
-      // Only a current native rollout can supersede an unrecognized historical envelope. Without
-      // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
+      // A steering replacement may arrive in a native wire shape that the strict XML adjacency
+      // parser cannot bind even though the exact current Codex rollout still proves the workspace.
+      // Only callers with independently proven steering may enter that recovery path; if rollout
+      // authentication cannot resolve the current turn, preserve the normal fail-closed behavior.
+      if (blockedCurrentFilesystemFallback) throw error;
       const sameThread = this.get(identity.threadId);
-      if (sameThread) return {
+      // Historical replay may retain an old filesystem envelope after Codex stops emitting it on
+      // every follow-up. When this request carries no current filesystem update, an already-
+      // authenticated cache for this exact native thread remains valid authority. Current updates
+      // still fail closed above, and unknown/foreign threads cannot enter this path.
+      if (!hasCurrentFilesystemContext && sameThread) return {
         cwd: sameThread.cwd,
         roots: sameThread.roots,
         writableRoots: sameThread.writableRoots,
         sandboxPolicy: sameThread.sandboxPolicy,
         tools: parsed.context.tools ?? [],
       };
+      // Without current rollout proof or exact-thread cached authority, never derive authority from
+      // an unrecognized historical filesystem envelope.
+      if (hasRawChatGptFilesystemEnvironmentContext(parsed)) throw error;
 
       if (!lineage) throw error;
       const parent = this.get(lineage.parentThreadId);

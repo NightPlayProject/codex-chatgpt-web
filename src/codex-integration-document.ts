@@ -27,7 +27,8 @@ export function firstTableIndex(lines: string[]): number {
   return index < 0 ? lines.length : index;
 }
 function assignmentRegex(key: string): RegExp {
-  return new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+?)\\s*$`);
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\s*(?:${escaped}|"${escaped}"|'${escaped}')\\s*=\\s*(.+?)\\s*$`);
 }
 
 function stripTomlComment(value: string): string {

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
@@ -10,22 +10,25 @@ import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adap
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
-import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
+import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, extractChatGptTurnUserRevisionRecord, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { bindCompactionContinuationStore, ChatGptCompactionContinuationStore, rememberCompactionContinuation, rememberCompletedCompactionHandoffSource } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { bindGoalContinuationStore, ChatGptGoalContinuationStore } from "../src/adapters/chatgpt-web/goal-continuation";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { ChatGptLunaCheckpointStore, hashChatGptLunaAnswer } from "../src/adapters/chatgpt-web/rolling-checkpoint";
 import {
   CODEX_ACTIVE_COMPACTION_REQUEST_MARKER,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
-import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
-import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptWebRateLimitController, MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRoundKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
 import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
-import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
+import { decodeCompactionSummary, encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
 
@@ -156,6 +159,9 @@ async function executeGatewayProgram(
   availableToolNames: string[],
   calls: GatewayProgramCall[],
   dynamicRegistry = false,
+  includeRegistry = true,
+  toolsOverride?: unknown,
+  registryOverride?: unknown,
 ): Promise<Array<{ type: "text"; text: string }>> {
   const emitted: Array<{ type: "text"; text: string }> = [];
   const implementations = Object.fromEntries(availableToolNames.map(name => [
@@ -181,8 +187,10 @@ async function executeGatewayProgram(
   };
   const ignoreOutput = (_value: unknown): void => {};
   await execute(
-    nestedTools,
-    availableToolNames.map(name => ({ name, description: `${name} test tool` })),
+    toolsOverride ?? nestedTools,
+    includeRegistry
+      ? registryOverride ?? availableToolNames.map(name => ({ name, description: `${name} test tool` }))
+      : undefined,
     emitText,
     ignoreOutput,
     ignoreOutput,
@@ -516,6 +524,68 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("a completed native compaction retires its superseded source as a clean continuation boundary", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-compaction-supersede-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-compaction-supersede-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let started!: () => void;
+    const browserStarted = new Promise<void>(resolveStarted => { started = resolveStarted; });
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      await turn.prepare();
+      started();
+      return await new Promise<string>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("browser aborted", "AbortError"));
+        if (turn.abortSignal?.aborted) abort();
+        else turn.abortSignal?.addEventListener("abort", abort, { once: true });
+      });
+    };
+
+    const request = rawWireRequest(environmentXml);
+    const store = new ChatGptCompactionContinuationStore();
+    bindCompactionContinuationStore(request, store);
+    const compactRequest = structuredClone(request);
+    compactRequest._compactionRequest = true;
+    bindCompactionContinuationStore(compactRequest, store);
+    const identity = extractChatGptTurnIdentity(request);
+    const revision = extractChatGptTurnUserRevisionRecord(request);
+    const source = {
+      content: revision.content,
+      ...(revision.turnId !== undefined ? { turnId: revision.turnId } : {}),
+      ...(revision.itemId !== undefined ? { itemId: revision.itemId } : {}),
+    };
+    // Reproduce the ordering seen in activity logs: ChatGPT has accepted the structured handoff,
+    // but server.ts has not yet persisted the completed compact response.
+    rememberCompletedCompactionHandoffSource(compactRequest, identity, source);
+
+    const adapter = createChatGptWebAdapter(provider);
+    const events: AdapterEvent[] = [];
+    try {
+      const running = adapter.runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      await browserStarted;
+      const lineage = chatGptInstructionLineage(request);
+      const ownerKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptThreadOwnershipKey(request)}`;
+      expect(chatGptTurnSessions.preemptSupersededOwnerTurn(
+        ownerKey,
+        identity.turnId!,
+        { current: "post-compaction-continuation", predecessors: new Set([lineage.current]) },
+        "replacement-execution",
+      )).toBe(1);
+      await running;
+
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: false });
+      expect(events.some(event => event.type === "error")).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
   test("does not trust an environment tag supplied as the active user message", () => {
     const request = parsed();
     request._rawBody = {
@@ -840,6 +910,126 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(() => chatGptTurnExecutionKey(parsed(environmentXml))).toThrow("requires native Codex turn_id metadata");
   });
 
+  test("authenticated post-compaction wrapper regeneration keeps continuation identity stable without weakening steering", async () => {
+    const store = new ChatGptCompactionContinuationStore();
+    const sourceRequest = rawWireRequest(environmentXml);
+    const sourceInput = (sourceRequest._rawBody as { input: Array<Record<string, unknown>> }).input;
+    sourceInput.at(-1)!.id = "msg_before_compaction";
+    bindCompactionContinuationStore(sourceRequest, store);
+
+    const compactRequest = structuredClone(sourceRequest);
+    compactRequest._compactionRequest = true;
+    bindCompactionContinuationStore(compactRequest, store);
+    const identity = extractChatGptTurnIdentity(compactRequest);
+    const sourceRecord = extractChatGptTurnUserRevisionRecord(compactRequest);
+    const source = {
+      content: sourceRecord.content,
+      ...(sourceRecord.turnId !== undefined ? { turnId: sourceRecord.turnId } : {}),
+      ...(sourceRecord.itemId !== undefined ? { itemId: sourceRecord.itemId } : {}),
+    };
+    const summary = "Compaction checkpoint for regenerated continuation identity.";
+    rememberCompactionContinuation(compactRequest, identity, [source], summary);
+
+    const continued = (itemId: string): CodexParsedRequest => {
+      const request = structuredClone(sourceRequest);
+      const input = (request._rawBody as { input: Array<Record<string, unknown>> }).input;
+      input.at(-1)!.id = itemId;
+      input.push({ type: "compaction", encrypted_content: encodeCompactionSummary(summary) });
+      bindCompactionContinuationStore(request, store);
+      return request;
+    };
+    const first = continued("msg_after_compaction_a");
+    const reconnect = continued("msg_after_compaction_b");
+
+    expect(chatGptTurnExecutionKey(first)).toBe(chatGptTurnExecutionKey(reconnect));
+    expect(chatGptTurnRoundKey(first)).toBe(chatGptTurnRoundKey(reconnect));
+    expect(chatGptInstructionLineage(first).current).toBe(chatGptInstructionLineage(reconnect).current);
+
+    const sessions = new ChatGptTurnSessions();
+    const ownerKey = "post-compaction-owner";
+    const sourceKey = chatGptTurnExecutionKey(sourceRequest);
+    const sourceSession = await sessions.getOrCreateAfterOwnerRetirement(
+      sourceKey,
+      ownerKey,
+      () => ({
+        mode: "read-only" as const,
+        browser: Promise.resolve("pre-compaction"),
+        physicalSettlement: Promise.resolve(),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      }),
+      "pre-compaction-trace",
+      undefined,
+      identity.turnId,
+      identity.threadId,
+      chatGptInstructionLineage(sourceRequest),
+    );
+    await sourceSession.browserOutcome;
+    expect(sessions.retire(sourceKey, sourceSession)).toBeTrue();
+    await sessions.waitForRetirement(sourceKey);
+
+    const firstLineage = chatGptInstructionLineage(first);
+    expect(sessions.preemptSupersededOwnerTurn(ownerKey, identity.turnId!, firstLineage, chatGptTurnExecutionKey(first))).toBe(1);
+    let starts = 0;
+    const runtime = () => {
+      starts += 1;
+      return {
+        mode: "read-only" as const,
+        browser: new Promise<string>(() => {}),
+        physicalSettlement: new Promise<void>(() => {}),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      };
+    };
+    const firstSession = await sessions.getOrCreateAfterOwnerRetirement(
+      chatGptTurnExecutionKey(first),
+      ownerKey,
+      runtime,
+      "continuation-a",
+      undefined,
+      identity.turnId,
+      identity.threadId,
+      firstLineage,
+    );
+    const reconnectLineage = chatGptInstructionLineage(reconnect);
+    expect(sessions.preemptSupersededOwnerTurn(ownerKey, identity.turnId!, reconnectLineage, chatGptTurnExecutionKey(reconnect))).toBe(0);
+    expect(await sessions.getOrCreateAfterOwnerRetirement(
+      chatGptTurnExecutionKey(reconnect),
+      ownerKey,
+      runtime,
+      "continuation-b",
+      undefined,
+      identity.turnId,
+      identity.threadId,
+      reconnectLineage,
+    )).toBe(firstSession);
+    expect(starts).toBe(1);
+
+    const steered = structuredClone(reconnect);
+    const steeredInput = (steered._rawBody as { input: Array<Record<string, unknown>> }).input;
+    steeredInput.push({
+      type: "message",
+      role: "user",
+      id: "msg_real_steer",
+      content: [{ type: "input_text", text: "Stop and inspect the latest result before continuing" }],
+      internal_chat_message_metadata_passthrough: { turn_id: identity.turnId },
+    });
+    bindCompactionContinuationStore(steered, store);
+    expect(chatGptTurnExecutionKey(steered)).not.toBe(chatGptTurnExecutionKey(reconnect));
+    const steeredLineage = chatGptInstructionLineage(steered);
+    expect(steeredLineage.current).not.toBe(reconnectLineage.current);
+    expect(steeredLineage.predecessors.has(reconnectLineage.current)).toBeTrue();
+    expect(sessions.preemptSupersededOwnerTurn(
+      ownerKey,
+      identity.turnId!,
+      steeredLineage,
+      chatGptTurnExecutionKey(steered),
+    )).toBe(1);
+    sessions.clear();
+  });
+
   test("coalesces provider retries onto one browser runtime and preserves outstanding calls", () => {
     const sessions = new ChatGptTurnSessions();
     let starts = 0;
@@ -862,6 +1052,135 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(starts).toBe(1);
     first.setOutstanding([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
     expect(second.outstanding()).toEqual([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
+  });
+
+  test("accepts a later human steer after one trusted current goal wrapper and rejects ambiguous ordering", () => {
+    const raw = rawWireRequest(environmentXml);
+    const body = raw._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, unknown> };
+    const metadata = JSON.parse(String(body.client_metadata["x-codex-turn-metadata"])) as { thread_id: string; turn_id: string };
+    const goal = {
+      type: "message",
+      role: "user",
+      id: "msg_goal_before_steer",
+      content: [{ type: "input_text", text: [
+        '<codex_internal_context source="goal">',
+        "Continue working toward the active thread goal.",
+        "<objective>",
+        "Keep implementing the active goal",
+        "</objective>",
+        "runtime budget",
+        "</codex_internal_context>",
+      ].join("\n") }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: metadata.turn_id,
+        content_item_kinds: ["goal.internal_context"],
+      },
+    };
+    // A goal runtime wrapper generated before the current human revision is the normal steering
+    // shape. The later human message supersedes the wrapper and must become a fresh execution key.
+    body.input.splice(body.input.length - 1, 0, goal);
+    const steered = parseRequest({ model: "chatgpt-web/high", stream: false, ...raw._rawBody as Record<string, unknown> });
+    steered.modelId = raw.modelId;
+    steered.options.reasoning = raw.options.reasoning;
+    expect(() => chatGptTurnExecutionKey(steered)).not.toThrow();
+
+    // Reversing the order leaves the goal wrapper as the later authority and remains ambiguous.
+    const goalAfterHuman = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    const wrapper = goalAfterHuman.input.splice(goalAfterHuman.input.length - 2, 1)[0]!;
+    goalAfterHuman.input.push(wrapper);
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...goalAfterHuman,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const malformed = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    const malformedGoal = malformed.input.at(-2)!;
+    malformedGoal.content = [{ type: "input_text", text: '<codex_internal_context source="goal">missing objective</codex_internal_context>' }];
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...malformed,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const duplicate = structuredClone(raw._rawBody) as { input: Array<Record<string, unknown>> };
+    duplicate.input.splice(duplicate.input.length - 1, 0, {
+      ...structuredClone(duplicate.input.at(-2)!), id: "msg_goal_duplicate",
+    });
+    expect(() => chatGptTurnExecutionKey(parseRequest({
+      model: CHATGPT_WEB_MODEL_ID, stream: false, ...duplicate,
+    }))).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+  });
+
+  test("native /goal execution follows the trusted objective instead of the retained human source", () => {
+    const threadId = "thread_harness_goal_semantics";
+    const sourceTurnId = "turn_harness_goal_source";
+    const checkpointTurnId = "turn_harness_goal_checkpoint";
+    const goalTurnId = "turn_harness_goal_active";
+    const summary = "Harness goal checkpoint";
+    const source = {
+      type: "message", role: "user", id: "msg_harness_goal_source",
+      content: [{ type: "input_text", text: "Reply with exactly INITIAL_NATIVE_OK" }],
+      internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId, content_item_kinds: ["user.text"] },
+    };
+    const compactionStore = new ChatGptCompactionContinuationStore();
+    const goalStore = new ChatGptGoalContinuationStore();
+    const checkpoint = parseRequest({
+      model: CHATGPT_WEB_MODEL_ID,
+      stream: true,
+      input: [source, { type: "compaction_trigger" }],
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: checkpointTurnId }),
+      },
+    });
+    bindCompactionContinuationStore(checkpoint, compactionStore);
+    rememberCompactionContinuation(
+      checkpoint,
+      extractChatGptTurnIdentity(checkpoint),
+      [extractChatGptCompactionSourceRevision(checkpoint)],
+      summary,
+    );
+    const makeGoal = (objective: string, wrapperId: string, turnId = goalTurnId): CodexParsedRequest => {
+      const request = parseRequest({
+        model: CHATGPT_WEB_MODEL_ID,
+        stream: true,
+        input: [
+          source,
+          { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+          {
+            type: "message", role: "user", id: wrapperId,
+            content: [{ type: "input_text", text: [
+              '<codex_internal_context source="goal">',
+              "Continue working toward the active thread goal.",
+              "<objective>",
+              objective,
+              "</objective>",
+              `Budget wrapper ${wrapperId}`,
+              "</codex_internal_context>",
+            ].join("\n") }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["goal.internal_context"] },
+          },
+        ],
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }) },
+      });
+      bindCompactionContinuationStore(request, compactionStore);
+      bindGoalContinuationStore(request, goalStore);
+      return request;
+    };
+
+    const first = makeGoal("Reply with exactly GOAL_ONLY", "msg_harness_goal_a");
+    expect(extractChatGptTurnUserRevision(first)).toEqual(source.content);
+    const compiled = compileChatGptWebPrompt(first, browserOnlyCapabilities);
+    expect(JSON.stringify(first.context.messages)).not.toContain("GOAL_ONLY");
+    expect(compiled.text).toContain("GOAL_ONLY");
+    expect(compiled.text).toContain("Execute the active native Codex goal now");
+    const firstKey = chatGptTurnExecutionKey(first);
+
+    const replay = makeGoal("Reply with exactly GOAL_ONLY", "msg_harness_goal_regenerated");
+    expect(chatGptTurnExecutionKey(replay)).toBe(firstKey);
+    expect(() => chatGptTurnExecutionKey(
+      makeGoal("Reply with exactly MUTATED_SAME_TURN", "msg_harness_goal_mutated"),
+    )).toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+
+    const nextTurn = makeGoal("Reply with exactly SECOND_GOAL", "msg_harness_goal_next", "turn_harness_goal_next");
+    expect(chatGptTurnExecutionKey(nextTurn)).not.toBe(firstKey);
+    expect(compileChatGptWebPrompt(nextTurn, browserOnlyCapabilities).text).toContain("SECOND_GOAL");
   });
 
   test("waits for completed browser cleanup before starting the next canonical instruction", async () => {
@@ -901,7 +1220,8 @@ describe("ChatGPT outer-native harness v4", () => {
       undefined,
       "new-native-turn",
       "native-thread",
-      { current: "new-instruction", predecessors: new Set(["old-instruction"]) },
+      // A new paginated native turn may not replay the previous turn's instruction in this request.
+      { current: "new-instruction", predecessors: new Set() },
     );
     await Bun.sleep(0);
 
@@ -911,6 +1231,57 @@ describe("ChatGPT outer-native harness v4", () => {
     expect((await replacement).traceId).toBe("new-trace");
     expect(replacements).toBe(1);
     expect(cancellations).toBe(0);
+    sessions.clear();
+  });
+
+  test("a fully settled paginated native turn does not require the prior turn's instruction lineage", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const first = await sessions.getOrCreateAfterOwnerRetirement(
+      "first-paginated-turn",
+      "shared-paginated-thread",
+      () => ({
+        mode: "read-only" as const,
+        browser: Promise.resolve("first"),
+        physicalSettlement: Promise.resolve(),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      }),
+      "first-trace",
+      undefined,
+      "native-turn-a",
+      "native-thread",
+      { current: "instruction-a", predecessors: new Set() },
+    );
+    await first.browserOutcome;
+    await first.physicalSettlement;
+
+    let starts = 0;
+    const second = await sessions.getOrCreateAfterOwnerRetirement(
+      "second-paginated-turn",
+      "shared-paginated-thread",
+      () => {
+        starts += 1;
+        return {
+          mode: "read-only" as const,
+          browser: Promise.resolve("second"),
+          physicalSettlement: Promise.resolve(),
+          trace: new ChatGptTraceFeed(),
+          text: new ChatGptTextFeed(),
+          cancel: () => {},
+        };
+      },
+      "second-trace",
+      undefined,
+      "native-turn-b",
+      "native-thread",
+      // Codex paginated history can start a fresh native turn with only its current delta. The
+      // prior turn remains authoritative in history_base but is absent from this request's input.
+      { current: "instruction-b", predecessors: new Set() },
+    );
+
+    expect(second.nativeTurnId).toBe("native-turn-b");
+    expect(starts).toBe(1);
     sessions.clear();
   });
 
@@ -967,6 +1338,83 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
+  for (const steerCount of [5, 20]) {
+    test(`coalesces ${steerCount} rapid canonical steers while the previous browser is retiring`, async () => {
+      const sessions = new ChatGptTurnSessions();
+      let rejectOld!: (reason: Error) => void;
+      let settleOld!: () => void;
+      const cancellations: Error[] = [];
+      sessions.getOrCreate("root", () => ({
+        mode: "tools",
+        token: new Promise<string>(() => {}),
+        externalProgress: new ChatGptExternalTurnProgress(),
+        browser: new Promise<string>((_, reject) => { rejectOld = reject; }),
+        physicalSettlement: new Promise<void>(resolve => { settleOld = resolve; }),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: reason => {
+          if (!reason) return;
+          cancellations.push(reason);
+          rejectOld(reason);
+        },
+      }), "root-trace", "shared-owner", "native-turn", "native-thread", "root-instruction");
+
+      const starts: string[] = [];
+      const pending: Array<Promise<ChatGptTurnSession>> = [];
+      const predecessors = ["root-instruction"];
+      for (let index = 1; index <= steerCount; index += 1) {
+        const current = `steer-${index}`;
+        const key = `steer-key-${index}`;
+        pending.push(sessions.getOrCreateAfterOwnerRetirement(
+          key,
+          "shared-owner",
+          () => {
+            starts.push(current);
+            return {
+              mode: "read-only" as const,
+              browser: Promise.resolve(current),
+              physicalSettlement: Promise.resolve(),
+              trace: new ChatGptTraceFeed(),
+              text: new ChatGptTextFeed(),
+              cancel: () => {},
+            };
+          },
+          `trace-${index}`,
+          undefined,
+          "native-turn",
+          "native-thread",
+          { current, predecessors: new Set(predecessors) },
+        ));
+        predecessors.push(current);
+      }
+
+      expect(cancellations).toHaveLength(1);
+      expect(starts).toEqual([]);
+      settleOld();
+      const outcomes = await Promise.allSettled(pending);
+      expect(starts).toEqual([`steer-${steerCount}`]);
+      for (const outcome of outcomes.slice(0, -1)) {
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status === "rejected") {
+          expect(outcome.reason).toMatchObject({ code: "client_cancelled", retryable: false });
+        }
+      }
+      expect(outcomes.at(-1)?.status).toBe("fulfilled");
+
+      await expect(sessions.getOrCreateAfterOwnerRetirement(
+        "late-root",
+        "shared-owner",
+        () => { throw new Error("stale steering must never restart"); },
+        "late-root-trace",
+        undefined,
+        "native-turn",
+        "native-thread",
+        { current: "root-instruction", predecessors: new Set() },
+      )).rejects.toMatchObject({ code: "client_cancelled", retryable: false });
+      sessions.clear();
+    });
+  }
+
   test("retires only the exact active native turn that Codex marked aborted", () => {
     const sessions = new ChatGptTurnSessions();
     const cancelled: string[] = [];
@@ -985,6 +1433,61 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(sessions.find("old")).toBeUndefined();
     expect(sessions.find("other")?.nativeTurnId).toBe("turn_other");
     expect(cancelled).toEqual(["old"]);
+  });
+
+  test("proven same-turn steering cancels stale browser work before replacement startup", () => {
+    const sessions = new ChatGptTurnSessions();
+    let cancellations = 0;
+    sessions.getOrCreate("old", () => ({
+      mode: "read-only" as const,
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => { cancellations += 1; },
+    }), "old-trace", "shared-owner", "turn_shared", "thread_shared", "old-instruction");
+
+    expect(sessions.preemptSupersededOwnerTurn(
+      "shared-owner",
+      "turn_shared",
+      { current: "steered-instruction", predecessors: new Set(["old-instruction"]) },
+      "replacement",
+    )).toBe(1);
+    expect(cancellations).toBe(1);
+    expect(sessions.find("old")?.supersededError).toMatchObject({
+      code: "client_cancelled",
+      retryable: false,
+    });
+  });
+
+  test("recognizes queued same-turn steering after the previous browser session settled", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const prior = await sessions.getOrCreateAfterOwnerRetirement(
+      "old",
+      "shared-owner",
+      () => ({
+        mode: "read-only" as const,
+        browser: Promise.resolve("done"),
+        physicalSettlement: Promise.resolve(),
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => {},
+      }),
+      "old-trace",
+      undefined,
+      "turn_shared",
+      "thread_shared",
+      { current: "old-instruction", predecessors: new Set() },
+    );
+    expect(sessions.retire("old", prior)).toBe(true);
+    await sessions.waitForRetirement("old");
+
+    expect(sessions.preemptSupersededOwnerTurn(
+      "shared-owner",
+      "turn_shared",
+      { current: "queued-steering", predecessors: new Set(["old-instruction"]) },
+      "replacement",
+    )).toBe(1);
   });
 
   test("retires a failed session so the next native retry starts a new browser turn", async () => {
@@ -1241,7 +1744,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("caps automatic transient-server-error browser sends at three retries for one native turn", async () => {
+  test("treats a rate-limited native turn as terminal without another browser send", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-retry-budget-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1254,15 +1757,15 @@ describe("ChatGPT outer-native harness v4", () => {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
       turn.onSendActivated?.();
-      throw new ChatGptWebAdapterError("ChatGPT is temporarily unavailable. Try again in a few minutes.", {
-        status: 502,
-        errorType: "server_error",
-        code: "upstream_server_error",
+      throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests. Try again in a few minutes.", {
+        status: 429,
+        errorType: "rate_limit_error",
+        code: "rate_limit_exceeded",
         retryable: true,
       });
     };
     try {
-      for (let attempt = 0; attempt < MAX_CHATGPT_WEB_TURN_RETRIES + 2; attempt += 1) {
+      for (let attempt = 0; attempt < Math.max(2, MAX_CHATGPT_WEB_TURN_RETRIES); attempt += 1) {
         const events: AdapterEvent[] = [];
         await createChatGptWebAdapter(provider).runTurn!(
           rawWireRequest(environmentXml),
@@ -1270,19 +1773,45 @@ describe("ChatGPT outer-native harness v4", () => {
           event => events.push(event),
         );
         const error = events.at(-1);
-        expect(error).toMatchObject({ type: "error", code: "upstream_server_error" });
-        expect((error as Extract<AdapterEvent, { type: "error" }>).retryable)
-          .toBe(attempt < MAX_CHATGPT_WEB_TURN_RETRIES);
-        if (attempt === MAX_CHATGPT_WEB_TURN_RETRIES) {
-          expect((error as Extract<AdapterEvent, { type: "error" }>).message)
-            .toContain("Try again in a few minutes.");
-        }
+        expect(error).toMatchObject({ type: "error", code: "rate_limit_exceeded" });
+        expect((error as Extract<AdapterEvent, { type: "error" }>).retryable).toBeFalse();
       }
-      expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+      expect(browserStarts).toBe(1);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();
     }
+  });
+
+  test("rate-limit recovery cools down one provider scope and admits one recovery probe", () => {
+    const controller = new ChatGptWebRateLimitController(1_000, 10_000);
+    const rateLimit = new ChatGptWebAdapterError("ChatGPT rate limit: too many requests.", {
+      status: 429,
+      errorType: "rate_limit_error",
+      code: "rate_limit_exceeded",
+      retryable: true,
+    });
+
+    const terminal = controller.recordRateLimit("scope-a", "scope-a:turn-a", rateLimit, 100);
+    expect(terminal.retryable).toBeFalse();
+    expect(controller.terminalTurnError("scope-a:turn-a", 200)?.retryable).toBeFalse();
+    expect(controller.terminalTurnError("scope-a:turn-b", 200)).toMatchObject({
+      status: 429,
+      code: "rate_limit_exceeded",
+      retryable: false,
+    });
+    expect(controller.terminalTurnError("scope-b:turn-a", 200)).toBeUndefined();
+
+    expect(controller.terminalTurnError("scope-a:turn-b", 1_200)).toBeUndefined();
+    expect(controller.terminalTurnError("scope-a:turn-c", 1_200)).toMatchObject({
+      status: 429,
+      code: "rate_limit_exceeded",
+      retryable: false,
+    });
+    controller.recordRequestSettled("scope-a", 1_200);
+    expect(controller.terminalTurnError("scope-a:turn-c", 1_201)).toBeUndefined();
+    controller.recordSuccess("scope-a", 1_201);
+    expect(controller.terminalTurnError("scope-a:turn-d", 1_202)).toBeUndefined();
   });
 
   test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {
@@ -1407,6 +1936,284 @@ describe("ChatGPT outer-native harness v4", () => {
       }
       expect(browserStarts).toBe(1);
       expect(existsSync(checkpointPath)).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a missing optional Sol checkpoint completes once without repeating the browser turn", async () => {
+    const checkpointPath = join(tempRoot, `missing-sol-checkpoint-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-missing-checkpoint-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeTrue();
+        const answer = "Sol completed the requested task.";
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    const request = rawWireRequest(environmentXml);
+    request.options.reasoning = "high";
+    const adapter = createChatGptWebAdapter(provider);
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(request, { headers: new Headers() }, event => events.push(event));
+        expect(events.filter(event => event.type === "text_delta" && event.phase === "final_answer")).toEqual([{
+          type: "text_delta",
+          text: "Sol completed the requested task.",
+          phase: "final_answer",
+        }]);
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+        expect(events.some(event => event.type === "error")).toBeFalse();
+      }
+      expect(browserStarts).toBe(1);
+      expect(existsSync(checkpointPath)).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a Sol compaction request applies an exact-parent checkpoint without capturing or mutating it", async () => {
+    const checkpointPath = join(tempRoot, `sol-compaction-checkpoint-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-compaction-checkpoint-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const threadId = "thread_test_123";
+    const sourceTurnId = "turn_sol_compaction_source";
+    const currentTurnId = "turn_test_123";
+    const parentAnswer = "Sol finished the previous retained step.";
+    const priorHistory = `VERY LARGE PRIOR RAW SOL HISTORY ${"x".repeat(40_000)}`;
+    const store = new ChatGptLunaCheckpointStore(checkpointPath, Date.now, "Sol");
+    const source = parseRequest({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: priorHistory }],
+        internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+      }],
+      stream: true,
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: sourceTurnId }),
+      },
+    });
+    store.commit(source, {
+      checkpoint: {
+        version: 2,
+        summary: "Objective:\nContinue the long Sol task.\nPending:\n- Preserve the fresh turn and its tool evidence.",
+      },
+      answerHash: hashChatGptLunaAnswer(parentAnswer),
+    }, parentAnswer);
+    const checkpointBefore = readFileSync(checkpointPath, "utf8");
+
+    const request = parseRequest({
+      model: "gpt-5.6-sol",
+      prompt_cache_key: threadId,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: currentTurnId }),
+      },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: priorHistory }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: parentAnswer }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+          internal_chat_message_metadata_passthrough: { turn_id: currentTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue the current Sol task after compaction" }],
+          internal_chat_message_metadata_passthrough: { turn_id: currentTurnId },
+        },
+        {
+          type: "function_call",
+          call_id: "call_sol_compaction_current",
+          name: "exec_command",
+          arguments: JSON.stringify({ cmd: "git status --short" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_sol_compaction_current",
+          output: "CURRENT SOL TOOL EVIDENCE",
+        },
+      ],
+      stream: true,
+      reasoning: { effort: "high" },
+    });
+    request._compactionRequest = true;
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let preparedText = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeFalsy();
+        preparedText = prepared.text;
+        const answer = `${SUMMARY_PREFIX}\nSol compaction completed.`;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      expect(preparedText).toContain("Compressed Sol task history");
+      expect(preparedText).toContain("Continue the current Sol task after compaction");
+      expect(preparedText).toContain("CURRENT SOL TOOL EVIDENCE");
+      expect(preparedText).not.toContain("VERY LARGE PRIOR RAW SOL HISTORY");
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpointBefore);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a Sol compaction request with the wrong parent fails closed to raw history without checkpoint capture", async () => {
+    const checkpointPath = join(tempRoot, `sol-compaction-mismatch-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-sol-compaction-mismatch-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: false,
+        solCheckpointStatePath: checkpointPath,
+      },
+    };
+    const sourceTurnId = "turn_sol_compaction_mismatch_source";
+    const parentAnswer = "Stored Sol parent answer.";
+    const store = new ChatGptLunaCheckpointStore(checkpointPath, Date.now, "Sol");
+    const source = parseRequest({
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Stored source task" }],
+        internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+      }],
+      stream: true,
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_test_123", turn_id: sourceTurnId }),
+      },
+    });
+    store.commit(source, {
+      checkpoint: { version: 2, summary: "Stored Sol checkpoint summary." },
+      answerHash: hashChatGptLunaAnswer(parentAnswer),
+    }, parentAnswer);
+    const checkpointBefore = readFileSync(checkpointPath, "utf8");
+
+    const request = parseRequest({
+      model: "gpt-5.6-sol",
+      prompt_cache_key: "thread_test_123",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_test_123", turn_id: "turn_test_123" }),
+      },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "RAW HISTORY MUST SURVIVE MISMATCH" }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Different parent answer." }],
+          internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_test_123" },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue after mismatch" }],
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_test_123" },
+        },
+      ],
+      stream: true,
+      reasoning: { effort: "high" },
+    });
+    request._compactionRequest = true;
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let preparedText = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        expect(turn.captureLunaCheckpoint).toBeFalsy();
+        preparedText = prepared.text;
+        const answer = `${SUMMARY_PREFIX}\nMismatch fallback completed.`;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      expect(preparedText).not.toContain("Compressed Sol task history");
+      expect(preparedText).toContain("RAW HISTORY MUST SURVIVE MISMATCH");
+      expect(preparedText).toContain("Continue after mismatch");
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpointBefore);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     }
@@ -2055,6 +2862,57 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test("replays a pending native invocation after a broker response timeout and deduplicates its retry", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-replay-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    const token = await broker.register(environment);
+    try {
+      const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+      const first = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, 25);
+      await expect(first).rejects.toThrow("timed out");
+
+      // The timed-out MCP socket no longer owns the result, but the broker keeps the invocation
+      // available to the next native owner instead of retiring the whole turn.
+      const retry = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, null);
+      await Bun.sleep(25);
+      const [request] = await broker.nextToolBatch(token);
+      expect(request).toMatchObject({ wireName: "exec_command", arguments: { cmd: "reconnect-safe" } });
+      expect(await broker.nextToolBatch(token)).toEqual([request]);
+      broker.completeTool(token, request!.callId, toolResult({ output: "reconnected" }));
+      expect(await retry).toEqual(toolResult({ output: "reconnected" }));
+
+      // If the native result won the race with the MCP deadline, a later retry receives the
+      // committed result instead of starting the side-effecting native tool again.
+      const lateRetry = callTurnBroker<BrokerToolResult>(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "reconnect-safe" },
+        invocationKey: "mcp-replay-key",
+      }, null);
+      expect(await lateRetry).toEqual(toolResult({ output: "reconnected" }));
+    } finally {
+      broker.revoke(token);
+      await broker.close();
+    }
+  });
+
   test("makes capability claim retries idempotent until the turn is revoked", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-claim-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
@@ -2660,6 +3518,7 @@ describe("ChatGPT outer-native harness v4", () => {
         "codex_apply_patch",
         "codex_exec",
         "codex_tool_call",
+        "codex_tool_capabilities",
         "codex_tool_inventory",
         "codex_view_image",
         "codex_write_stdin",
@@ -2675,7 +3534,7 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("9bb14902149337b52ce8598889497b1aba5a3265f28291df950bb38b5700a421");
+        .toBe("4ab3b622b3d9198f17a317cee29b3d16c40b73df5083a4c3ba72a72cbed74375");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -2717,6 +3576,24 @@ describe("ChatGPT outer-native harness v4", () => {
         destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
+      });
+
+      const capabilities = await call("codex_tool_capabilities", { turn_token: token });
+      expect(capabilities.structuredContent).toMatchObject({
+        protocol_version: 2,
+        contract: "native",
+        gateway: {
+          available: true,
+          wire_name: "exec",
+          can_discover_deferred: true,
+        },
+        discovery: { inventory: true, exact_call: true },
+        surfaces: {
+          execution: { availability: "direct", deferred_possible: true },
+          agents: { availability: "direct", deferred_possible: true },
+        },
+        connector: { contract_version: "codex-web-gpt-tooling-v2" },
+        recovery: { status: "ready" },
       });
 
       const firstExec = call("codex_exec", {
@@ -2793,11 +3670,13 @@ describe("ChatGPT outer-native harness v4", () => {
         query: string,
         includeSchema: boolean,
         nestedToolNames: string[],
+        surface?: string,
       ) => {
         const pending = call("codex_tool_inventory", {
           turn_token: token,
           query,
           include_schema: includeSchema,
+          ...(surface ? { surface } : {}),
         });
         const [request] = await broker.nextToolBatch(token);
         expect(request).toMatchObject({ wireName: "exec", freeform: true });
@@ -2825,13 +3704,166 @@ describe("ChatGPT outer-native harness v4", () => {
         }],
       });
 
-      const search = call("codex_tool_call", {
-        turn_token: token, wire_name: "tool_search", arguments: { query: "clink opencode pal" },
+      // Native runtimes may expose a namespace as an object map instead of a flat ALL_TOOLS
+      // array. The gateway must preserve the dotted namespace and resolve the nested function
+      // against its owning object so methods that depend on `this` keep working.
+      const nestedNamespaceCalls: GatewayProgramCall[] = [];
+      const nestedNamespaceTools = {
+        "Microsoft.windows.Computer": {
+          get_app_state: async (input: unknown) => {
+            nestedNamespaceCalls.push({
+              name: "Microsoft.windows.Computer__get_app_state",
+              input,
+            });
+            return { output: "desktop", exit_code: 0 };
+          },
+        },
+      };
+      const nestedNamespaceRegistry = {
+        "Microsoft.windows.Computer": {
+          get_app_state: {
+            type: "function",
+            name: "get_app_state",
+            description: "Read the current Windows app state",
+            input_schema: { type: "object", additionalProperties: false },
+          },
+        },
+      };
+      const nestedNamespaceInventoryPending = call("codex_tool_inventory", {
+        turn_token: token,
+        query: "get_app_state",
+        include_schema: true,
       });
-      const [searchRequest] = await broker.nextToolBatch(token);
-      expect(searchRequest).toMatchObject({ wireName: "tool_search", arguments: { query: "clink opencode pal" } });
-      broker.completeTool(token, searchRequest!.callId, toolResult({ tools: [] }));
-      await search;
+      const [nestedNamespaceInventoryRequest] = await broker.nextToolBatch(token);
+      const nestedNamespaceInventoryContent = await executeGatewayProgram(
+        nestedNamespaceInventoryRequest!.input!,
+        [],
+        [],
+        false,
+        true,
+        nestedNamespaceTools,
+        nestedNamespaceRegistry,
+      );
+      broker.completeTool(token, nestedNamespaceInventoryRequest!.callId, { content: nestedNamespaceInventoryContent });
+      expect((await nestedNamespaceInventoryPending).structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "Microsoft.windows.Computer__get_app_state",
+          name: "Microsoft.windows.Computer__get_app_state",
+          namespace: null,
+          kind: "gateway",
+          parameters: { type: "object", additionalProperties: false },
+        }],
+      });
+
+      const nestedNamespaceCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "Microsoft.windows.Computer__get_app_state",
+        arguments: { include_windows: true },
+      });
+      const [nestedNamespaceRequest] = await broker.nextToolBatch(token);
+      const nestedNamespaceContent = await executeGatewayProgram(
+        nestedNamespaceRequest!.input!,
+        [],
+        nestedNamespaceCalls,
+        false,
+        true,
+        nestedNamespaceTools,
+        nestedNamespaceRegistry,
+      );
+      expect(nestedNamespaceCalls).toEqual([{
+        name: "Microsoft.windows.Computer__get_app_state",
+        input: { include_windows: true },
+      }]);
+      broker.completeTool(token, nestedNamespaceRequest!.callId, { content: nestedNamespaceContent });
+      expect((await nestedNamespaceCall).isError).not.toBe(true);
+
+      // Fresh Codex tasks can keep optional MCPs deferred behind tool_search. Full mode must be
+      // able to discover tool_search through the native exec gateway, invoke it, then see and use
+      // the newly exposed desktop-control tool on the next tool boundary without another tunnel.
+      const deferredSearchInventory = await inventoryThroughGateway(
+        "tool_search",
+        true,
+        ["exec", "tool_search"],
+      );
+      expect(deferredSearchInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "tool_search",
+          name: "tool_search",
+          namespace: null,
+          kind: "tool_search",
+        }],
+      });
+
+      const deferredSearch = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "tool_search",
+        arguments: { query: "open-computer-use desktop control", limit: 8 },
+      });
+      const [deferredSearchRequest] = await broker.nextToolBatch(token);
+      expect(deferredSearchRequest).toMatchObject({
+        wireName: "tool_search",
+        freeform: false,
+        arguments: { query: "open-computer-use desktop control", limit: 8 },
+      });
+      expect(deferredSearchRequest?.input).toBeUndefined();
+      broker.completeTool(token, deferredSearchRequest!.callId, toolResult({
+        tools: [{ name: "mcp__open_computer_use__list_apps" }],
+      }));
+      expect((await deferredSearch).isError).not.toBe(true);
+
+      const desktopInventory = await inventoryThroughGateway(
+        "open_computer_use",
+        true,
+        ["exec", "tool_search", "mcp__open_computer_use__list_apps"],
+      );
+      expect(desktopInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "mcp__open_computer_use__list_apps",
+          name: "mcp__open_computer_use__list_apps",
+          namespace: null,
+          kind: "gateway",
+        }],
+      });
+
+      const desktopSurfaceInventory = await inventoryThroughGateway(
+        "list_apps",
+        true,
+        ["exec", "mcp__open_computer_use__list_apps"],
+        "computer",
+      );
+      expect(desktopSurfaceInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{
+          wire_name: "mcp__open_computer_use__list_apps",
+          kind: "gateway",
+        }],
+      });
+
+      const desktopCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "mcp__open_computer_use__list_apps",
+        arguments: {},
+      });
+      const [desktopRequest] = await broker.nextToolBatch(token);
+      const desktopCalls: GatewayProgramCall[] = [];
+      const desktopContent = await executeGatewayProgram(
+        desktopRequest!.input!,
+        ["mcp__open_computer_use__list_apps"],
+        desktopCalls,
+      );
+      expect(desktopCalls).toEqual([{
+        name: "mcp__open_computer_use__list_apps",
+        input: {},
+      }]);
+      broker.completeTool(token, desktopRequest!.callId, { content: desktopContent });
+      expect((await desktopCall).isError).not.toBe(true);
 
       const rawGatewayInventory = await inventoryThroughGateway(
         "Run nested Codex tools",
@@ -2958,6 +3990,41 @@ describe("ChatGPT outer-native harness v4", () => {
         type: "text",
         text: JSON.stringify({ output: "web__run", exit_code: 0 }),
       }]);
+
+      // Newer MCP registries may use punctuation in an exact wire name and may omit ALL_TOOLS
+      // while still exposing callable properties on the native tools object. The gateway must
+      // preserve that name instead of sanitizing it into a different function key.
+      const punctuationInventory = await inventoryThroughGateway(
+        "desktop/process",
+        true,
+        ["exec", "mcp__desktop/process-list"],
+      );
+      expect(punctuationInventory.structuredContent).toMatchObject({
+        total: 1,
+        next_offset: null,
+        tools: [{ wire_name: "mcp__desktop/process-list", name: "mcp__desktop/process-list", kind: "gateway" }],
+      });
+
+      const punctuationCall = call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "mcp__desktop/process-list",
+        arguments: { filter: "Task Manager" },
+      });
+      const [punctuationRequest] = await broker.nextToolBatch(token);
+      const punctuationCalls: GatewayProgramCall[] = [];
+      const punctuationContent = await executeGatewayProgram(
+        punctuationRequest!.input!,
+        ["mcp__desktop/process-list"],
+        punctuationCalls,
+        false,
+        false,
+      );
+      expect(punctuationCalls).toEqual([{
+        name: "mcp__desktop/process-list",
+        input: { filter: "Task Manager" },
+      }]);
+      broker.completeTool(token, punctuationRequest!.callId, { content: punctuationContent });
+      expect((await punctuationCall).isError).not.toBe(true);
 
       const waitPromise = call("codex_tool_call", {
         turn_token: token,
@@ -3199,6 +4266,54 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 30_000);
 
+  test("does not treat a namespaced MCP tool as a native bridge or exec gateway", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-mcp-collision-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    environment.tools = [{
+      name: "exec_command",
+      namespace: "mcp__unrelated",
+      description: "An unrelated MCP command-shaped tool",
+      parameters: { type: "object" },
+    }, {
+      name: "exec",
+      namespace: "mcp__unrelated",
+      description: "An unrelated namespaced freeform tool",
+      parameters: { type: "object" },
+      freeform: true,
+    }];
+    const token = await broker.register(environment, 60_000);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+      cwd: process.cwd(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "codex-chatgpt-web-collision-test", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+      const capabilities = await client.callTool({
+        name: "codex_tool_capabilities",
+        arguments: { turn_token: token },
+      });
+      expect(capabilities.structuredContent).toMatchObject({
+        gateway: { available: false, wire_name: null },
+      });
+
+      const exec = await client.callTool({
+        name: "codex_exec",
+        arguments: { turn_token: token, cmd: "should-not-route" },
+      });
+      expect(exec.isError).toBe(true);
+      expect(JSON.stringify(exec.content)).toContain("no native exec gateway");
+    } finally {
+      await client.close().catch(() => {});
+      broker.revoke(token);
+      await broker.close();
+    }
+  }, 30_000);
+
   test("keeps simultaneous direct-token MCP actions isolated by outer Codex turn", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-mcp-isolation-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
@@ -3375,7 +4490,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 10_000);
 
-  test("a native tool deadline returns an explicit MCP timeout instead of a transport failure", async () => {
+  test("a native tool deadline returns a retryable MCP timeout before the turn TTL retires it", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-mcp-timeout-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
     const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
@@ -3423,7 +4538,8 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(timeoutResult.structuredContent).toMatchObject({
         code: "codex_tool_timeout",
         tool: "exec_command",
-        retryable: false,
+        retryable: true,
+        binding_preserved: true,
       });
       expect(JSON.stringify(timeoutResult.content)).toContain("did not complete before the MCP transport deadline");
       await retirement;
@@ -3455,6 +4571,104 @@ describe("ChatGPT outer-native harness v4", () => {
       await broker.close();
     }
   }, 10_000);
+
+  test("missing trusted workspace returns a terminal error on reconnect without starting a browser", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://missing-workspace-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let starts = 0;
+    worker.run = async () => { starts++; throw new Error("unexpected browser start"); };
+    try {
+      const adapter = createChatGptWebAdapter(provider);
+      for (let retry = 0; retry < 2; retry++) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(rawWireRequest("Continue"), { headers: new Headers() }, event => events.push(event));
+        expect(events.at(-1)).toMatchObject({
+          type: "error", code: "chatgpt_trusted_environment_missing", status: 409, retryable: false,
+        });
+      }
+      expect(starts).toBe(0);
+    } finally {
+      worker.run = originalRun;
+    }
+  });
+
+  test("steering cancels stale browser work before a replacement can fail workspace preflight", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://steering-preflight-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let browserStarts = 0;
+    worker.run = async () => { browserStarts++; throw new Error("replacement must fail before browser startup"); };
+
+    const initial = rawWireRequest(environmentXml);
+    const namespace = chatGptWebExecutionNamespace(provider);
+    const initialIdentity = extractChatGptTurnIdentity(initial);
+    const ownerKey = `${namespace}:${chatGptThreadOwnershipKey(initial)}`;
+    const initialKey = `${namespace}:${chatGptTurnExecutionKey(initial)}`;
+    let cancellations = 0;
+    let settleOwner!: () => void;
+    const ownerSettlement = new Promise<void>(resolve => { settleOwner = resolve; });
+    chatGptTurnSessions.getOrCreate(
+      initialKey,
+      () => ({
+        mode: "read-only" as const,
+        browser: new Promise<string>(() => {}),
+        physicalSettlement: ownerSettlement,
+        trace: new ChatGptTraceFeed(),
+        text: new ChatGptTextFeed(),
+        cancel: () => { cancellations += 1; settleOwner(); },
+      }),
+      "steering-preflight-old",
+      ownerKey,
+      initialIdentity.turnId,
+      initialIdentity.threadId,
+      chatGptInstructionLineage(initial).current,
+    );
+
+    const replacement = structuredClone(initial);
+    const raw = replacement._rawBody as { input: Array<Record<string, unknown>> };
+    raw.input[0]!.content = [{ type: "input_text", text: "Context omitted by native steering replay" }];
+    raw.input.push({
+      type: "message",
+      role: "user",
+      id: "msg_steer",
+      content: [{ type: "input_text", text: "Stop the old work and follow this steering instead" }],
+      internal_chat_message_metadata_passthrough: { turn_id: initialIdentity.turnId },
+    });
+    replacement.context.messages.push({
+      role: "user",
+      content: "Stop the old work and follow this steering instead",
+      timestamp: 3,
+    });
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        replacement,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(cancellations).toBe(1);
+      expect(browserStarts).toBe(0);
+      expect(events.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_trusted_environment_missing",
+        status: 409,
+      });
+    } finally {
+      settleOwner();
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+    }
+  });
 
   test("a retired MCP binding closes the adapter tool boundary before the stale batch can be emitted", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-retired-boundary-${process.pid}-${Date.now()}`);
@@ -3515,7 +4729,7 @@ describe("ChatGPT outer-native harness v4", () => {
         markRetirementObserved();
 
         return await new Promise<string>((_resolve, reject) => {
-          const rejectAborted = () => reject(turn.abortSignal?.reason ?? new DOMException("test browser aborted", "AbortError"));
+          const rejectAborted = () => reject(new DOMException("test browser aborted", "AbortError"));
           if (turn.abortSignal?.aborted) rejectAborted();
           else turn.abortSignal?.addEventListener("abort", rejectAborted, { once: true });
         });
@@ -3537,7 +4751,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
       expect(events.at(-1)).toMatchObject({
         type: "error",
-        code: "chatgpt_submitted_turn_failed",
+        code: "chatgpt_native_binding_retired",
       });
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;

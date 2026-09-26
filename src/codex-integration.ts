@@ -5,6 +5,7 @@ import { getConfigPath, loadConfig, saveConfig } from "./config";
 import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+  MANAGED_PROVIDER_ID,
   getCodexConfigPath,
   getCodexJournalPath,
   getCodexJournalRecoveryPath,
@@ -20,6 +21,7 @@ import type {
   AnyCodexIntegrationJournal,
   CodexIntegrationJournal,
   InstallCodexIntegrationOptions,
+  LegacyCodexIntegrationJournalV10,
   LegacyCodexIntegrationJournalV4,
   LegacyCodexIntegrationJournalV5,
   LegacyCodexIntegrationJournalV6,
@@ -62,6 +64,7 @@ function installConfiguredRoute(
   text: string;
   previous: CodexIntegrationJournal["previous"];
   previousRealtimeWebrtcCallBaseUrl: CodexIntegrationJournal["previousRealtimeWebrtcCallBaseUrl"];
+  providerBlock: string;
   previousMultiAgent?: CodexIntegrationJournal["previousMultiAgent"];
   previousMultiAgentV2?: CodexIntegrationJournal["previousMultiAgentV2"];
   previousAgentMaxDepth?: CodexIntegrationJournal["previousAgentMaxDepth"];
@@ -81,6 +84,7 @@ function installConfiguredRoute(
           text: features.text,
           previous: route.previous,
           previousRealtimeWebrtcCallBaseUrl: route.previousRealtimeWebrtcCallBaseUrl,
+          providerBlock: route.providerBlock,
           previousMultiAgent: features.previousMultiAgent,
           previousMultiAgentV2: features.previousMultiAgentV2,
           previousAgentMaxDepth: features.previousAgentMaxDepth,
@@ -95,7 +99,7 @@ function installConfiguredRoute(
 }
 
 function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version: 2 }>): AppConfig["subagentProtocol"] {
-  return journal.version === 8 || journal.version === 9 || journal.version === 10
+  return journal.version === 8 || journal.version === 9 || journal.version === 10 || journal.version === 11
     ? journal.installed.subagent_protocol
     : "native";
 }
@@ -120,7 +124,7 @@ export function readCodexSubagentProtocol(
   fallback: AppConfig["subagentProtocol"] = "compatibility-v1",
 ): AppConfig["subagentProtocol"] {
   const journal = readJournal();
-  return journal?.version === 8 || journal?.version === 9 || journal?.version === 10
+  return journal?.version === 8 || journal?.version === 9 || journal?.version === 10 || journal?.version === 11
     ? journal.installed.subagent_protocol
     : fallback;
 }
@@ -199,6 +203,7 @@ export function preflightCodexIntegration(
       );
       return;
     }
+    if (existing.version === 11) return;
     if (existing.version === 10) {
       assertBuiltinModelProvider(currentText);
       return;
@@ -265,11 +270,12 @@ export function installCodexIntegration(
       installedUrl,
       config,
       true,
-      !preservePrevious || existing.version === 9 || existing.version === 10 || options.replaceExistingRoute === true,
+      !preservePrevious || existing.version === 9 || existing.version === 10 || existing.version === 11
+        || options.replaceExistingRoute === true,
     );
     if (preservePrevious) {
       assertPreservedPreviousAssignments(patched.previous, existing.previous);
-      if (existing.version === 9 || existing.version === 10) {
+      if (existing.version === 9 || existing.version === 10 || existing.version === 11) {
         assertPreservedPreviousRealtimeAssignment(
           patched.previousRealtimeWebrtcCallBaseUrl,
           existing.previousRealtimeWebrtcCallBaseUrl,
@@ -277,19 +283,22 @@ export function installCodexIntegration(
       }
     }
     const updated: CodexIntegrationJournal = {
-      version: 10,
+      version: 11,
       active: true,
       configPath,
       installed: {
         openai_base_url: installedUrl,
+        model_provider: MANAGED_PROVIDER_ID,
         experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
         subagent_protocol: config.subagentProtocol,
         ...(config.subagentProtocol === "compatibility-v1" ? {
           agent_max_depth: patched.installedAgentMaxDepth,
         } : {}),
       },
+      providerBlock: patched.providerBlock,
       previous: preservePrevious ? existing.previous : patched.previous,
-      previousRealtimeWebrtcCallBaseUrl: preservePrevious && (existing.version === 9 || existing.version === 10)
+      previousRealtimeWebrtcCallBaseUrl: preservePrevious
+        && (existing.version === 9 || existing.version === 10 || existing.version === 11)
         ? existing.previousRealtimeWebrtcCallBaseUrl
         : patched.previousRealtimeWebrtcCallBaseUrl,
       interruptHook: patched.interruptHook,
@@ -319,17 +328,19 @@ export function installCodexIntegration(
     options.replaceExistingRoute === true,
   );
   const journal: CodexIntegrationJournal = {
-    version: 10,
+    version: 11,
     active: true,
     configPath,
     installed: {
       openai_base_url: installedUrl,
+      model_provider: MANAGED_PROVIDER_ID,
       experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
       subagent_protocol: config.subagentProtocol,
       ...(config.subagentProtocol === "compatibility-v1" ? {
         agent_max_depth: patched.installedAgentMaxDepth,
       } : {}),
     },
+    providerBlock: patched.providerBlock,
     previous: patched.previous,
     previousRealtimeWebrtcCallBaseUrl: patched.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: patched.interruptHook,
@@ -354,13 +365,14 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
   const current = readFileSync(existing.configPath, "utf8");
-  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
+  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10 || existing.version === 11) && !existing.active) {
     verifyRestoredRoute(current, existing);
     return { changed: false, active: false };
   }
   const restored = restoreManagedRoute(current, existing);
   const disconnected:
     | CodexIntegrationJournal
+    | LegacyCodexIntegrationJournalV10
     | LegacyCodexIntegrationJournalV9
     | LegacyCodexIntegrationJournalV8
     | LegacyCodexIntegrationJournalV6
@@ -368,6 +380,7 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
     | LegacyCodexIntegrationJournalV5
     | LegacyCodexIntegrationJournalV4 = existing.version === 6 || existing.version === 5
       || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10
+      || existing.version === 11
       ? { ...existing, active: false }
       : { ...existing, version: 4, active: false };
   writeIntegrationState(disconnected, { path: existing.configPath, data: restored }, [getCodexModelsCachePath()]);
@@ -383,12 +396,12 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
   const current = readFileSync(existing.configPath, "utf8");
-  if (existing.version === 10 && existing.active) {
+  if (existing.version === 11 && existing.active) {
     verifyInstalledRoute(current, existing);
     return { changed: false, active: true };
   }
   let baseline: string;
-  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
+  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10 || existing.version === 11) && !existing.active) {
     verifyRestoredRoute(current, existing);
     baseline = current;
   } else {
@@ -396,7 +409,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
     baseline = restoreManagedRoute(current, existing);
   }
   const protocol = journalProtocol(existing);
-  const hookConfig = existing.version === 10
+  const hookConfig = existing.version === 10 || existing.version === 11
     ? { interruptHookCommand: existing.interruptHook.command }
     : { runtimeCommand: loadConfig().runtimeCommand };
   const route = installConfiguredRoute(
@@ -404,29 +417,31 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
     existing.installed.openai_base_url,
     { subagentProtocol: protocol, ...hookConfig },
     true,
-    existing.version === 9 || existing.version === 10,
+    existing.version === 9 || existing.version === 10 || existing.version === 11,
   );
   assertPreservedPreviousAssignments(route.previous, existing.previous);
-  if (existing.version === 9 || existing.version === 10) {
+  if (existing.version === 9 || existing.version === 10 || existing.version === 11) {
     assertPreservedPreviousRealtimeAssignment(
       route.previousRealtimeWebrtcCallBaseUrl,
       existing.previousRealtimeWebrtcCallBaseUrl,
     );
   }
   const connected: CodexIntegrationJournal = {
-    version: 10,
+    version: 11,
     active: true,
     configPath: existing.configPath,
     installed: {
       openai_base_url: existing.installed.openai_base_url,
+      model_provider: MANAGED_PROVIDER_ID,
       experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
       subagent_protocol: protocol,
       ...(protocol === "compatibility-v1" ? {
         agent_max_depth: route.installedAgentMaxDepth,
       } : {}),
     },
+    providerBlock: route.providerBlock,
     previous: existing.previous,
-    previousRealtimeWebrtcCallBaseUrl: existing.version === 9 || existing.version === 10
+    previousRealtimeWebrtcCallBaseUrl: existing.version === 9 || existing.version === 10 || existing.version === 11
       ? existing.previousRealtimeWebrtcCallBaseUrl
       : route.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: route.interruptHook,
@@ -452,7 +467,7 @@ export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
       throw new Error(`Managed legacy catalog changed after setup: ${journal.catalogPath}`);
     }
     restored = restoreLegacyV2(current, journal);
-  } else if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) && !journal.active) {
+  } else if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10 || journal.version === 11) && !journal.active) {
     verifyRestoredRoute(current, journal);
     restored = current;
   } else {
@@ -501,10 +516,10 @@ export function inspectCodexIntegration(): {
     try {
       assertJournalTargetsConfig(journal, getCodexConfigPath());
       const text = readFileSync(journal.configPath, "utf8");
-      if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) && !journal.active) {
+      if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10 || journal.version === 11) && !journal.active) {
         verifyRestoredRoute(text, journal);
       }
-      else if (journal.version === 3 || journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) {
+      else if (journal.version === 3 || journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10 || journal.version === 11) {
         verifyInstalledRoute(text, journal);
       }
       else {
@@ -522,11 +537,11 @@ export function inspectCodexIntegration(): {
   }
   return {
     installed: Boolean(journal),
-    active: journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10
+    active: journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10 || journal?.version === 11
       ? journal.active
       : Boolean(journal),
     configPath: getCodexConfigPath(),
-    ...(journal?.version === 3 || journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10
+    ...(journal?.version === 3 || journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10 || journal?.version === 11
       ? { routeUrl: journal.installed.openai_base_url }
       : {}),
     ...(journal ? { journal } : {}),

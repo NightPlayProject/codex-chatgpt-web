@@ -258,7 +258,7 @@ describe("Zero Risk turn broker lifecycle", () => {
         token: requestId,
         finalAnswer: "remote final",
       });
-      await expect(completed).resolves.toBe("remote final");
+      expect(await completed).toBe("remote final");
       await remote.revoke(requestId);
     } finally {
       await broker.close();
@@ -291,12 +291,15 @@ describe("Zero Risk public MCP ABI", () => {
     try {
       await client.connect(transport);
       expect(client.getInstructions()).toContain("begin with codex_turn_start using the request_id");
+      expect(client.getInstructions()).toContain("Direct and deferred shell, process, browser/computer, MCP, connector/app, and subagent tools use the same bridge");
+      expect(client.getInstructions()).toContain("call codex_tool_inventory with a focused query and include_schema=true");
       expect(client.getInstructions()).toContain("send the complete answer with codex_turn_complete");
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
         "codex_exec",
         "codex_tool_call",
+        "codex_tool_capabilities",
         "codex_tool_inventory",
         "codex_turn_complete",
         "codex_turn_start",

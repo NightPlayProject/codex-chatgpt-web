@@ -6,8 +6,10 @@ import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-export const TUNNEL_VERSION = "0.0.12";
-const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
+// Keep the current upstream tunnel-client release as the managed target. Older known releases
+// remain trusted migration sources so existing installations can upgrade without a manual reset.
+export const TUNNEL_VERSION = "0.0.14";
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.11", "0.0.12", "0.0.13"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;
@@ -25,7 +27,7 @@ interface TunnelInstallManifest {
 export function tunnelClientInstallAction(installedVersion: string): "reuse" | "upgrade" {
   if (installedVersion === TUNNEL_VERSION) return "reuse";
   if (MIGRATABLE_TUNNEL_VERSIONS.has(installedVersion)) return "upgrade";
-  throw new Error(`Installed tunnel-client version ${installedVersion} is not a trusted upgrade source`);
+  throw new Error(`Installed tunnel-client version ${installedVersion} is not a trusted migration source`);
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -414,14 +416,19 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
     if (!Array.isArray(parsed.entries)) throw new Error("local inventory has no entries array");
-    const matches = parsed.entries.filter(entry => entry?.alias === alias);
+    const matches = parsed.entries.filter(entry => (
+      entry && typeof entry === "object" && !Array.isArray(entry)
+      && (entry as Record<string, unknown>).alias === alias
+    ));
     if (matches.length > 1) throw new Error("local inventory contains duplicate aliases");
-    const state = matches.length === 0 ? "stopped" : matches[0].runtime_state;
-    if (!["stopped", "starting", "healthy", "ready"].includes(state)) {
+    const state = matches.length === 0
+      ? "stopped"
+      : (matches[0] as Record<string, unknown>).runtime_state;
+    if (!["stopped", "starting", "healthy", "ready"].includes(String(state))) {
       throw new Error("local inventory has an unsupported runtime state");
     }
-    // tunnel-client 0.0.12 derives these states from the live process and local healthz/readyz
-    // probes. It does not need the optional remote control-plane lookup made by `status`.
+    // tunnel-client derives these states from the live process and local health probes. It does
+    // not need the optional remote control-plane lookup made by `status`.
     const processRunning = state !== "stopped";
     const healthy = state === "healthy" || state === "ready";
     const ready = state === "ready";
@@ -435,9 +442,15 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
         `state=${state}`,
         ...(matches.length === 0 ? ["local_inventory=absent"] : []),
       ].join("; "));
-    return { ok, processRunning, healthy, ready, state, detail };
+    return { ok, processRunning, healthy, ready, state: String(state), detail };
   } catch (error) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
+    return {
+      ok: false,
+      processRunning: false,
+      healthy: false,
+      ready: false,
+      detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}`,
+    };
   }
 }
 

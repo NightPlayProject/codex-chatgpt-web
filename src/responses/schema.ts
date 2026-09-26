@@ -118,16 +118,29 @@ export const toolSchema = z.object({
   description: z.string().optional(),
   parameters: z.record(z.string(), z.unknown()).optional(),
   strict: z.boolean().optional(),
-});
+  // Responses Lite/native Codex revisions may attach a namespace or mark a function as
+  // freeform/tool-search without changing its callable wire shape. Keep those fields at the
+  // parser boundary instead of letting Zod's default object stripping make the tool unreachable.
+  namespace: z.string().optional(),
+  freeform: z.boolean().optional(),
+  toolSearch: z.boolean().optional(),
+  input_schema: z.record(z.string(), z.unknown()).optional(),
+  inputSchema: z.record(z.string(), z.unknown()).optional(),
+}).loose();
 
 const builtinToolSchema = z.object({ type: z.string() }).loose();
+const toolEntrySchema = z.union([toolSchema, builtinToolSchema]);
 
 const hostedToolType = z.enum([
   "web_search_preview", "file_search", "computer_use_preview",
   "code_interpreter", "image_generation", "mcp",
 ]);
 
-const allowedToolEntrySchema = z.object({ type: z.string(), name: z.string().optional() });
+const allowedToolEntrySchema = z.object({
+  type: z.string(),
+  name: z.string().optional(),
+  namespace: z.string().optional(),
+}).loose();
 
 export const toolChoiceSchema = z.union([
   z.literal("auto"),
@@ -150,7 +163,16 @@ export const responsesRequestSchema = z.object({
   model: z.string().min(1),
   input: z.union([z.string(), z.array(inputItemSchema)]).optional(),
   instructions: z.union([z.string(), z.null()]).optional(),
-  tools: z.array(z.union([toolSchema, builtinToolSchema])).optional(),
+  // Responses Lite has shipped both the public array form and an object-mapped native registry.
+  // Keep the map intact so the parser can flatten namespaced Computer/MCP tools.
+  tools: z.union([
+    z.array(toolEntrySchema),
+    z.record(z.string(), z.unknown()),
+  ]).optional(),
+  // A few native clients put deferred declarations beside `tools` instead of inside an input
+  // item. They are opaque to ordinary Responses callers, but must remain available to the bridge.
+  additional_tools: z.unknown().optional(),
+  tool_search_output: z.unknown().optional(),
   tool_choice: toolChoiceSchema.optional(),
   max_output_tokens: z.number().optional(),
   temperature: z.number().optional(),

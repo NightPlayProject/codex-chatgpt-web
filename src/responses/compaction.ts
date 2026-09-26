@@ -87,9 +87,43 @@ export function compactionItemToText(encryptedContent: string | undefined): stri
  */
 
 /** codex-rs compact.rs COMPACT_USER_MESSAGE_MAX_TOKENS = 20k tokens (~4 chars/token). */
-const COMPACT_V1_RETAINED_CHAR_BUDGET = 20_000 * 4;
+export const COMPACT_V1_RETAINED_TEXT_TOKEN_BUDGET = 20_000;
+
+export interface CompactV1OutputOptions {
+  /** Keep the newest structured image history independently of the retained text budget. */
+  maxImages?: number;
+  /** Override codex-rs's 20k recent-user-text budget for a narrower routed browser envelope. */
+  retainedTextTokenBudget?: number;
+}
 
 type CompactMessageItem = Record<string, unknown>;
+
+const CODEX_CONTEXTUAL_USER_CONTENT_ITEM_KINDS = new Set([
+  "environments.environment_context",
+  "goal.internal_context",
+  "plugins.recommendations",
+]);
+
+/** Native Codex runtime context can use role=user without being a human-authored revision. */
+export function hasOnlyCodexContextualUserContentItemKinds(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = (value as { internal_chat_message_metadata_passthrough?: unknown })
+    .internal_chat_message_metadata_passthrough;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const kinds = (metadata as { content_item_kinds?: unknown }).content_item_kinds;
+  return Array.isArray(kinds) && kinds.length > 0
+    && kinds.every(kind => typeof kind === "string" && CODEX_CONTEXTUAL_USER_CONTENT_ITEM_KINDS.has(kind));
+}
+
+/** A native goal continuation is runtime steering, never a human-authored browser message. */
+export function isNativeGoalContextItem(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = (value as { internal_chat_message_metadata_passthrough?: unknown })
+    .internal_chat_message_metadata_passthrough;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const kinds = (metadata as { content_item_kinds?: unknown }).content_item_kinds;
+  return Array.isArray(kinds) && kinds.length === 1 && kinds[0] === "goal.internal_context";
+}
 
 interface CompactContentBlock extends Record<string, unknown> {
   type?: string;
@@ -131,6 +165,9 @@ export function extractCompactUserMessages(input: unknown): CompactMessageItem[]
     const rec = item as CompactMessageItem & { type?: string; role?: string; content?: unknown };
     if (rec.type !== undefined && rec.type !== "message") continue;
     if (rec.role !== "user") continue;
+    // Codex Desktop also represents some runtime preamble as role=user. Native kinds are the
+    // authoritative distinction; do not retain that context as a human message in v1 output.
+    if (hasOnlyCodexContextualUserContentItemKinds(rec)) continue;
     // Codex removes InternalModelContextFragment during process_annotated_compacted_history.
     // In particular, a goal continuation is runtime steering, not a retained human message.
     // Exclude it before computing the v1 checkpoint source, or the next request authenticates
@@ -182,10 +219,12 @@ function imageBlock(block: CompactContentBlock): boolean {
 export function buildCompactV1Output(
   userMessages: CompactMessageItem[],
   summary: string,
-  maxImages = 10,
+  options: CompactV1OutputOptions = {},
 ): CompactMessageItem[] {
+  const maxImages = options.maxImages ?? 10;
+  const retainedTextTokenBudget = options.retainedTextTokenBudget ?? COMPACT_V1_RETAINED_TEXT_TOKEN_BUDGET;
   const selected: CompactMessageItem[] = [];
-  let remaining = COMPACT_V1_RETAINED_CHAR_BUDGET;
+  let remaining = Math.max(0, Math.floor(retainedTextTokenBudget)) * 4;
   let retainedImages = 0;
   for (let i = userMessages.length - 1; i >= 0 && (remaining > 0 || retainedImages < maxImages); i--) {
     const message = structuredClone(userMessages[i]!);

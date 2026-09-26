@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { pipeline } = require("node:stream/promises");
 
-const REPOSITORY = "miuuyy/codex-chatgpt-web";
+const REPOSITORY = "NightPlayProject/codex-chatgpt-web";
 const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
 const USER_AGENT = "codex-web-gpt-launcher-updater";
 const MAX_REDIRECTS = 5;
@@ -23,12 +23,23 @@ function parseVersion(value) {
 }
 
 function compareVersions(left, right) {
-  const a = parseVersion(left);
-  const b = parseVersion(right);
+  const normalize = (value) => {
+    const parsed = parseVersion(value);
+    if (!parsed) return null;
+    // Releases before v5.0.8 used 5.0.7xxx as a build train (for example 5.0.7030).
+    // Treat those as v5.0.7 build revisions so the public v5.0.8 release upgrades them.
+    if (parsed.major === 5 && parsed.minor === 0 && parsed.patch >= 7000 && parsed.patch < 8000) {
+      return { ...parsed, patch: 7, legacyBuild: parsed.patch - 7000 };
+    }
+    return { ...parsed, legacyBuild: 0 };
+  };
+  const a = normalize(left);
+  const b = normalize(right);
   if (!a || !b) throw new Error(`Invalid release version comparison: ${left} / ${right}`);
   for (const key of ["major", "minor", "patch"]) {
     if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
   }
+  if (a.legacyBuild !== b.legacyBuild) return a.legacyBuild > b.legacyBuild ? 1 : -1;
   if (a.prerelease === b.prerelease) return 0;
   if (a.prerelease === null) return 1;
   if (b.prerelease === null) return -1;
@@ -266,6 +277,7 @@ function createUpdateController({
   const supportedAsset = releaseAssetName(currentVersion, platform, arch);
   let state = packaged && supportedAsset ? { status: "idle" } : { status: "disabled" };
   let checked = false;
+  let checking = null;
   let pending = null;
   let candidate = null;
 
@@ -275,43 +287,60 @@ function createUpdateController({
     return state;
   };
 
-  async function checkOnce() {
-    if (state.status === "disabled" || checked) return state;
+  async function runCheck(force) {
+    if (state.status === "disabled" || (!force && checked)) return state;
+    if (pending || state.status === "downloading" || state.status === "installing") return state;
+    if (checking) return checking;
     checked = true;
-    transition({ status: "checking" });
+    checking = (async () => {
+      transition({ status: "checking" });
+      try {
+        const release = await deps.fetchRelease();
+        // GitHub's /releases/latest already excludes these, including for older launchers.
+        if (release?.draft === true || release?.prerelease === true) {
+          candidate = null;
+          return transition({ status: "up-to-date" });
+        }
+        const version = releaseVersion(release?.tag_name);
+        if (compareVersions(version, currentVersion) <= 0) {
+          candidate = null;
+          return transition({ status: "up-to-date" });
+        }
+        const assetName = releaseAssetName(version, platform, arch);
+        if (!assetName) return transition({ status: "disabled" });
+        const assets = Array.isArray(release?.assets) ? release.assets : [];
+        const asset = assets.find((item) => item?.name === assetName);
+        const checksums = assets.find((item) => item?.name === "checksums.txt");
+        if (!asset?.browser_download_url || !checksums?.browser_download_url) {
+          throw new Error(`Release v${version} is missing ${assetName} or checksums.txt`);
+        }
+        candidate = {
+          version,
+          assetName,
+          assetUrl: validateReleaseAssetUrl(asset.browser_download_url, version, assetName),
+          checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
+        };
+        logger?.info("launcher.update_available", { currentVersion, version, platform, arch });
+        return transition({ status: "available", version });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger?.warn("launcher.update_check_failed", { message });
+        return transition({ status: "error", message });
+      }
+    })();
     try {
-      const release = await deps.fetchRelease();
-      // GitHub's /releases/latest already excludes these, including for older launchers.
-      if (release?.draft === true || release?.prerelease === true) {
-        candidate = null;
-        return transition({ status: "up-to-date" });
-      }
-      const version = releaseVersion(release?.tag_name);
-      if (compareVersions(version, currentVersion) <= 0) {
-        candidate = null;
-        return transition({ status: "up-to-date" });
-      }
-      const assetName = releaseAssetName(version, platform, arch);
-      if (!assetName) return transition({ status: "disabled" });
-      const assets = Array.isArray(release?.assets) ? release.assets : [];
-      const asset = assets.find((item) => item?.name === assetName);
-      const checksums = assets.find((item) => item?.name === "checksums.txt");
-      if (!asset?.browser_download_url || !checksums?.browser_download_url) {
-        throw new Error(`Release v${version} is missing ${assetName} or checksums.txt`);
-      }
-      candidate = {
-        version,
-        assetName,
-        assetUrl: validateReleaseAssetUrl(asset.browser_download_url, version, assetName),
-        checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
-      };
-      logger?.info("launcher.update_available", { currentVersion, version, platform, arch });
-      return transition({ status: "available", version });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger?.warn("launcher.update_check_failed", { message });
-      return transition({ status: "error", message });
+      return await checking;
+    } finally {
+      checking = null;
     }
+  }
+
+  async function checkOnce() {
+    return runCheck(false);
+  }
+
+  async function checkAgain() {
+    return runCheck(true);
   }
 
   async function beginInstall() {
@@ -380,6 +409,7 @@ function createUpdateController({
   return {
     getState: () => state,
     checkOnce,
+    checkAgain,
     beginInstall,
     cancelInstall,
   };

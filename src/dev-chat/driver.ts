@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import type { ProviderAdapter } from "../adapters/base";
 import { closeChatGptBrowserWorkers } from "../adapters/chatgpt-web/browser-worker";
 import { createChatGptWebAdapter } from "../adapters/chatgpt-web";
-import { estimateChatGptWebInputTokens } from "../adapters/chatgpt-web/usage";
+import { estimateChatGptWebUsage } from "../adapters/chatgpt-web/usage";
 import { RemoteTurnBroker, type TurnBrokerOwner } from "../adapters/chatgpt-web/turn-broker";
 import {
   CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
@@ -19,7 +19,7 @@ import { compactRequest, responseRequest, routeChatGptWebRequest } from "../serv
 import { namespacedToolName, type AdapterEvent, type CodexProviderConfig } from "../types";
 import {
   createDevCoherentContextPayload,
-  createDevContextFiller,
+  createDevContextFillers,
   type DevChatModel,
   type DevChatState,
   type DevChatStore,
@@ -398,6 +398,7 @@ export function createLauncherDevAdapter(
       browserDiagnosticsPath: join(runtimeStateRoot, "diagnostics", "browser-turns"),
       threadEnvironmentStatePath: join(runtimeStateRoot, "thread-environments.json"),
       lunaCheckpointStatePath: join(runtimeStateRoot, "luna-checkpoints.json"),
+      solCheckpointStatePath: join(runtimeStateRoot, "sol-checkpoints.json"),
       turnTimeoutMs: 60 * 60_000,
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
@@ -449,18 +450,20 @@ export class DevChatDriver {
   }
 
   fill(state: DevChatState, targetTokens: number): { addedTokens: number; status: DevContextStatus } {
-    const filler = createDevContextFiller(targetTokens);
-    const fillerTurnId = id("dev_fill_turn");
-    state.input.push({
-      type: "message",
-      id: id("msg_dev_fill"),
-      role: "user",
-      content: [{ type: "input_text", text: filler.text }],
-      internal_chat_message_metadata_passthrough: { turn_id: fillerTurnId },
-    });
+    const fillers = createDevContextFillers(targetTokens);
+    for (const filler of fillers) {
+      const fillerTurnId = id("dev_fill_turn");
+      state.input.push({
+        type: "message",
+        id: id("msg_dev_fill"),
+        role: "user",
+        content: [{ type: "input_text", text: filler.text }],
+        internal_chat_message_metadata_passthrough: { turn_id: fillerTurnId },
+      });
+    }
     state.syntheticFills += 1;
     this.store.save(state);
-    return { addedTokens: filler.tokens, status: this.status(state) };
+    return { addedTokens: fillers.reduce((total, filler) => total + filler.tokens, 0), status: this.status(state) };
   }
 
   status(state: DevChatState): DevContextStatus {
@@ -595,12 +598,19 @@ export class DevChatDriver {
       this.config.mode === "full",
     ));
     const route = routeChatGptWebRequest(parsed, this.config);
-    const inputTokens = estimateChatGptWebInputTokens(parsed, {
+    const usageCapabilities = {
       localToolsEnabled: this.config.mode === "full",
       solAvailable: this.config.solAvailable,
       extraHighAvailable: this.config.extraHighAvailable === true,
       proAvailable: this.config.proAvailable,
-    });
+    };
+    const inputTokens = estimateChatGptWebUsage(
+      parsed,
+      { answer: "" },
+      usageCapabilities,
+      this.config.experimentalBiggerContext,
+      this.config.experimentalSkillAttachments,
+    ).inputTokens;
     const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;

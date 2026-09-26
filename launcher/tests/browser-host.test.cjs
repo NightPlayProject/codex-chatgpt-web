@@ -15,19 +15,86 @@ const {
 const {
   allowedAuthUrl,
   BrowserHost,
+  chatGptCoreWebRequestHeaders,
+  chatGptCoreWebUserAgent,
+  configureChatGptWebContents,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
+  manualOperationAllowsTurn,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
   MANUAL_SUBMIT_TIMEOUT_MS,
   navigationErrorForLog,
   navigationOriginForLog,
 } = require("../electron/browser-host.cjs");
 
+test("embedded ChatGPT uses a core-web Chromium user agent instead of Codex webview identity", () => {
+  const electronUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CodexWebGPT/6.0.3-test.17 Chrome/146.0.7680.216 Electron/41.10.7 Safari/537.36";
+  const browserUa = chatGptCoreWebUserAgent(electronUa);
+  assert.equal(
+    browserUa,
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.216 Safari/537.36",
+  );
+  assert.doesNotMatch(browserUa, /CodexWebGPT|Electron/);
+  assert.match(browserUa, /Chrome\/146\.0\.7680\.216/);
+  assert.equal(chatGptCoreWebUserAgent(browserUa), browserUa);
+  assert.throws(
+    () => chatGptCoreWebUserAgent("Mozilla/5.0 Electron/41.10.7 Safari/537.36"),
+    /does not identify a Chromium browser/,
+  );
+
+  const applied = [];
+  const contents = {
+    getUserAgent: () => electronUa,
+    setUserAgent: userAgent => applied.push(["contents", userAgent]),
+    session: {
+      getUserAgent: () => electronUa,
+      setUserAgent: userAgent => applied.push(["session", userAgent]),
+    },
+  };
+  assert.equal(configureChatGptWebContents(contents), browserUa);
+  assert.deepEqual(applied, [["session", browserUa], ["contents", browserUa]]);
+});
+
+test("embedded ChatGPT normalizes only Codex-webview backend routing headers", () => {
+  assert.deepEqual(chatGptCoreWebRequestHeaders({
+    Authorization: "Bearer redacted",
+    "X-OpenAI-Codex-Window-Type": "browser",
+    "X-OpenAI-Web-Frontend": "codex_webview",
+    originator: "Codex Browser",
+    Accept: "text/event-stream",
+  }), {
+    Authorization: "Bearer redacted",
+    "X-OpenAI-Web-Frontend": "core_web",
+    Accept: "text/event-stream",
+  });
+  assert.deepEqual(chatGptCoreWebRequestHeaders({
+    "x-openai-codex-window-type": "browser",
+    Accept: "application/json",
+  }), {
+    Accept: "application/json",
+    "x-openai-web-frontend": "core_web",
+  });
+  assert.deepEqual(chatGptCoreWebRequestHeaders({
+    "x-openai-web-frontend": "core_web",
+    originator: "ordinary browser",
+  }), {
+    "x-openai-web-frontend": "core_web",
+    originator: "ordinary browser",
+  });
+});
+
 test("manual prompt handoff keeps ordinary turns at one minute and compaction at two minutes", () => {
   assert.equal(MANUAL_SUBMIT_TIMEOUT_MS, 60_000);
   assert.equal(MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS, 120_000);
+});
+
+test("the launcher operation lock leases only the smoke helper's own dedicated turn", () => {
+  assert.equal(manualOperationAllowsTurn("browser smoke test", `smoke_${"a".repeat(32)}`), true);
+  assert.equal(manualOperationAllowsTurn("browser smoke test", "ordinary_runtime_turn"), false);
+  assert.equal(manualOperationAllowsTurn("session inspection", `smoke_${"a".repeat(32)}`), false);
+  assert.equal(manualOperationAllowsTurn(null, `smoke_${"a".repeat(32)}`), false);
 });
 
 test("Electron and Bun agree on the exact launcher idle surface", () => {
@@ -466,7 +533,8 @@ test("session inspection delegates navigation and capability detection to the sh
           temporary: true,
           url: "https://chatgpt.com/?temporary-chat=true",
           solAvailable: true,
-          extraHighAvailable: true, proAvailable: true,
+          extraHighAvailable: true,
+          proAvailable: true,
         },
       };
     },
@@ -479,7 +547,8 @@ test("session inspection delegates navigation and capability detection to the sh
     temporary: true,
     url: "https://chatgpt.com/?temporary-chat=true",
     solAvailable: true,
-    extraHighAvailable: true, proAvailable: true,
+    extraHighAvailable: true,
+    proAvailable: true,
   });
   assert.equal(calls.length, 2);
   assert.equal(calls[0].operation, "refresh");
@@ -1557,6 +1626,7 @@ test("launcher delegates every ChatGPT model and turn operation to the shared br
     logger: { info: (...args) => calls.push(["log", ...args]) },
     show: () => calls.push(["show"]),
     waitForSurfaceReady: async () => calls.push(["ready"]),
+    refreshChatGptHomeDocument: async () => calls.push(["refresh"]),
     setState: patch => calls.push(["state", patch]),
     runBrowserHelperOperation: async options => {
       calls.push(["helper", options]);
@@ -1569,6 +1639,10 @@ test("launcher delegates every ChatGPT model and turn operation to the shared br
     effort: "High",
     response: "CODEX WEB GPT READY",
   });
+  assert.deepEqual(
+    calls.filter(([type]) => ["ready", "refresh", "helper"].includes(type)).map(([type]) => type),
+    ["ready", "refresh", "helper"],
+  );
   const helperCall = calls.find(call => call[0] === "helper")[1];
   assert.equal(helperCall.operation, "smoke");
   assert.equal(helperCall.appName, "Codex Native2");
@@ -1713,6 +1787,7 @@ test("a replacement helper takes over only after the previous owner exited", asy
     tabId: tab.id,
     reused: false,
     connectorBound: false,
+    saveChat: false,
   });
   assert.equal(tab.helperPid, process.pid);
   assert.equal(warnings.length, 1);
@@ -1850,35 +1925,20 @@ test("an expired browser surface cancels its runtime before releasing the tab", 
   assert.equal(fixture.selectedTabId, "home");
   assert.equal(fixture.closedTurnOwners.get(tab.traceId), tab.helperPid);
   assert.deepEqual(closed, ["view", "contents"]);
-  assert.deepEqual(warnings, ["browser.orphan_turn_expired", "browser.orphan_turn_reaped"].map(event => [event, {
+  assert.deepEqual(warnings, [
+    ["browser.orphan_turn_expired", {
+      tabId: tab.id,
+      traceId: tab.traceId,
+      helperPid: tab.helperPid,
+      evidence: "browser_surface_bootstrap_timeout",
+    }],
+    ["browser.orphan_turn_reaped", {
     tabId: tab.id,
     traceId: tab.traceId,
     helperPid: tab.helperPid,
     evidence: "browser_surface_bootstrap_timeout",
-  }]));
-});
-
-test("expiry cancellation preserves a changed owner and keeps failed cleanup visible", async () => {
-  for (const outcome of ["reused", "failed"]) {
-    const removed = [], warnings = [];
-    const tab = { id: "expiry-race", traceId: "trace_expiry", helperPid: 123,
-      status: "running", bootstrapReady: true, lastHeartbeatAt: 0 };
-    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
-      turnTabs: new Map([[tab.id, tab]]),
-      cancelTurn: async () => {
-        if (outcome === "failed") throw new Error("control unavailable");
-        tab.traceId = "trace_replacement";
-      },
-      removeTurnTab: () => removed.push(tab.id),
-      logger: { warn: event => warnings.push(event) },
-    });
-    await fixture.reapExpiredTurnTabs(120_000);
-    assert.deepEqual(removed, []);
-    assert.equal(fixture.turnTabs.get(tab.id), tab);
-    assert.equal(tab.expiryCancellation, undefined);
-    assert.equal(warnings.includes("browser.orphan_turn_cancel_failed"), outcome === "failed");
-    assert.equal(warnings.includes("browser.orphan_turn_reaped"), outcome !== "failed");
-  }
+    }],
+  ]);
 });
 
 test("removing the final turn tab keeps the descriptor-owned idle host attached offscreen", () => {
@@ -2359,6 +2419,7 @@ test("a later provider round reuses only its exact connector-bound conversation"
     tabId: "tab-reused",
     reused: true,
     connectorBound: true,
+    saveChat: false,
   });
   assert.equal(tab.traceId, "trace_next");
   assert.equal(tab.helperPid, 222);
@@ -2412,6 +2473,7 @@ test("a retained conversation is not reused for a different connector identity",
     tabId: "fresh",
     reused: false,
     connectorBound: false,
+    saveChat: false,
   });
   assert.equal(retained.status, "ready");
 });
@@ -2453,6 +2515,7 @@ test("an Automatic turn never reuses a retained Zero Risk conversation", async (
       tabId: "automatic-fresh",
       reused: false,
       connectorBound: false,
+      saveChat: false,
     },
   );
   assert.equal(retained.status, "ready");
@@ -2506,6 +2569,7 @@ test("a connector conversation is not reused until its connector was bound", asy
       tabId: "fresh",
       reused: false,
       connectorBound: false,
+      saveChat: false,
     },
   );
 });

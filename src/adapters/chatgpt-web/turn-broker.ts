@@ -8,6 +8,10 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import {
+  buildChatGptToolCapabilityReport,
+  chatGptToolingHealth,
+} from "./tool-capabilities";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -32,6 +36,8 @@ interface PendingInvocation {
   request: BrokerToolRequest;
   resolve: (result: BrokerToolResult) => void;
   reject: (error: Error) => void;
+  promise: Promise<BrokerToolResult>;
+  invocationKey?: string;
 }
 
 interface ToolWaiter {
@@ -69,6 +75,10 @@ interface TurnChannel {
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
   invocations: Map<string, PendingInvocation>;
+  /** Stable MCP request keys prevent a transport retry from enqueueing the same native action twice. */
+  invocationKeys: Map<string, string>;
+  /** Bounded result replay cache closes the late-response gap after a native call already ran. */
+  completedInvocationResults: Map<string, BrokerToolResult>;
   waiters: Set<ToolWaiter>;
   compactionRequested: boolean;
   compactionResult?: BrokerToolResult;
@@ -118,6 +128,7 @@ interface BrokerRequest {
   freeform?: boolean;
   arguments?: Record<string, unknown>;
   input?: string;
+  invocationKey?: string;
   environment?: ChatGptTurnEnvironment;
   ttlMs?: number;
   traceId?: string;
@@ -141,6 +152,7 @@ interface BrokerResponse {
 const brokers = new Map<string, TurnBroker>();
 const MAX_BROKER_LINE_CHARS = 67_108_864;
 const MAX_RETIRED_TURN_HANDLES = 64;
+const MAX_COMPLETED_INVOCATION_REPLAYS = 32;
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
@@ -257,11 +269,53 @@ export class TurnBroker implements TurnBrokerOwner {
   // previous turn's handle" from "this handle never existed".
   private readonly retiredBindings = new Map<string, string>();
   private readonly retiredTokens = new Map<string, string>();
+  private latestToolingHealth?: {
+    observedAt: string;
+    report: ReturnType<typeof chatGptToolingHealth>;
+  };
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
 
   private constructor(readonly socketPath: string) {}
+
+  private observeTooling(traceId: string, environment: ChatGptTurnEnvironment): void {
+    const gateway = environment.tools.find(tool => !tool.namespace && tool.name === "exec" && tool.freeform === true);
+    const report = buildChatGptToolCapabilityReport({
+      outerTools: environment.tools,
+      visibleTools: environment.tools,
+      ...(gateway ? { gateway } : {}),
+      contract: "native",
+    });
+    const snapshot = chatGptToolingHealth(report);
+    const changed = this.latestToolingHealth?.report.catalog_hash !== snapshot.catalog_hash
+      || this.latestToolingHealth?.report.outer_catalog_hash !== snapshot.outer_catalog_hash;
+    this.latestToolingHealth = {
+      observedAt: new Date().toISOString(),
+      report: snapshot,
+    };
+    if (!changed) return;
+    console.info(
+      `[chatgpt-web] tooling trace=${traceId} catalog=${report.catalog_hash.slice(0, 12)}`
+      + ` outer=${report.outer_tool_count} direct=${report.direct_tool_count}`
+      + ` gateway=${report.gateway.available} toolSearch=${report.discovery.tool_search}`,
+    );
+  }
+
+  toolingHealth(): {
+    status: "ok" | "no_turn_observed";
+    active_turns: number;
+    last_observed_at: string | null;
+    snapshot: ReturnType<typeof chatGptToolingHealth> | null;
+  } {
+    this.prune();
+    return {
+      status: this.latestToolingHealth ? "ok" : "no_turn_observed",
+      active_turns: this.channels.size,
+      last_observed_at: this.latestToolingHealth?.observedAt ?? null,
+      snapshot: this.latestToolingHealth?.report ?? null,
+    };
+  }
 
   /**
    * A ChatGPT turn outlives the request that started it, and its Codex Native calls arrive from a
@@ -299,6 +353,8 @@ export class TurnBroker implements TurnBrokerOwner {
       queuedCallIds: [],
       deliveredCallIds: new Set(),
       invocations: new Map(),
+      invocationKeys: new Map(),
+      completedInvocationResults: new Map(),
       waiters: new Set(),
       compactionRequested: false,
       compactionDeliveryCount: 0,
@@ -310,6 +366,7 @@ export class TurnBroker implements TurnBrokerOwner {
     };
     this.channels.set(token, channel);
     this.pending.set(token, channel);
+    this.observeTooling(traceId, environment);
     console.info(`[chatgpt-web] broker trace=${traceId} registered tokenHash=${handleFingerprint(token)}`);
     return token;
   }
@@ -374,6 +431,7 @@ export class TurnBroker implements TurnBrokerOwner {
         ? { expiresAt: channel.environment.expiresAt }
         : {}),
     };
+    this.observeTooling(channel.traceId, environment);
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -435,6 +493,10 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error(`tool call was completed before it was delivered: ${callId}`);
     }
     channel.invocations.delete(callId);
+    if (invocation.invocationKey && channel.invocationKeys.get(invocation.invocationKey) === callId) {
+      channel.invocationKeys.delete(invocation.invocationKey);
+      this.rememberCompletedInvocation(channel, invocation.invocationKey, result);
+    }
     console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
     invocation.resolve(result);
   }
@@ -493,6 +555,10 @@ export class TurnBroker implements TurnBrokerOwner {
       const invocation = channel.invocations.get(callId);
       if (!invocation) continue;
       channel.invocations.delete(callId);
+      if (invocation.invocationKey && channel.invocationKeys.get(invocation.invocationKey) === callId) {
+        channel.invocationKeys.delete(invocation.invocationKey);
+        this.rememberCompletedInvocation(channel, invocation.invocationKey, queuedResult);
+      }
       channel.compactionDeliveryCount += 1;
       invocation.resolve(structuredClone(queuedResult));
     }
@@ -1129,6 +1195,28 @@ export class TurnBroker implements TurnBrokerOwner {
 
     const wireName = request.wireName?.trim();
     if (!wireName) throw new Error("wire tool name is required");
+    const invocationKey = request.invocationKey?.trim();
+    if (invocationKey !== undefined && (invocationKey.length < 1 || invocationKey.length > 512)) {
+      throw new Error("invocation key is invalid");
+    }
+    if (invocationKey) {
+      const completed = binding.channel.completedInvocationResults.get(invocationKey);
+      if (completed) {
+        console.info(
+          `[chatgpt-web] broker trace=${binding.channel.traceId} replayed completed call key=${invocationKey.slice(0, 17)}`,
+        );
+        return structuredClone(completed);
+      }
+      const existingCallId = binding.channel.invocationKeys.get(invocationKey);
+      const existing = existingCallId ? binding.channel.invocations.get(existingCallId) : undefined;
+      if (existing) {
+        console.info(
+          `[chatgpt-web] broker trace=${binding.channel.traceId} deduplicated pending call=${existingCallId!.slice(0, 17)} tool=${wireName}`,
+        );
+        return existing.promise;
+      }
+      if (existingCallId) binding.channel.invocationKeys.delete(invocationKey);
+    }
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,
@@ -1136,14 +1224,26 @@ export class TurnBroker implements TurnBrokerOwner {
       freeform: request.freeform === true,
       ...(request.freeform === true ? { input: request.input ?? "" } : { arguments: request.arguments ?? {} }),
     };
-    return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
-      binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
-      binding.channel.queuedCallIds.push(callId);
-      console.info(
-        `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
-      );
-      this.scheduleToolWaiters(binding.channel);
+    let resolveInvoke!: (result: BrokerToolResult) => void;
+    let rejectInvoke!: (error: Error) => void;
+    const promise = new Promise<BrokerToolResult>((resolve, reject) => {
+      resolveInvoke = resolve;
+      rejectInvoke = reject;
     });
+    binding.channel.invocations.set(callId, {
+      request: toolRequest,
+      resolve: resolveInvoke,
+      reject: rejectInvoke,
+      promise,
+      ...(invocationKey ? { invocationKey } : {}),
+    });
+    if (invocationKey) binding.channel.invocationKeys.set(invocationKey, callId);
+    binding.channel.queuedCallIds.push(callId);
+    console.info(
+      `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
+    );
+    this.scheduleToolWaiters(binding.channel);
+    return promise;
   }
 
   private takeQueued(channel: TurnChannel): BrokerToolRequest[] {
@@ -1198,8 +1298,24 @@ export class TurnBroker implements TurnBrokerOwner {
     channel.waiters.clear();
     for (const invocation of channel.invocations.values()) invocation.reject(error);
     channel.invocations.clear();
+    channel.invocationKeys.clear();
+    channel.completedInvocationResults.clear();
     channel.queuedCallIds = [];
     channel.deliveredCallIds.clear();
+  }
+
+  private rememberCompletedInvocation(channel: TurnChannel, invocationKey: string, result: BrokerToolResult): void {
+    try {
+      channel.completedInvocationResults.delete(invocationKey);
+      channel.completedInvocationResults.set(invocationKey, structuredClone(result));
+      while (channel.completedInvocationResults.size > MAX_COMPLETED_INVOCATION_REPLAYS) {
+        const oldest = channel.completedInvocationResults.keys().next();
+        if (oldest.done) break;
+        channel.completedInvocationResults.delete(oldest.value);
+      }
+    } catch {
+      // A non-cloneable provider payload must not make a successful native tool result fail.
+    }
   }
 
   private prune(): void {
@@ -1275,8 +1391,10 @@ export async function callTurnBroker<T>(
     }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    // The server owns response termination. Waiting for the pipe/socket to close before resolving
-    // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
+    // `end` is the peer's authoritative no-more-bytes boundary. Some Windows named-pipe paths can
+    // remain half-open after a clean peer end, so relying only on `close` can leave an unbounded
+    // caller unresolved forever when the peer terminates without writing a response frame.
+    socket.once("end", finishResponse);
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
@@ -1300,12 +1418,12 @@ export async function callTurnBroker<T>(
         return;
       }
       response = parsed;
-      if (settleOnResponseFrame) {
-        // A long-poll keeps its request half open while the server waits. Its complete response
-        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
-        finishResponse();
-        socket.destroy();
-      }
+      // A response frame is the protocol boundary. Waiting for the TCP/socket close event makes
+      // pending broker errors depend on transport cleanup timing, which can leave an invocation
+      // rejected by the broker but still unresolved in the caller. Long-poll callers use the same
+      // complete frame boundary, then close their local socket.
+      finishResponse();
+      if (settleOnResponseFrame) socket.destroy();
     });
   });
 }

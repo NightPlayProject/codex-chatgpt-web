@@ -178,8 +178,8 @@ class AppServerClient {
 
   async close(): Promise<{ stderr: string }> {
     this.child.kill();
-    const stderr = await new Response(this.errors).text();
     await this.child.exited;
+    const stderr = await new Response(this.errors).text();
     return { stderr };
   }
 }

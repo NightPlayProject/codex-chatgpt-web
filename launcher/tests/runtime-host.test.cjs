@@ -3,8 +3,15 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
-const { RuntimeHost } = require("../electron/runtime.cjs");
+const {
+  RuntimeHost,
+  mcpRegistrationMatches,
+  nativeCodexDesktopExecutable,
+  systemCommandInvocation,
+  usableExecutable,
+} = require("../electron/runtime.cjs");
 
 function hostFor(existingConfig, interactionMode = "automatic") {
   const host = new RuntimeHost({
@@ -59,6 +66,140 @@ function devHostFor(existingConfig, interactionMode = "automatic") {
   };
   return { host, invocation: () => invocation };
 }
+
+test("Windows command resolution rejects extensionless shims and wraps command scripts", () => {
+  if (process.platform !== "win32") return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-command-resolution-"));
+  try {
+    const extensionless = path.join(root, "codex");
+    const commandScript = path.join(root, "codex.cmd");
+    const executable = path.join(root, "codex.exe");
+    fs.writeFileSync(extensionless, "shim");
+    fs.writeFileSync(commandScript, "@echo off");
+    fs.writeFileSync(executable, "binary");
+    assert.equal(usableExecutable(extensionless, "win32"), false);
+    assert.equal(usableExecutable(commandScript, "win32"), true);
+    assert.equal(usableExecutable(executable, "win32"), true);
+
+    assert.deepEqual(
+      systemCommandInvocation("C:\\Program Files\\nodejs\\npm.cmd", ["install", "--global", "open-computer-use@0.3.4"], "win32"),
+      {
+        executable: process.env.ComSpec || "cmd.exe",
+        args: ["/d", "/s", "/c", '""C:\\Program Files\\nodejs\\npm.cmd" install --global open-computer-use@0.3.4"'],
+        windowsVerbatimArguments: true,
+      },
+    );
+    assert.deepEqual(
+      systemCommandInvocation("C:\\Tools\\codex.exe", ["mcp", "get"], "win32"),
+      { executable: "C:\\Tools\\codex.exe", args: ["mcp", "get"] },
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows command script wrapper preserves a spaced MCP executable as one argument", () => {
+  if (process.platform !== "win32") return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-command-wrapper-"));
+  try {
+    const scriptDir = path.join(root, "Codex CLI");
+    fs.mkdirSync(scriptDir, { recursive: true });
+    const script = path.join(scriptDir, "codex.cmd");
+    const captureScript = path.join(root, "capture.cjs");
+    const capturePath = path.join(root, "captured args.json");
+    const computerUse = "C:\\Program Files\\Codex Web GPT\\resources\\native\\open-computer-use\\win32-x64\\open-computer-use.exe";
+    fs.writeFileSync(captureScript, [
+      'const fs = require("node:fs");',
+      'fs.writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));',
+      "",
+    ].join("\r\n"));
+    fs.writeFileSync(script, [
+      "@echo off",
+      `"${process.execPath}" "${captureScript}" "${capturePath}" %*`,
+      "",
+    ].join("\r\n"));
+    const expected = ["mcp", "add", "open-computer-use", "--", computerUse, "mcp"];
+    const invocation = systemCommandInvocation(script, expected, "win32");
+    const result = spawnSync(invocation.executable, invocation.args, {
+      encoding: "utf8",
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(JSON.parse(fs.readFileSync(capturePath, "utf8")), expected);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows native Codex desktop executable is preferred by newest installed binary", () => {
+  if (process.platform !== "win32") return;
+  const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-native-codex-"));
+  try {
+    const older = path.join(localAppData, "OpenAI", "Codex", "bin", "older", "codex.exe");
+    const newer = path.join(localAppData, "OpenAI", "Codex", "bin", "newer", "codex.exe");
+    fs.mkdirSync(path.dirname(older), { recursive: true });
+    fs.mkdirSync(path.dirname(newer), { recursive: true });
+    fs.writeFileSync(older, "older");
+    fs.writeFileSync(newer, "newer");
+    fs.utimesSync(older, new Date(1_000), new Date(1_000));
+    fs.utimesSync(newer, new Date(2_000), new Date(2_000));
+    assert.equal(nativeCodexDesktopExecutable("win32", localAppData), newer);
+  } finally {
+    fs.rmSync(localAppData, { recursive: true, force: true });
+  }
+});
+
+test("native Computer Use registration requires the exact direct stdio executable", () => {
+  const executable = process.platform === "win32"
+    ? "C:\\Users\\tester\\open-computer-use.exe"
+    : "/Users/tester/open-computer-use";
+  const registration = JSON.stringify({
+    name: "open-computer-use",
+    enabled: true,
+    transport: { type: "stdio", command: executable, args: ["mcp"] },
+  });
+  assert.equal(mcpRegistrationMatches(registration, executable, process.platform), true);
+  assert.equal(mcpRegistrationMatches(registration, `${executable}.old`, process.platform), false);
+  assert.equal(mcpRegistrationMatches(registration.replace('"mcp"', '"serve"'), executable, process.platform), false);
+  assert.equal(mcpRegistrationMatches(JSON.stringify({ transport: { type: "sse", command: executable, args: ["mcp"] } }), executable, process.platform), false);
+});
+
+test("native Computer Use setup replaces a stale registration with the bundled executable", async () => {
+  if (process.platform !== "win32") return;
+  const fixture = hostFor(null);
+  const codex = "C:\\Tools\\codex.exe";
+  const computerUse = "C:\\Program Files\\Codex Web GPT\\native\\open-computer-use.exe";
+  const calls = [];
+  let reads = 0;
+  fixture.host.commandResolver = commands => commands[0].startsWith("codex") ? codex : null;
+  fixture.host.bundledNativeComputerUseExecutable = () => computerUse;
+  fixture.host.runSystemCommand = async (_name, executable, args) => {
+    calls.push({ executable, args });
+    if (args[0] === "mcp" && args[1] === "get") {
+      reads += 1;
+      return {
+        code: 0,
+        stdout: JSON.stringify({ transport: {
+          type: "stdio",
+          command: reads === 1 ? "open-computer-use" : computerUse,
+          args: ["mcp"],
+        } }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  const result = await fixture.host.setupNativeComputerUse();
+  assert.deepEqual(result, { ok: true, registered: true, restartRequired: true, stdout: "" });
+  assert.deepEqual(calls.map(call => call.args), [
+    ["mcp", "get", "open-computer-use", "--json"],
+    ["mcp", "remove", "open-computer-use"],
+    ["mcp", "add", "open-computer-use", "--", computerUse, "mcp"],
+    ["mcp", "get", "open-computer-use", "--json"],
+  ]);
+});
 
 test("core setup preserves an existing full-harness installation", async () => {
   const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
@@ -209,6 +350,20 @@ test("Bigger Context updates the isolated DEV config without installing a Codex 
       "--standard-context",
     ],
   });
+});
+
+test("skill file experiment uses the setup transaction in production and DEV, and rejects manual mode", async () => {
+  const production = hostFor({ mode: "full", browserInteractionMode: "automatic" });
+  assert.equal((await production.host.setSkillAttachments(true)).enabled, true);
+  assert.equal(production.invocation().args.includes("--skill-attachments"), true);
+  assert.equal(production.invocation().args.includes("--restart-service"), true);
+  const dev = devHostFor({ mode: "full", browserInteractionMode: "automatic" });
+  assert.equal((await dev.host.setSkillAttachments(false)).enabled, false);
+  assert.equal(dev.invocation().args.includes("--inline-skills"), true);
+  assert.equal(dev.invocation().args.includes("--replace-codex-route"), false);
+  const manual = hostFor({ mode: "full", browserInteractionMode: "manual" }, "manual");
+  await assert.rejects(() => manual.host.setSkillAttachments(true), /Zero Risk/);
+  assert.equal(manual.invocation(), undefined);
 });
 
 test("Zero Risk Pro transaction installs or removes only its explicit model profile", async () => {

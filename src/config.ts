@@ -221,7 +221,9 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     experimentalFreshConversationPerTurn: false,
     useSavedChats: false,
     zeroRiskProEnabled: false,
-    autoApproveToolCalls: false,
+    // Full automatic mode is intended to expose the active native Codex tool surface without
+    // stopping on a per-call ChatGPT connector prompt. Zero Risk remains explicitly manual below.
+    autoApproveToolCalls: mode === "full",
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
   };
@@ -509,6 +511,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid stallTimeoutSec in ${path}`);
   }
   const solAvailable = parsed.solAvailable !== false;
+  const extraHighAvailable = parsed.extraHighAvailable === true;
   const proAvailable = parsed.proAvailable === true;
   if (parsed.experimentalSkillAttachments !== undefined && typeof parsed.experimentalSkillAttachments !== "boolean") {
     throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
@@ -531,7 +534,10 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
     throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
   }
-  if (parsed.extraHighAvailable === true && !solAvailable) {
+  if (browserInteractionMode === "manual" && experimentalSkillAttachments) {
+    throw new Error(`Zero Risk does not support Skills as files in ${path}`);
+  }
+  if (extraHighAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Extra High requires Sol`);
   }
   if (proAvailable && !solAvailable) {
@@ -545,12 +551,21 @@ function parseConfig(value: unknown, path: string): AppConfig {
     browserInteractionMode,
     subagentProtocol,
     solAvailable,
+    extraHighAvailable,
     proAvailable,
     experimentalBiggerContext,
     experimentalSkillAttachments,
     experimentalFreshConversationPerTurn,
     useSavedChats,
     zeroRiskProEnabled,
+    // A stale v3 config may still contain false from releases that required an explicit opt-in.
+    // Full automatic mode now owns this setting so a runtime upgrade does not leave tool calls
+    // waiting for an approval card that the user already authorized through the connector.
+    autoApproveToolCalls: browserInteractionMode === "manual"
+      ? false
+      : parsed.mode === "full"
+        ? true
+        : parsed.autoApproveToolCalls,
   } as AppConfig;
 }
 
@@ -599,6 +614,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
       lunaCheckpointStatePath: join(getConfigDir(), "runtime", "luna-checkpoints.json"),
+      solCheckpointStatePath: join(getConfigDir(), "runtime", "sol-checkpoints.json"),
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
       solAvailable: manual ? false : config.solAvailable,
@@ -609,7 +625,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       experimentalFreshConversationPerTurn: !manual && config.experimentalFreshConversationPerTurn === true,
       useSavedChats: config.useSavedChats === true,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
-      autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
+      autoApproveToolCalls: manual ? false : config.mode === "full" ? true : config.autoApproveToolCalls,
     },
   };
 }

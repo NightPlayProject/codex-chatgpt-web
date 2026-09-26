@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/download/v6.1.0-test.2/codex-web-gpt-6.1.0-test.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="#get-started">Get started</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases">What’s new</a> · <a href="docs/architecture.md">Architecture</a> · <a href="TROUBLESHOOTING.md">Troubleshooting</a>
+  <a href="#get-started">Get started</a> · <a href="https://github.com/NightPlayProject/codex-chatgpt-web/releases">What’s new</a> · <a href="docs/architecture.md">Architecture</a> · <a href="TROUBLESHOOTING.md">Troubleshooting</a>
 </p>
 
 Use the ChatGPT Web models available on your account, including Pro, from Codex’s native model picker—with ChatGPT Web’s separate usage limits, without spending your Work or Codex quota. Keep the same interface, tasks, images, and streaming.
@@ -49,13 +49,13 @@ Quit the launcher before updating. These installers select the platform and arch
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 </details>
@@ -67,13 +67,31 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 
 Automatic modes offer Luna/Think when the account has no reasoning selector; otherwise Instant–High, with Extra High and Pro available independently when exposed by the account.
 
-| Mode | Sending messages | Local Codex tools |
-| --- | --- | --- |
-| **Browser-only** | Automatic | No |
-| **Full harness (With Automation)** | Automatic | Yes, through MCP |
-| **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
+The launcher Settings page includes a **Codex Wallpapers** toggle. When enabled, it attaches the
+vendored Codex Wallpapers picker to the separate official Microsoft Store Codex/ChatGPT desktop
+app and reuses the existing `%LOCALAPPDATA%\\CodexWallpapers` library. Codex Web GPT never injects
+wallpaper code into its embedded ChatGPT surface. The launcher validates media and transfers it to
+the official app over a loopback-only local debugging endpoint. If the official app was already
+running without that endpoint, restart the official app once after enabling; Codex Web GPT stays
+open.
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
+The lower sidebar also includes an **Account switcher** for Windows users who already use the
+compatible Codex Switcher account store at `%USERPROFILE%\\.codex-switcher\\accounts.json`. It imports
+the current official Codex session, shows redacted account state, usage windows, native token
+activity, and recent local switches, then writes the selected account to the official Codex
+`%USERPROFILE%\\.codex\\auth.json`. Switching restarts only the verified official Microsoft Store
+Codex app when it is running; a stopped app uses the selected account on its next launch. Usage
+refresh is explicit and failures remain attached to the affected account instead of blocking a
+switch. Stored access, refresh, and ID tokens are never sent to the renderer or displayed in the
+launcher.
+
+**Run from source**
+
+```bash
+git clone https://github.com/NightPlayProject/codex-chatgpt-web.git && \
+cd codex-chatgpt-web && \
+bun run app
+```
 
 <a id="full-harness"></a>
 
@@ -100,11 +118,41 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
    **Codex Native2**, with **Authentication: None** and **Allow all actions**.
 3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
 
+The bridge exposes `codex_tool_capabilities` as a live catalog diagnostic. It reports the current
+outer catalog hash, direct/deferred tool provenance, and whether the native `exec` gateway can
+discover tools that were deferred by Codex. Use `codex_tool_inventory` with a focused `surface`
+such as `computer`, `browser`, `execution`, `mcp`, or `agents` to retrieve exact wire names and
+schemas before calling them. If the capability diagnostic itself is missing, reload the ChatGPT
+connector so its cached MCP contract matches the installed bridge.
+
+Desktop control is optional. Full mode forwards native Codex MCP/plugin tools through the same
+**Codex Native2** connector. On Windows, one working option is
+[`open-computer-use`](https://www.npmjs.com/package/open-computer-use):
+
+Open the launcher's **MCP** page and choose **Set up desktop controls** to register the bundled
+Windows native runtime without opening PowerShell or installing Node.js/npm. This is an explicit
+action because it installs a native desktop-control MCP and edits the Codex MCP configuration.
+Codex must be fully restarted after a new registration so it reloads its tool catalog. Older
+launcher builds without the bundled runtime can use the manual fallback:
+
+```powershell
+npm install -g open-computer-use@0.3.4
+codex mcp add open-computer-use -- open-computer-use mcp
+```
+
+Fully quit and reopen Codex after registering it. Full mode eagerly exposes the concrete
+`open-computer-use` tools to the bridge so current Codex clients whose deferred `tool_search` path
+is unavailable can still call them. Clients that advertise native `tool_search` may continue to use
+it for tools that remain deferred; no separate desktop-control tunnel or connector is required. If
+no desktop-control MCP is installed, Full mode continues to provide the rest of the active Codex
+harness normally.
+
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
 [developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
-Unexpected approval prompts fail closed unless `--auto-approve-tool-calls` is explicitly enabled;
-that option clicks **Allow once**, never a permanent grant.
+Full automatic mode clicks the one-shot **Allow once** connector prompt automatically; it never
+selects a permanent grant. The ChatGPT connector itself must still use **Allow all actions**, and
+the outer Codex harness remains responsible for its native tool authorization and sandbox policy.
 
 </details>
 

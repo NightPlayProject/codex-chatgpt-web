@@ -329,7 +329,9 @@ export async function inspectLauncherBrowserHost(
       throw new Error("Launcher returned invalid ChatGPT session evidence");
     }
     if (options.detectCapabilities
-      && (typeof body.solAvailable !== "boolean" || typeof body.extraHighAvailable !== "boolean" || typeof body.proAvailable !== "boolean")) {
+      && (typeof body.solAvailable !== "boolean"
+        || typeof body.extraHighAvailable !== "boolean"
+        || typeof body.proAvailable !== "boolean")) {
       throw new Error("Launcher did not return complete ChatGPT account capability evidence");
     }
     if (options.detectCapabilities && (body.proAvailable === true || body.extraHighAvailable === true) && body.solAvailable !== true) {
@@ -376,6 +378,7 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      resumeAnswerDigest?: string;
     }
   | {
       phase: "heartbeat";
@@ -391,11 +394,11 @@ export type LauncherTurnActivity =
       status: "completed" | "failed" | "aborted";
       message?: string;
       retain?: boolean;
+      answerDigest?: string;
       connectorBound?: boolean;
     };
 
-// Startup must outlast the launcher's ten-second idle bootstrap. This is not a model-turn budget.
-export const LAUNCHER_TURN_START_TIMEOUT_MS = 30_000;
+export const LAUNCHER_TURN_START_TIMEOUT_MS = 60_000;
 export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
@@ -636,6 +639,7 @@ export async function notifyLauncherTurn(
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
+  saveChat?: boolean;
   trackUsage?: boolean;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
@@ -681,6 +685,7 @@ export async function notifyLauncherTurn(
         surfaceId: body.surfaceId,
         reused: body.reused,
         connectorBound: body.connectorBound,
+        saveChat: body.saveChat === true,
         trackUsage: body.trackUsage === true,
       };
     }

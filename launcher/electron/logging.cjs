@@ -5,9 +5,30 @@ const { renameAtomicFile, writePrivateFileAtomic } = require("./atomic-file.cjs"
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 const MAX_MEMORY_RECORDS = 300;
 const MAX_LOG_STRING_CHARS = 16 * 1024;
+const SECRET_FIELD = /^(?:authorization|cookie|runtimeKey|controlToken|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|secret|private[_-]?key)$/i;
+const PRIVATE_KEY_BEGIN = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/;
+const PRIVATE_KEY_END = /-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/;
+
+function createDiagnosticLineRedactor() {
+  let insideKey = false;
+  return line => {
+    const begins = PRIVATE_KEY_BEGIN.test(line);
+    if (insideKey || begins) {
+      for (const marker of line.matchAll(/-----(BEGIN|END) (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/g)) {
+        insideKey = marker[1] === "BEGIN";
+      }
+      return "[private-key-redacted]";
+    }
+    return redactText(line);
+  };
+}
 
 function redactText(value) {
   const redacted = value
+    .replace(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*:\s*[^\r\n]+/gi, "$1: [redacted]")
+    .replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|$)/g, "[private-key-redacted]")
+    .replace(/\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,})\b/g, "[credential-redacted]")
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|secret|private[_-]?key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s,;}]+)/gi, "$1[redacted]")
     .replace(/tunnel_[a-f0-9]{32}/g, "[tunnel-id]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[runtime-key]")
     .replace(/\bBearer\s+[A-Za-z0-9._~-]{20,}\b/gi, "Bearer [redacted]");
@@ -44,7 +65,7 @@ function sanitizeForExport(value, seen = new WeakSet()) {
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      /^(?:prompt|response|html|dom|content|visibleRows|sidebarRows|sidebarTitles|conversationTitle|conversationTitles|chatTitle|chatTitles)$/i.test(key)
+      (SECRET_FIELD.test(key) || /^(?:prompt|response|html|dom|content|visibleRows|sidebarRows|sidebarTitles|conversationTitle|conversationTitles|chatTitle|chatTitles)$/i.test(key))
         ? "[redacted]"
         : sanitizeForExport(item, seen),
     ]),
@@ -67,6 +88,7 @@ function exportSanitizedLogs({ filePath, destinationPath }) {
     throw new Error("Refusing to overwrite a launcher source log with an exported diagnostic");
   }
   const records = [];
+  const streamRedactors = new Map();
   for (const sourcePath of sourcePaths) {
     let lines;
     try {
@@ -82,13 +104,16 @@ function exportSanitizedLogs({ filePath, destinationPath }) {
           || typeof record.at !== "string"
           || !["debug", "info", "warning", "error"].includes(record.level)
           || typeof record.event !== "string") continue;
+        const detail = record.detail && typeof record.detail === "object" ? { ...record.detail } : {};
+        if (typeof detail.line === "string") {
+          if (!streamRedactors.has(record.event)) streamRedactors.set(record.event, createDiagnosticLineRedactor());
+          detail.line = streamRedactors.get(record.event)(detail.line);
+        }
         records.push({
           at: record.at,
           level: record.level,
           event: record.event,
-          detail: record.detail && typeof record.detail === "object"
-            ? sanitizeForExport(record.detail)
-            : {},
+          detail: sanitizeForExport(detail),
         });
       } catch {}
     }
@@ -112,7 +137,7 @@ function sanitize(value, seen = new WeakSet()) {
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      /(?:authorization|cookie|runtimeKey|controlToken)/i.test(key)
+      (SECRET_FIELD.test(key) || /(?:authorization|cookie|runtimeKey|controlToken)/i.test(key))
         ? "[redacted]"
         : sanitize(item, seen),
     ]),
@@ -121,34 +146,39 @@ function sanitize(value, seen = new WeakSet()) {
 
 function readRecent(filePath) {
   const records = [];
-  // Count valid events, not lines: a partial final write must not evict history.
-  for (const sourcePath of [filePath, `${filePath}.1`]) {
+  const streamRedactors = new Map();
+  // Read in chronological order so stateful private-key redaction spans rotated logs.
+  // Keep the last 300 valid events; an incomplete trailing line cannot evict history.
+  for (const sourcePath of [filePath + ".1", filePath]) {
     let lines;
     try {
       lines = fs.readFileSync(sourcePath, "utf8").split(/\r?\n/);
     } catch {
       continue;
     }
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
+    for (const line of lines) {
       try {
-        const record = JSON.parse(lines[index]);
+        const record = JSON.parse(line);
         if (!record
           || typeof record.at !== "string"
           || !["debug", "info", "warning", "error"].includes(record.level)
           || typeof record.event !== "string") continue;
+        const detail = record.detail && typeof record.detail === "object" ? { ...record.detail } : {};
+        if (typeof detail.line === "string") {
+          if (!streamRedactors.has(record.event)) streamRedactors.set(record.event, createDiagnosticLineRedactor());
+          detail.line = streamRedactors.get(record.event)(detail.line);
+        }
         records.push({
           at: record.at,
           level: record.level,
           event: record.event,
-          detail: record.detail && typeof record.detail === "object"
-            ? sanitize(record.detail)
-            : {},
+          detail: sanitize(detail),
         });
-        if (records.length === MAX_MEMORY_RECORDS) return records.reverse();
+        if (records.length > MAX_MEMORY_RECORDS) records.shift();
       } catch {}
     }
   }
-  return records.reverse();
+  return records;
 }
 
 function createLogger({ filePath, publish }) {
@@ -196,7 +226,7 @@ function installProcessDiagnosticGuards({ filePath, streams = [process.stdout, p
         fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
         fs.appendFileSync(
           filePath,
-          `${new Date().toISOString()} ${error instanceof Error ? error.stack || error.message : String(error)}\n`,
+          `${new Date().toISOString()} ${redactText(error instanceof Error ? error.stack || error.message : String(error))}\n`,
           { mode: 0o600 },
         );
       } catch {
@@ -221,6 +251,7 @@ function registerLoggedIpc(ipcMain, logger, channel, handler) {
 }
 
 module.exports = {
+  createDiagnosticLineRedactor,
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,

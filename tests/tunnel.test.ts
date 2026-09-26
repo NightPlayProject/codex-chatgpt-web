@@ -145,12 +145,13 @@ test("tunnel verification and install errors survive failed cleanup and rollback
   });
 });
 
-test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
-  expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
-  expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
-  expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+test("pins the current tunnel-client and migrates known installations", () => {
+  expect(TUNNEL_VERSION).toBe("0.0.14");
+  expect(tunnelClientInstallAction("0.0.14")).toBe("reuse");
+  for (const version of ["0.0.10", "0.0.11", "0.0.12", "0.0.13"]) {
+    expect(tunnelClientInstallAction(version)).toBe("upgrade");
+  }
+  expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted migration source");
 });
 
 describe("tunnel status boundary", () => {

@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
-const { redactText } = require("./logging.cjs");
+const { redactText, createDiagnosticLineRedactor } = require("./logging.cjs");
 const {
   DETACH_OWNED_CHILD,
   processRunning,
@@ -29,24 +29,39 @@ const CURRENT_BOOT_STARTED_AT_MS = Date.now() - (os.uptime() * 1_000);
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function collectLines(stream, onLine, onError) {
+  const redactLine = createDiagnosticLineRedactor();
+  const emit = line => onLine(redactLine(line));
+  let discardingLine = false;
+  let discardedTail = "";
   let buffered = "";
   stream.on("data", (chunk) => {
-    buffered += chunk.toString("utf8");
+    let text = chunk.toString("utf8");
+    if (discardingLine) {
+      const end = text.indexOf("\n");
+      if (end < 0) { redactLine(discardedTail + text); discardedTail = (discardedTail + text).slice(-128); return; }
+      redactLine(discardedTail + text.slice(0, end));
+      discardedTail = "";
+      text = text.slice(end + 1);
+      discardingLine = false;
+    }
+    buffered += text;
     for (;;) {
       const newline = buffered.indexOf("\n");
       if (newline < 0) break;
       const line = buffered.slice(0, newline).trimEnd();
       buffered = buffered.slice(newline + 1);
-      if (line) onLine(line);
+      if (line) emit(line);
     }
     if (buffered.length > MAX_RUNTIME_LOG_LINE_CHARS) {
-      onLine(`${buffered.slice(0, MAX_RUNTIME_LOG_LINE_CHARS)}…[truncated]`);
+      emit(buffered);
+      discardingLine = true;
+      discardedTail = buffered.slice(-128);
       buffered = "";
     }
   });
   stream.on("end", () => {
     const line = buffered.trim();
-    if (line) onLine(line);
+    if (line) emit(line);
   });
   stream.on("error", (error) => onError?.(error));
 }
@@ -115,7 +130,7 @@ function runtimeOwnershipMayBeLive(state) {
 
 function conciseTunnelLog(value) {
   if (typeof value !== "string" || !value.trim()) return undefined;
-  const tail = value.trim().split(/\r?\n/).slice(-3).join(" | ");
+  const tail = redactText(value).trim().split(/\r?\n/).slice(-3).join(" | ");
   const redacted = redactText(tail);
   return redacted.length > 800 ? `…${redacted.slice(-800)}` : redacted;
 }
@@ -260,6 +275,10 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   if (config.experimentalBiggerContext !== undefined
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
+  }
+  if (config.experimentalSkillAttachments !== undefined
+    && typeof config.experimentalSkillAttachments !== "boolean") {
+    throw new Error("Runtime configuration has an invalid experimentalSkillAttachments");
   }
   if (config.experimentalFreshConversationPerTurn !== undefined
     && typeof config.experimentalFreshConversationPerTurn !== "boolean") {

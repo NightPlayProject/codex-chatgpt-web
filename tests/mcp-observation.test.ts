@@ -6,7 +6,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import * as z from "zod/v4";
 import { observeMcpToolCalls } from "../src/adapters/chatgpt-web/mcp-observation";
 
-test("MCP observations separate pre-handler validation and returned tool errors without recording content", async () => {
+test("MCP observations separate validation and returned tool errors without recording content", async () => {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const events: Array<Record<string, unknown>> = [];
   const secret = "fixture-private-path-token-and-command";
@@ -42,7 +42,7 @@ test("MCP observations separate pre-handler validation and returned tool errors 
   }
 });
 
-test("MCP observation failures, arbitrary IDs and unknown names never alter transport behavior", async () => {
+test("MCP observation failures, arbitrary IDs, and unknown names never alter transport behavior", async () => {
   const events: Array<Record<string, unknown>> = [];
   const secret = "private-id-and-tool-name";
   const originalError = new Error("private transport failure");

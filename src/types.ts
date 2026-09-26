@@ -5,6 +5,12 @@ export interface CodexParsedRequest {
   stream: boolean;
   options: CodexRequestOptions;
   _rawBody?: unknown;
+  /**
+   * Internal-only usage floor carried across a one-shot transition compaction. It preserves the
+   * original native context pressure in the response usage report so Codex still performs its own
+   * authoritative compaction instead of treating the temporary reduced browser history as canonical.
+   */
+  _nativeUsageInputTokenFloor?: number;
   /** Set only by the trusted Web route, never parsed from caller-supplied model metadata. */
   _chatgptModelFamily?: "5.6" | "6";
   /** Number of leading raw input items restored from local previous_response_id state. */
@@ -39,10 +45,16 @@ export type CodexMessage =
 
 export interface CodexUserMessage {
   role: "user";
-  /** Native Responses metadata, never inferred from message text. */
+  /** Native Responses provenance for selected-skill instructions; never inferred from message text. */
   origin?: "codex_skill";
   content: string | CodexContentPart[];
   timestamp: number;
+  /** Exact raw Responses input position for transport-only provenance binding. */
+  _sourceInputIndex?: number;
+  /** Native source provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceItemId?: string;
+  /** Native turn provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceTurnId?: string;
 }
 
 /** A readable MultiAgent message delivered between native Codex agents. */
@@ -52,6 +64,12 @@ export interface CodexAgentMessage {
   recipient?: string;
   content: string | CodexContentPart[];
   timestamp: number;
+  /** Exact raw Responses input position for transport-only provenance binding. */
+  _sourceInputIndex?: number;
+  /** Native source provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceItemId?: string;
+  /** Native turn provenance used only to bind transport metadata; never serialized as task text. */
+  _sourceTurnId?: string;
 }
 
 export interface CodexAssistantMessage {
@@ -129,6 +147,8 @@ export interface CodexTool {
   freeform?: boolean;
   /** Client-executed tool discovery (tool_search): the model's call must be relayed as a tool_search_call. */
   toolSearch?: boolean;
+  /** Where the current Responses request supplied this tool declaration. */
+  source?: "declared" | "additional_tools" | "tool_search_output";
 }
 
 /**
@@ -286,6 +306,8 @@ export interface CodexProviderConfig {
     threadEnvironmentStatePath?: string;
     /** Persisted exact-parent rolling checkpoints used only by Free/Luna turns. */
     lunaCheckpointStatePath?: string;
+    /** Persisted exact-parent rolling checkpoints used by automatic Sol turns. */
+    solCheckpointStatePath?: string;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
     /**
@@ -303,11 +325,13 @@ export interface CodexProviderConfig {
     solAvailable?: boolean;
     /** Account capability proven by the authenticated browser probe. */
     extraHighAvailable?: boolean;
+    /** Account capability proven by the authenticated browser probe. */
     proAvailable?: boolean;
-    /** Authorize per-call "Allow once" confirmation clicks for this connector. */
+    /** Full automatic mode authorizes per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
     /** Experimental transport: adapt one context across one, two, or six ChatGPT messages. */
     experimentalBiggerContext?: boolean;
+    /** Transport native Codex selected-skill instructions as authenticated text-file attachments. */
     experimentalSkillAttachments?: boolean;
     /** Explicitly rebuild each automatic turn in a fresh browser conversation. */
     experimentalFreshConversationPerTurn?: boolean;

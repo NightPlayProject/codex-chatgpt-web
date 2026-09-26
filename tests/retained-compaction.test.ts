@@ -5,12 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BIGGER_CONTEXT_PARTS } from "../src/adapters/chatgpt-web/prompt";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
+  LATEST_USER_PROMPT_MARKER,
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
   cancelStructuredCompactionNativeTurn,
   cancelStructuredCompactionTrace,
+  canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
   requestRetainedCompactionHandoff,
   runStructuredCompactionOnce,
@@ -94,6 +97,42 @@ function controlBinding(instruction: string): { token: string; handoffId: string
   if (!token || !handoffId) throw new Error(`Missing compaction control binding: ${instruction}`);
   return { token, handoffId };
 }
+
+test("structured compaction bounds a large latest-user appendix without losing source integrity", () => {
+  const compact = request(true);
+  const largePrompt = `BEGIN-${"x".repeat(100_000)}-END`;
+  const source = (compact._rawBody as { input: Array<{
+    content: Array<{ type: string; text: string }>;
+  }> }).input[0]!;
+  source.content = [{ type: "input_text", text: largePrompt }];
+
+  const handoff = canonicalizeCompactionHandoff(compact, "Bounded checkpoint");
+  const appendix = handoff.slice(handoff.lastIndexOf(`${LATEST_USER_PROMPT_MARKER}\n`)
+    + LATEST_USER_PROMPT_MARKER.length + 1);
+  const descriptor = JSON.parse(appendix) as {
+    truncated: boolean;
+    chars: number;
+    sha256: string;
+    head: string;
+    tail: string;
+  };
+
+  expect(descriptor.truncated).toBeTrue();
+  expect(descriptor.chars).toBe(largePrompt.length);
+  expect(descriptor.sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(descriptor.head).toStartWith("BEGIN-");
+  expect(descriptor.tail).toEndWith("-END");
+  expect(descriptor.head.length + descriptor.tail.length).toBe(16_384);
+  expect(handoff.length).toBeLessThan(17_000);
+});
+
+test("structured compaction preserves the exact latest-user appendix for ordinary prompts", () => {
+  const compact = request(true);
+  const handoff = canonicalizeCompactionHandoff(compact, "Ordinary checkpoint");
+  expect(handoff).toEndWith(
+    `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify("Continue with the next step")}`,
+  );
+});
 
 test("one browser conversation spans native turns and rotates only at compaction", () => {
   const before = request(false);
@@ -976,7 +1015,7 @@ test("a repeated compaction waits for the previous conversation retirement", asy
   expect(waited).toBeTrue();
 });
 
-test("retained compaction can close its browser epoch while preserving an ordinary final response", async () => {
+test.each(["empty", "settled", "active", "foreign"])("retained compaction can close its browser epoch while preserving an ordinary final response", async (occupied) => {
   const sessions = new ChatGptTurnSessions();
   const conversationKey = "b".repeat(64);
   const text = new ChatGptTextFeed();
@@ -996,11 +1035,30 @@ test("retained compaction can close its browser epoch while preserving an ordina
   await source.browserOutcome;
   await source.physicalSettlement;
 
+  if (occupied !== "empty") {
+    const previous = sessions.getOrCreate("compacted-ordinary-final", () => ({
+      mode: "read-only", browser: occupied === "active" ? new Promise<string>(() => {}) : Promise.resolve("previous round"),
+      physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(), conversationKey: occupied === "foreign" ? "foreign" : conversationKey, cancel() {},
+    }));
+    if (occupied !== "active") await previous.browserOutcome;
+  }
+
+  if (occupied === "active" || occupied === "foreign") {
+    await expect(sessions.retireConversationPreservingFinalResponse(
+      conversationKey, source, "compacted-ordinary-final",
+    )).rejects.toThrow("already owned by another session");
+    expect(sessions.find("ordinary-final")).toBe(source);
+    expect(releases).toBe(0);
+    sessions.clear();
+    return;
+  }
+
   expect(await sessions.retireConversationPreservingFinalResponse(
     conversationKey,
     source,
     "compacted-ordinary-final",
-  )).toBe(1);
+  )).toBe(occupied === "settled" ? 2 : 1);
   expect(releases).toBe(1);
   expect(source.conversationKey()).toBeUndefined();
   expect(sessions.findConversationHead(conversationKey)).toBeUndefined();
@@ -1011,6 +1069,86 @@ test("retained compaction can close its browser epoch while preserving an ordina
     throw new Error("the committed final response must be replayed, not replaced");
   })).toBe(source);
   expect(replacementStarts).toBe(0);
+  sessions.clear();
+});
+
+test("retained compaction accepts a settled replay owner from the same native thread after subscription migration", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const conversationKey = "m".repeat(64);
+  const nativeThreadId = "019f4edd-1032-7ec2-80bd-5b526a05471d";
+  const source = sessions.getOrCreate("ordinary-final-after-migration", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("ordinary final answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey,
+    releaseRetainedConversation: async () => {},
+    cancel() {},
+  }), undefined, "new-subscription-owner", "new-turn", nativeThreadId);
+  const previous = sessions.getOrCreate("compacted-migrated-final", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("previous subscription answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "previous-subscription-browser-epoch",
+    cancel() {},
+  }), undefined, "previous-subscription-owner", "previous-turn", nativeThreadId);
+  await Promise.all([
+    source.browserOutcome,
+    source.physicalSettlement,
+    previous.browserOutcome,
+    previous.physicalSettlement,
+  ]);
+
+  expect(await sessions.retireConversationPreservingFinalResponse(
+    conversationKey,
+    source,
+    "compacted-migrated-final",
+  )).toBe(1);
+  expect(sessions.find("compacted-migrated-final")).toBe(source);
+  sessions.clear();
+});
+
+test.each([
+  ["different native thread", "019f4edd-1032-7ec2-80bd-5b526a05471e", false],
+  ["active same native thread", "019f4edd-1032-7ec2-80bd-5b526a05471d", true],
+])("retained compaction still rejects a foreign replay owner with %s", async (_name, targetThreadId, active) => {
+  const sessions = new ChatGptTurnSessions();
+  const conversationKey = "n".repeat(64);
+  const nativeThreadId = "019f4edd-1032-7ec2-80bd-5b526a05471d";
+  const source = sessions.getOrCreate("ordinary-final-protected", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("ordinary final answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey,
+    cancel() {},
+  }), undefined, "new-subscription-owner", "new-turn", nativeThreadId);
+  const previous = sessions.getOrCreate("compacted-protected-final", () => ({
+    mode: "read-only",
+    browser: active ? new Promise<string>(() => {}) : Promise.resolve("foreign answer"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    conversationKey: "foreign-browser-epoch",
+    cancel() {},
+  }), undefined, "foreign-owner", "foreign-turn", targetThreadId);
+  await source.browserOutcome;
+  await source.physicalSettlement;
+  if (!active) {
+    await previous.browserOutcome;
+    await previous.physicalSettlement;
+  }
+
+  await expect(sessions.retireConversationPreservingFinalResponse(
+    conversationKey,
+    source,
+    "compacted-protected-final",
+  )).rejects.toThrow("already owned by another session");
+  expect(sessions.find("ordinary-final-protected")).toBe(source);
   sessions.clear();
 });
 
@@ -1234,7 +1372,7 @@ test.each([false, true])("structured compact rebuilds canonical context when its
     expect(contextText).toContain("Original task");
     expect(contextText).toContain("Continue with the next step");
     if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(6);
+      expect(prepared.multipart!.parts).toHaveLength(CHATGPT_BIGGER_CONTEXT_PARTS);
       expect(prepared.trimmedCompactionMessages).toBeUndefined();
       const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
       expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);
@@ -1262,7 +1400,7 @@ test.each([false, true])("structured compact rebuilds canonical context when its
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test.each([false, true])("configured fresh compaction waits for cleanup and preserves committed final=%s", async committed => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-fresh-owner-"));
@@ -1555,6 +1693,88 @@ test.each([false, true])("structured compact rebuild after retained browser loss
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after retained browser loss"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a disappeared retained source falls back when its replay key is already owned", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stale-retained-owned-replay-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://stale-retained-owned-replay-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const sourceRequest = request(false);
+  const compactRequest = request(true);
+  const compactSourceMessage = (compactRequest._rawBody as { input: Array<{
+    content: Array<{ type: string; text: string }>;
+  }> }).input[0]!;
+  compactSourceMessage.content = [{
+    type: "input_text",
+    text: "Provider-normalized current task revision",
+  }];
+  const namespace = chatGptWebExecutionNamespace(provider);
+  const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  const compactedSourceKey = `${namespace}:${chatGptCompactionSourceExecutionKey(compactRequest)}`;
+  expect(compactedSourceKey).not.toBe(sourceKey);
+  const conversationKey = chatGptConversationKey(sourceRequest, namespace)!;
+  const source = chatGptTurnSessions.getOrCreate(sourceKey, () => ({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey,
+    cancel() {},
+  }));
+  await source.browserOutcome;
+  const replayOwner = chatGptTurnSessions.getOrCreate(compactedSourceKey, () => ({
+    mode: "read-only",
+    browser: Promise.resolve("already-owned replay"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() {},
+  }), undefined, "existing-replay-owner", "existing-replay-turn", "other-thread");
+  await replayOwner.browserOutcome;
+
+  let browserStarts = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    browserStarts += 1;
+    if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
+    const prepared = await turn.prepare();
+    expect(prepared.text).toContain("Original task");
+    prepared.release();
+    return "Fallback checkpoint after replay ownership collision";
+  };
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(
+      compactRequest,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    expect(browserStarts).toBe(2);
+    expect(events.some(event => event.type === "text_delta"
+      && event.text.includes("Fallback checkpoint after replay ownership collision"))).toBeTrue();
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
+    expect(chatGptTurnSessions.find(compactedSourceKey)).toBe(replayOwner);
+    expect(chatGptTurnSessions.findConversationHead(conversationKey)).toBeUndefined();
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();

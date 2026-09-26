@@ -42,6 +42,21 @@ async function localHealthServer(statusForPath = () => 200, bodyForPath = () => 
   };
 }
 
+async function removeTreeAfterTransientWindowsLock(root, attempts = 20, delayMs = 25) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const retryable = process.platform === "win32"
+        && ["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)
+        && attempt < attempts;
+      if (!retryable) throw error;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 function launcherConfig(descriptorPath, overrides = {}) {
   const root = path.dirname(descriptorPath);
   return {
@@ -799,10 +814,10 @@ test("launcher adopts a healthy native managed tunnel without spawning a foregro
   supervisor.startTunnelMonitor = () => { monitors += 1; };
   try {
     await supervisor.startTunnel({
-      mode: "full",
-      tunnel: {
-        alias: "codex-chatgpt-web",
-        binaryPath,
+        mode: "full",
+        tunnel: {
+          alias: "codex-chatgpt-web",
+          binaryPath,
         runtimeKeyFile,
         profileDir,
         profileName: "codex-chatgpt-web",
@@ -895,7 +910,7 @@ for (const existingReady of [true, false]) {
     });
     let connected = existingReady;
     let monitoring = false;
-    const config = { mode: "full", tunnel: { alias: "owned-test" } };
+      const config = { mode: "full", tunnel: { alias: "owned-test" } };
     supervisor.assertTunnelClientReady = () => {};
     supervisor.readTunnelHealth = async () => ({ ready: connected, statusKnown: true,
       state: connected ? "ready" : "stopped", processRunning: connected, pid: null });
@@ -1004,9 +1019,9 @@ test("fresh tunnel recovery discovers its official loopback diagnostics before p
       profileDir: root,
     },
   };
-  const commands = [];
-  const healthFile = path.join(root, "health.url");
-  fs.writeFileSync(healthFile, "http://127.0.0.1:43127\n");
+    const commands = [];
+    const healthFile = path.join(root, "health.url");
+    fs.writeFileSync(healthFile, "http://127.0.0.1:43127\n");
   supervisor.runTunnelCommand = async (_config, args) => {
     commands.push(args);
     return {
@@ -1576,7 +1591,7 @@ test("failed initial health checks stop their child without scheduling crash rec
     assert.equal(recoveries, 0);
   } finally {
     await supervisor.stopChild("daemon").catch(() => {});
-    fs.rmSync(root, { recursive: true, force: true });
+    await removeTreeAfterTransientWindowsLock(root);
   }
 });
 
@@ -1932,6 +1947,20 @@ process.once("SIGTERM", () => server.close(() => process.exit(0)));
     assert.equal(Number.isInteger(state.daemonPid), true);
     assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).ok, true);
 
+    // Kill only the fixture-owned child and exercise the real automatic restart path.
+    supervisor.daemon.kill("SIGKILL");
+    const recoveryDeadline = Date.now() + 10_000;
+    let recovered = null;
+    while (Date.now() < recoveryDeadline) {
+      try {
+        const health = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
+        if (health.pid !== state.daemonPid && health.accepting_turns === true) { recovered = health; break; }
+      } catch {}
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(recovered, "a killed fixture daemon must restart and accept requests");
+    assert.equal(supervisor.daemon.pid, recovered.pid);
+
     const stopped = await supervisor.stopForSetup();
     assert.equal(stopped.status, "stopped");
     assert.equal(fs.existsSync(path.join(root, "runtime", "launcher-supervisor.json")), false);
@@ -2041,61 +2070,25 @@ server.listen(config.port, config.host);
   }
 });
 
-test("observed CLI fresh-conversation changes retire completed tabs once and defer launcher transactions", async () => {
-  const vm = require("node:vm");
-  const { BrowserHost } = require("../electron/browser-host.cjs");
-  const { releaseRetainedConversation } = require("../electron/retained-turn-release.cjs");
-  const main = fs.readFileSync(path.join(__dirname, "../electron/main.cjs"), "utf8");
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-fresh-config-"));
-  const descriptorPath = path.join(root, "launcher.json");
-  const configPath = path.join(root, "config.json");
-  const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
-  const key = "a".repeat(64);
-  const old = { id: "old", traceId: "old-trace", status: "ready", interactionMode: "automatic", conversationKey: key,
-    connectorIdentity: "Codex Native2", connectorBound: true };
-  const active = { id: "active", traceId: "active-trace", status: "running", interactionMode: "automatic", conversationKey: key };
-  const manual = { id: "manual", status: "ready", interactionMode: "manual", conversationKey: "b".repeat(64) };
-  let operation = null, updates = 0;
-  const removed = [];
-  const browserHost = Object.assign(Object.create(BrowserHost.prototype), {
-    manualOperation: null, turnTabs: new Map([[old.id, old], [active.id, active], [manual.id, manual]]),
-    userCancelledTurnOwners: new Map(), logger: { info() {} },
-    removeTurnTab(tab, abort) { assert.equal(abort, false); removed.push(tab.id); this.turnTabs.delete(tab.id); },
-    createTurnTab: async () => ({ id: "new", surfaceId: "new-surface" }),
-    syncViewVisibility() {}, snapshot: () => ({}), publishState() {}, writeDescriptor() {},
+for (const scenario of [
+  { name: "a browser turn remains after HTTP completion", health: { accepting_turns: false, active_http_turns: 0, active_browser_turns: 1 } },
+  { name: "browser activity evidence is missing", health: { accepting_turns: false, active_http_turns: 0 } },
+  { name: "drain acknowledgement is lost", health: null },
+]) {
+  test(`recovery preserves runtime when ${scenario.name}`, async () => {
+    const actions = [];
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => "0.2.0", isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: os.tmpdir(), coreHome: os.tmpdir(),
+      browserDescriptorPath: path.join(os.tmpdir(), "launcher.json"),
+    });
+    supervisor.control = async (_config, action) => {
+      actions.push(action);
+      if (action === "drain" && !scenario.health) throw new Error("connection reset");
+      return scenario.health;
+    };
+    await assert.rejects(supervisor.acquireDrain({}, 0), /atomic idleness could not be proven/);
+    assert.deepEqual(actions, ["drain", "resume"]);
   });
-  const sandbox = {
-    browserHost, releaseRetainedConversation, runtimeHost: { currentOperation: () => operation },
-    stateStore: { read: () => ({ ...state }), update: patch => { updates++; return Object.assign(state, patch); } },
-    send() {},
-  };
-  vm.runInNewContext(main.slice(main.indexOf("function syncFreshConversationPreference("), main.indexOf("function registerIpc(")), sandbox);
-  const supervisor = new RuntimeSupervisor({ coreHome: root, browserDescriptorPath: descriptorPath,
-    onConfigRead: config => sandbox.syncFreshConversationPreference(sandbox.stateStore, config) });
-  const persist = enabled => fs.writeFileSync(configPath, JSON.stringify(launcherConfig(descriptorPath, {
-    solAvailable: true, browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: enabled,
-  })));
-  try {
-    persist(true);
-    operation = "fresh-conversation-per-turn";
-    supervisor.readConfig();
-    assert.deepEqual(removed, [], "an uncommitted setup config must not retire history");
-    persist(false);
-    operation = null;
-    supervisor.readConfig();
-    assert.equal(updates, 0, "rolled-back setup preserves the saved preference");
-    for (const enabled of [true, false]) {
-      persist(enabled); // A separate CLI updates the persisted config.
-      supervisor.readConfig();
-      assert.equal(state.experimentalFreshConversationPerTurn, enabled);
-      supervisor.readConfig();
-      assert.equal(updates, enabled ? 1 : 2, "unchanged observations do not commit or clear twice");
-    }
-    assert.deepEqual(removed, [old.id]);
-    assert.equal(browserHost.turnTabs.get(active.id), active);
-    assert.equal(browserHost.turnTabs.get(manual.id), manual);
-    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native2");
-    assert.equal(lease.reused, false);
-    assert.equal(lease.tabId, "new");
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
+}

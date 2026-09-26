@@ -38,12 +38,18 @@ export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="assistant"]:not([data-turn-key] *)',
   '[data-testid^="conversation-turn-"][data-message-author-role="assistant"]:not([data-turn-key] *)',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"]):not([data-turn-key] *)',
+  '[data-turn-id][data-turn="assistant"]:not([data-turn-key] *)',
+  '[data-turn-id][data-message-author-role="assistant"]:not([data-turn-key] *)',
+  '[data-turn-id]:has([data-message-author-role="assistant"]):not([data-turn-key] *)',
   '[data-turn-key]:has([data-conversation-role="assistant"])',
 ].join(", ");
 export const CHATGPT_USER_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="user"]:not([data-turn-key] *)',
   '[data-testid^="conversation-turn-"][data-message-author-role="user"]:not([data-turn-key] *)',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="user"]):not([data-turn-key] *)',
+  '[data-turn-id][data-turn="user"]:not([data-turn-key] *)',
+  '[data-turn-id][data-message-author-role="user"]:not([data-turn-key] *)',
+  '[data-turn-id]:has([data-message-author-role="user"]):not([data-turn-key] *)',
   '[data-turn-key]:has([data-user-message-bubble])',
 ].join(", ");
 
@@ -85,6 +91,13 @@ export async function chatGptEffortMenuForControl(page: Page, control: Locator):
   const controlId = await control.getAttribute("id").catch(() => null);
   if (controlId) return page.locator(`[role="menu"][aria-labelledby~=${JSON.stringify(controlId)}]`).filter({ visible: true });
   return page.locator(CHATGPT_EFFORT_MENU_SELECTOR).filter({ visible: true });
+}
+
+export async function chatGptAvailableProMenuItem(menu: Locator): Promise<Locator | undefined> {
+  const rows = menu.getByRole("menuitemradio", { name: "Pro", exact: true }).filter({ visible: true });
+  if (await rows.count() !== 1) return undefined;
+  const row = rows.first();
+  return await row.getAttribute("aria-disabled").catch(() => null) === "true" ? undefined : row;
 }
 
 async function visibleEffortSurface(
@@ -286,8 +299,17 @@ export async function detectChatGptAccountCapabilities(
         { cause: new Error("ChatGPT effort slider exposed an invalid ARIA range") },
       );
     }
+    const optionCount = state.max - state.min + 1;
     const available = await readChatGptEffortAvailability(sliderContainer, state);
-    return { solAvailable: true, extraHighAvailable: available[3] === true, proAvailable: available[4] === true };
+    const proMenuItem = await chatGptAvailableProMenuItem(menu);
+    return {
+      solAvailable: true,
+      extraHighAvailable: optionCount >= 4 && available[3] === true,
+      // Current ChatGPT renders Pro as its own picker row on some accounts,
+      // while older variants exposed it as the fifth slider position. Accept
+      // either authoritative UI shape, but never count a locked slider tick.
+      proAvailable: proMenuItem !== undefined || (optionCount >= 5 && available[4] === true),
+    };
   } finally {
     await page.keyboard.press("Escape").catch(() => {});
   }

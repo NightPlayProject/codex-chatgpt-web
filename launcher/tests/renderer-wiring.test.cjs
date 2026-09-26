@@ -8,7 +8,30 @@ const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "ut
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
+const officialWallpaperSource = fs.readFileSync(path.join(launcherRoot, "electron", "official-codex-wallpapers.cjs"), "utf8");
+const wallpaperSource = fs.readFileSync(path.join(launcherRoot, "wallpapers", "runtime.js"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
+const accountSwitcherSource = fs.readFileSync(path.join(launcherRoot, "electron", "account-switcher.cjs"), "utf8");
+const launcherHtml = fs.readFileSync(path.join(launcherRoot, "index.html"), "utf8");
+
+test("update availability cannot be lost while the initial account snapshot is pending", () => {
+  const initialization = appSource.slice(appSource.indexOf("export function App()"), appSource.indexOf("const updateState = useCallback"));
+  const subscribe = initialization.indexOf("api.onUpdateState(");
+  const requestSnapshot = initialization.indexOf("void api.snapshot()");
+  assert.ok(subscribe >= 0 && requestSnapshot > subscribe, "subscribe before requesting the initial snapshot");
+  assert.match(initialization, /latestUpdate = update;/);
+  assert.match(initialization, /setSnapshot\(\{ \.\.\.next, update: latestUpdate \?\? next\.update \}\)/);
+
+  const snapshotHandler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:snapshot"'),
+    electronMain.indexOf('handle("launcher:set-language"'),
+  );
+  assert.ok(
+    snapshotHandler.indexOf("accounts: accountSwitcher ? await accountSwitcher.snapshot() : null")
+      < snapshotHandler.indexOf("update: updateController?.getState()"),
+    "read update state after the slow account lookup",
+  );
+});
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -98,7 +121,8 @@ test("setup preserves session-check failures and never installs without verified
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
       runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
-      smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
+      officialCodexWallpaperController: { setProviderGateEnabled: async () => ({ enabled: true }) },
+      smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: { warn() {} },
     });
     await assert.rejects(setup, error => error.message === browser.message);
     assert.equal(installs, 0);
@@ -167,17 +191,26 @@ test("startup failure stays visible on another launch and Retry exits the failed
   assert.deepEqual(sandbox.process.env, { CODEX_HOME: "original-codex-home" });
 });
 
-test("packaged runtime is verified before launcher browser surfaces can bind ports", () => {
+test("CDP startup switches are registered before packaged runtime verification", () => {
   const start = electronMain.indexOf("async function start()");
-  const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
   const cdpPortAllocation = electronMain.indexOf("cdpPort = await findFreePort();", start);
+  const cdpAddressSwitch = electronMain.indexOf('app.commandLine.appendSwitch("remote-debugging-address"', start);
+  const cdpPortSwitch = electronMain.indexOf('app.commandLine.appendSwitch("remote-debugging-port"', start);
+  const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
   const windowCreation = electronMain.indexOf("mainWindow = createWindow({", start);
   const controlServerStart = electronMain.indexOf("browserControl = await new BrowserControlServer({", start);
   const browserReady = electronMain.indexOf("await browserHost.ready();", start);
 
+  for (const [startupStep, position] of [
+    ["CDP port allocation", cdpPortAllocation],
+    ["CDP address switch", cdpAddressSwitch],
+    ["CDP port switch", cdpPortSwitch],
+  ]) {
+    assert.ok(position > start && position < runtimeValidation,
+      `${startupStep} must happen before runtime verification can let Electron become ready`);
+  }
   assert.ok(runtimeValidation > start, "startup must eagerly verify the packaged runtime");
   for (const [surface, position] of [
-    ["CDP port allocation", cdpPortAllocation],
     ["launcher window", windowCreation],
     ["browser control server", controlServerStart],
     ["embedded browser", browserReady],
@@ -229,6 +262,86 @@ test("Bigger Context startup recommendation reuses the persisted setting and set
   assert.match(appSource, /<Switch checked=\{checked\} disabled=\{busy\} onChange=\{onChange\} \/>/);
   assert.match(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*position:\s*fixed;/s);
   assert.doesNotMatch(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*backdrop-filter:/s);
+});
+
+test("Codex Wallpapers is routed only to the official Store Codex app", () => {
+  assert.match(appSource, /snapshot\.state\.codexWallpapersEnabled/);
+  assert.match(appSource, /api!\.setWallpapersEnabled\(enabled\)/);
+  const wallpaperSetting = appSource.slice(
+    appSource.indexOf('<SettingRow body={copy.codexWallpapersBody}'),
+    appSource.indexOf('<SettingRow', appSource.indexOf('<SettingRow body={copy.codexWallpapersBody}') + 1),
+  );
+  assert.match(wallpaperSetting, /disabled=\{busy\}/);
+  assert.doesNotMatch(wallpaperSetting, /browserInteractionMode/);
+  assert.match(preloadSource, /setWallpapersEnabled:[\s\S]*?launcher:wallpapers/);
+  assert.match(electronMain, /handle\("launcher:wallpapers"/);
+  assert.match(electronMain, /createOfficialCodexWallpaperController/);
+  assert.match(electronMain, /officialCodexWallpaperController\.setEnabled\(enabled === true\)/);
+  assert.match(electronMain, /persistOfficialCodexWallpaperStatus/);
+  assert.doesNotMatch(electronMain, /createWallpaperManager/);
+  assert.doesNotMatch(electronMain, /wallpaperManager:/);
+  assert.doesNotMatch(browserHostSource, /wallpaperManager|applyWallpapersToContents|setWallpapersEnabled|WALLPAPER_RETRY/);
+  assert.match(officialWallpaperSource, /Get-AppxPackage -Name OpenAI\.Codex/);
+  assert.match(officialWallpaperSource, /SignatureKind -ne 'Store'/);
+  assert.match(officialWallpaperSource, /--remote-debugging-address=127\.0\.0\.1/);
+  assert.match(officialWallpaperSource, /target\.url\.startsWith\("app:\/\/"\)/);
+  assert.match(wallpaperSource, /const api=\{[^}]*setEnabled/s);
+});
+
+test("upstream v6.1.0 Settings controls remain wired beside Wallpapers", () => {
+  const settings = appSource.slice(
+    appSource.indexOf("function SettingsSurface("),
+    appSource.indexOf("function ContentSurface("),
+  );
+  assert.match(settings, /checked=\{snapshot\.state\.experimentalFreshConversationPerTurn\}/);
+  assert.match(settings, /api!\.setFreshConversationPerTurn\(enabled\)/);
+  assert.match(settings, /checked=\{snapshot\.state\.useSavedChats\}/);
+  assert.match(settings, /api!\.setUseSavedChats\(enabled\)/);
+  assert.match(settings, /api!\.setWallpapersEnabled\(enabled\)/);
+  assert.doesNotMatch(settings, /copy\.saveChats|state\.saveChats|state\.savedChats/);
+  assert.match(preloadSource, /setFreshConversationPerTurn:[^\n]*launcher:fresh-conversation-per-turn/);
+  assert.match(preloadSource, /setUseSavedChats:[^\n]*launcher:use-saved-chats/);
+  assert.match(electronMain, /getSaveChats: \(\) => runtimeHost\.runtimeConfigSnapshot\(\)\.config\?\.useSavedChats === true/);
+});
+
+test("account switching stays in the official Windows Codex session", () => {
+  assert.match(appSource, /surface === "accounts"/);
+  assert.match(appSource, /label=\{copy\.accountSwitcher\}/);
+  assert.match(appSource, /api!\.addCurrentAccount\(\)/);
+  assert.match(appSource, /api!\.switchAccount\(account\.id\)/);
+  assert.match(preloadSource, /addCurrentAccount:[\s\S]*?launcher:account-add-current/);
+  assert.match(preloadSource, /switchAccount:[\s\S]*?launcher:account-switch/);
+  assert.match(electronMain, /createAccountSwitcher\(/);
+  assert.match(electronMain, /codexHome:\s*LAUNCHER_PROFILE\.codexHome/);
+  assert.match(accountSwitcherSource, /\.codex-switcher/, "the compatible Codex Switcher store is an input");
+  assert.match(accountSwitcherSource, /Get-AppxPackage|resolveOfficialCodexIdentity/);
+  assert.match(accountSwitcherSource, /writePrivateFileAtomic\(authPath/);
+  assert.match(accountSwitcherSource, /Official Codex account switching is currently available on Windows/);
+  assert.doesNotMatch(appSource, /auth_data/);
+});
+
+test("account avatars and email privacy are wired through the native account surface", () => {
+  assert.match(accountSwitcherSource, /profile\.profile_picture_url/);
+  assert.match(launcherHtml, /img-src 'self' data: https:/);
+  assert.match(appSource, /const refresh = \(refreshUsage = false\) =>/);
+  assert.match(appSource, /refresh\(true\);/);
+  assert.match(appSource, /formatAccountDisplayName\(activeAccount, showEmails\)/);
+  assert.match(appSource, /const displayName = formatAccountDisplayName\(account, showEmail\)/);
+  assert.match(appSource, /showEmail=\{showEmails\}/);
+  assert.match(appSource, /formatAccountDisplayName\(eventAccount, showEmail\)/);
+  assert.doesNotMatch(appSource, /<strong>\{account\.name\}<\/strong>/);
+});
+
+test("native Windows Computer Use setup is explicit, production-scoped, and reloads Codex", () => {
+  assert.match(appSource, /copy\.installNativeComputerUse/);
+  assert.match(appSource, /api!\.setupNativeComputerUse\(\)/);
+  assert.match(appSource, /step === 1 && !devProfile && platform === "win32"/);
+  assert.match(preloadSource, /setupNativeComputerUse:[\s\S]*?launcher:native-computer-use-setup/);
+  assert.match(electronMain, /handle\("launcher:native-computer-use-setup"/);
+  assert.match(electronMain, /if \(IS_DEV_PROFILE\)[\s\S]*?the DEV launcher cannot edit it/);
+  assert.match(electronMain, /codexCatalogVerified: false,[\s\S]*?codexRestartRequired: true/);
+  assert.match(electronMain, /startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
+  assert.doesNotMatch(browserHostSource, /setWallpapersEnabled/);
 });
 
 test("Zero Risk setup commits state after the runtime transaction and preserves manual inspection boundaries", () => {
@@ -388,153 +501,4 @@ test("catalog verification reports a failed request instead of requesting anothe
   assert.equal(state.codexCatalogVerified, true);
   assert.equal(state.codexRestartRequired, false);
   assert.ok(events.some(([event]) => event === "codex.model_catalog_verified"));
-});
-
-test("fresh-conversation IPC commits only after setup succeeds and refuses active browser work", async () => {
-  const vm = require("node:vm");
-  for (const savedChats of [false, true]) {
-    const property = savedChats ? "useSavedChats" : "experimentalFreshConversationPerTurn";
-    const method = savedChats ? "setUseSavedChats" : "setFreshConversationPerTurn";
-    const channel = savedChats ? "launcher:use-saved-chats" : "launcher:fresh-conversation-per-turn";
-    const nextChannel = savedChats ? "launcher:zero-risk-pro" : "launcher:use-saved-chats";
-    const source = electronMain.slice(
-      electronMain.indexOf(`handle("${channel}",`),
-      electronMain.indexOf(`handle("${nextChannel}",`),
-    );
-    const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
-    const config = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
-    const events = [];
-    let handler, finishSetup, setupFailure, calls = 0;
-    const browserHost = { activeTraceId: "running-turn", currentOperation: () => null, turnTabs: new Map() };
-    const syncSource = electronMain.slice(electronMain.indexOf("function syncFreshConversationPreference("), electronMain.indexOf("function registerIpc("));
-    vm.runInNewContext(syncSource + source, {
-      handle: (_channel, callback) => { handler = callback; }, browserHost,
-      releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
-      runtimeHost: { currentOperation: () => null, runtimeConfigSnapshot: () => ({ config }), [method]: async enabled => {
-        calls++;
-        if (setupFailure) throw setupFailure;
-        await new Promise(resolve => { finishSetup = resolve; });
-        config[property] = enabled;
-        return { enabled };
-      } },
-      stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
-      send: (channel, value) => events.push({ channel, value: { ...value } }),
-    });
-    await assert.rejects(() => handler(null, true), /Finish or cancel active ChatGPT turns/);
-    browserHost.activeTraceId = null;
-    browserHost.currentOperation = () => "browser-smoke";
-    await assert.rejects(() => handler(null, true), /Finish or cancel active ChatGPT turns/);
-    assert.equal(calls, 0);
-    browserHost.currentOperation = () => null;
-    let api;
-    vm.runInNewContext(preloadSource, { require: () => ({
-      contextBridge: { exposeInMainWorld: (_name, value) => { api = value; } },
-      ipcRenderer: { invoke: (actualChannel, enabled) => {
-        assert.equal(actualChannel, channel);
-        return handler(null, enabled);
-      } },
-    }) });
-    const changing = api[method](true);
-    assert.equal(state[property], false);
-    assert.equal(events.length, 0);
-    finishSetup();
-    assert.equal((await changing)[property], true);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].channel, "launcher:state-changed");
-    setupFailure = new Error("synthetic setup rollback");
-    await assert.rejects(() => api[method](false), /synthetic setup rollback/);
-    assert.equal(state[property], true);
-    assert.equal(events.length, 1);
-  }
-});
-
-test("fresh-conversation snapshot uses runtime configuration and mode switching preserves the preference", async () => {
-  const vm = require("node:vm");
-  const handlers = new Map();
-  const state = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: false };
-  let config = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: true };
-  const runtimeHost = {
-    currentOperation: () => null,
-    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native2",
-    setupConnectorName: () => "Codex Native2", mcpCredentialsConfigured: () => true,
-    setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
-  };
-  const sandbox = {
-    handle: (name, handler) => handlers.set(name, handler), runtimeHost,
-    releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
-    stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
-    browserHost: { activeTraceId: null, turnTabs: new Map(), currentOperation: () => null, snapshot: () => ({}),
-      withInteractionModeChange: async (_mode, action) => action() },
-    validateBrowserInteractionMode: mode => mode, IS_DEV_PROFILE: false, send() {}, startCatalogVerificationMonitor() {},
-    LAUNCHER_PROFILE: { kind: "production", codexHome: "/fixture/codex" }, CORE_HOME: "/fixture/core",
-    launcherUserData: "/fixture/launcher", logger: { recent: () => [] },
-    GITHUB_URL: "", X_URL: "", CONNECTORS_URL: "", TUNNELS_URL: "", KEYS_URL: "",
-    process: { platform: "darwin" }, app: { isPackaged: false, getVersion: () => "test" },
-    smokePassedThisSession: false, smokePassedForCurrentVersion: () => false, lastOperation: null, updateController: null,
-  };
-  vm.runInNewContext(electronMain.slice(electronMain.indexOf("function syncFreshConversationPreference("), electronMain.indexOf("function registerIpc(")) +
-    electronMain.slice(electronMain.indexOf('handle("launcher:snapshot",'),
-    electronMain.indexOf('handle("launcher:set-language",')) +
-    electronMain.slice(electronMain.indexOf('handle("launcher:browser-interaction-mode",'),
-    electronMain.indexOf('handle("launcher:set-preference",')), sandbox);
-  const snapshot = handlers.get("launcher:snapshot");
-  assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, true);
-  assert.equal(state.experimentalFreshConversationPerTurn, true, "snapshot synchronizes a CLI configuration change");
-  const changeMode = handlers.get("launcher:browser-interaction-mode");
-  for (const mode of ["manual", "automatic"]) {
-    const changed = await changeMode(null, mode);
-    assert.equal(changed.state.experimentalFreshConversationPerTurn, true);
-    assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, true);
-  }
-  config = {};
-  assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, false);
-});
-
-test("fresh-conversation control is translated, disabled in Zero Risk, and invokes the async setting", async () => {
-  const ts = require("typescript");
-  const vm = require("node:vm");
-  const settings = appSource.slice(appSource.indexOf("function SettingsSurface("), appSource.indexOf("function ContentSurface("));
-  const transpile = (source, fileName) => ts.transpileModule(source, {
-    fileName, compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.React, jsxFactory: "element" },
-  }).outputText;
-  const translated = { exports: {} };
-  vm.runInNewContext(transpile(fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"), "i18n.ts"), translated);
-  let render, invocation, saved;
-  const sandbox = {
-    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
-    useState: value => [value, () => {}],
-    api: { setFreshConversationPerTurn: async enabled => { invocation = enabled; return { experimentalFreshConversationPerTurn: enabled }; } },
-    messageOf: String, platformLabel: String,
-  };
-  for (const name of ["ContentSurface", "SectionHeading", "SettingRow", "Switch", "InteractionModePicker", "LanguageMenu", "NoticeRow", "Icon", "DoctorSummary", "BrandMark"]) sandbox[name] = name;
-  vm.runInNewContext(transpile(settings, "settings.tsx") + "\nrender = SettingsSurface;", Object.assign(sandbox, { render }));
-  render = sandbox.render;
-  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
-    ? [tree, ...visit(tree.children ?? [])] : [];
-  for (const language of Object.keys(require("../electron/languages.json"))) {
-    const copy = translated.exports.copyFor(language);
-    for (const key of ["freshConversation", "freshConversationBody", "manualFreshConversationUnavailable"]) {
-      assert.equal(typeof copy[key], "string");
-      assert.ok(copy[key].length > 10);
-    }
-    for (const [mode, configured, enabled] of [["automatic", true, false], ["manual", true, true], ["automatic", false, false]]) {
-      const tree = render({ copy, devProfile: false, language, configureInteractionMode() {}, setError() {},
-        snapshot: { state: { browserInteractionMode: mode, coreSetupComplete: configured, experimentalFreshConversationPerTurn: enabled } },
-        updateState: value => { saved = value; },
-      });
-      const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy.freshConversation);
-      assert.ok(row);
-      assert.equal(row.props.body, mode === "manual" ? copy.manualFreshConversationUnavailable : copy.freshConversationBody);
-      const control = visit(row).find(node => node.type === "Switch");
-      assert.equal(control.props.checked, enabled);
-      assert.equal(control.props.disabled, mode === "manual" || !configured);
-      if (!control.props.disabled) {
-        control.props.onChange(true);
-        await new Promise(resolve => setImmediate(resolve));
-        assert.equal(invocation, true);
-        assert.equal(saved.experimentalFreshConversationPerTurn, true);
-      }
-    }
-  }
 });

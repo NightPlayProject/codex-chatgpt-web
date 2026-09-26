@@ -175,3 +175,48 @@ test("a closed Windows diagnostic pipe is recorded without becoming an uncaught 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("credentials are absent from stored, published and exported diagnostics", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-redaction-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "export.jsonl");
+  try {
+    const published = [];
+    const logger = createLogger({ filePath, publish: row => published.push(row) });
+    const secret = "synthetic-sensitive-value";
+    logger.error("failure", { apiKey: secret, nested: { refresh_token: secret }, line: `password="${secret}" ordinary failure`, key: `-----BEGIN PRIVATE KEY-----\n${secret}\n-----END PRIVATE KEY-----` });
+    exportSanitizedLogs({ filePath, destinationPath });
+    for (const data of [fs.readFileSync(filePath, "utf8"), fs.readFileSync(destinationPath, "utf8"), JSON.stringify(published), JSON.stringify(logger.recent())]) {
+      assert.doesNotMatch(data, /synthetic-sensitive-value/);
+      assert.match(data, /ordinary failure/);
+    }
+    const legacy = (line, extra = {}) => JSON.stringify({ at: "2026-09-11T00:00:00Z", level: "error", event: "runtime.stdout", detail: { line, ...extra } });
+    fs.writeFileSync(`${filePath}.1`, legacy("-----BEGIN PRIVATE KEY-----") + "\n");
+    fs.writeFileSync(filePath, [legacy(secret, { authorization: secret }), legacy("-----END PRIVATE KEY-----"), legacy("ordinary output")].join("\n"));
+    exportSanitizedLogs({ filePath, destinationPath });
+    assert.doesNotMatch(fs.readFileSync(destinationPath, "utf8"), /synthetic-sensitive-value/);
+    assert.doesNotMatch(JSON.stringify(createLogger({ filePath }).recent()), /synthetic-sensitive-value/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("private-key line redactors are isolated and handle unfinished keys", () => {
+  const { createDiagnosticLineRedactor, redactText, sanitizeForExport } = require("../electron/logging.cjs");
+  const first = createDiagnosticLineRedactor();
+  const second = createDiagnosticLineRedactor();
+  first("-----BEGIN OPENSSH PRIVATE KEY-----");
+  assert.equal(first("sensitive-body"), "[private-key-redacted]");
+  assert.equal(second("ordinary output"), "ordinary output");
+  first("-----END OPENSSH PRIVATE KEY-----");
+  assert.equal(first("ordinary output"), "ordinary output");
+  assert.doesNotMatch(redactText('api_key="sensitive body with spaces"'), /sensitive/);
+  assert.equal(sanitizeForExport({ access_token: "secret" }).access_token, "[redacted]");
+});
+
+test("adjacent private key boundaries and HTTP credentials remain redacted", () => {
+  const { createDiagnosticLineRedactor, redactText } = require("../electron/logging.cjs");
+  const redact = createDiagnosticLineRedactor();
+  redact("-----BEGIN PRIVATE KEY-----");
+  redact("-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----");
+  assert.equal(redact("second-sensitive-body"), "[private-key-redacted]");
+  assert.doesNotMatch(redactText("Authorization: Basic synthetic-credential\nCookie: session=synthetic-cookie"), /synthetic/);
+});

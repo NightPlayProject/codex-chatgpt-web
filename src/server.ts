@@ -14,11 +14,20 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  extractChatGptTurnUserRevisionRecord,
 } from "./adapters/chatgpt-web/environment";
-import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
+import {
+  bindCompactionContinuationStore,
+  ChatGptCompactionContinuationStore,
+  rememberCompactionContinuation,
+} from "./adapters/chatgpt-web/compaction-continuation";
+import {
+  bindGoalContinuationStore,
+  ChatGptGoalContinuationStore,
+} from "./adapters/chatgpt-web/goal-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
-import { providerConfig } from "./config";
+import { getConfigDir, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -30,11 +39,15 @@ import {
   type CodexModelContextOverride,
 } from "./codex-integration";
 import {
+  CHATGPT_WEB_BACKEND_MODEL,
+  CHATGPT_WEB_HIGH_RELIABLE_COMPACT_RETAINED_TEXT_TOKEN_BUDGET,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
+  resolveChatGptWebContextLimits,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
+import { estimateChatGptWebNativeInputTokens } from "./adapters/chatgpt-web/usage";
 import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint } from "./native-passthrough";
 import { fetchNativeCodex } from "./native-network";
 import {
@@ -42,6 +55,7 @@ import {
   COMPACT_PROMPT,
   decodeCompactionSummary,
   extractCompactUserMessages,
+  isReadableCompactionSummaryText,
 } from "./responses/compaction";
 import { parseRequest } from "./responses/parser";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
@@ -49,12 +63,105 @@ import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
+import { join } from "node:path";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
+
+export function chatGptWebCompactV1RetainedTextTokenBudget(
+  route: ChatGptWebModelRoute,
+  config: Pick<AppConfig, "proAvailable" | "experimentalBiggerContext">,
+): number | undefined {
+  return route.slug === "chatgpt-web/high"
+    && !config.proAvailable
+    && !config.experimentalBiggerContext
+    ? CHATGPT_WEB_HIGH_RELIABLE_COMPACT_RETAINED_TEXT_TOKEN_BUDGET
+    : undefined;
+}
+
+function routedCompactV1Output(
+  input: unknown,
+  summary: string,
+  route: ChatGptWebModelRoute,
+  config: Pick<AppConfig, "proAvailable" | "experimentalBiggerContext">,
+): Record<string, unknown>[] {
+  const retainedTextTokenBudget = chatGptWebCompactV1RetainedTextTokenBudget(route, config);
+  return buildCompactV1Output(
+    extractCompactUserMessages(input),
+    summary,
+    retainedTextTokenBudget === undefined ? {} : { retainedTextTokenBudget },
+  );
+}
+
+function transitionInputIdentity(value: unknown): { id?: string; turnId?: string; role?: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const item = value as Record<string, unknown>;
+  const metadata = item.internal_chat_message_metadata_passthrough;
+  const turnId = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as { turn_id?: unknown }).turn_id
+    : undefined;
+  return {
+    ...(typeof item.id === "string" && item.id.length > 0 ? { id: item.id } : {}),
+    ...(typeof turnId === "string" && turnId.length > 0 ? { turnId } : {}),
+    ...(typeof item.role === "string" ? { role: item.role } : {}),
+  };
+}
+
+function sameTransitionInputIdentity(candidate: unknown, active: unknown): boolean {
+  const candidateIdentity = transitionInputIdentity(candidate);
+  const activeIdentity = transitionInputIdentity(active);
+  if (candidateIdentity.id && activeIdentity.id) return candidateIdentity.id === activeIdentity.id;
+  return Boolean(
+    candidateIdentity.turnId
+      && candidateIdentity.turnId === activeIdentity.turnId
+      && candidateIdentity.role
+      && candidateIdentity.role === activeIdentity.role,
+  );
+}
+
+function compactOutputText(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const item = value as { role?: unknown; content?: unknown };
+  if (item.role !== "user") return "";
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content)) return "";
+  return item.content.map(part => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return "";
+    const block = part as { type?: unknown; text?: unknown };
+    return (block.type === "input_text" || block.type === "text") && typeof block.text === "string"
+      ? block.text
+      : "";
+  }).join("");
+}
+
+/**
+ * Hidden transition compaction is allowed to reduce retained history, but it must never truncate
+ * or drop the exact instruction that authorized the current native turn. The regular v1 compact
+ * output intentionally has a bounded raw-text tail, so restore that one source item verbatim just
+ * before the readable checkpoint summary. The completed compaction store already authorizes both
+ * the original source revision and the normal bounded v1 source.
+ */
+function preserveTransitionActiveInput(
+  compacted: readonly unknown[],
+  activeInput: unknown,
+): unknown[] {
+  const summaryIndex = compacted.findLastIndex(item => isReadableCompactionSummaryText(compactOutputText(item)));
+  if (summaryIndex < 0) throw new Error("Transition compaction output is missing its readable summary");
+  const output = compacted
+    .filter(item => !sameTransitionInputIdentity(item, activeInput))
+    .map(item => structuredClone(item));
+  const normalizedSummaryIndex = output.findLastIndex(item => isReadableCompactionSummaryText(compactOutputText(item)));
+  output.splice(normalizedSummaryIndex, 0, structuredClone(activeInput));
+  return output;
+}
 
 export interface NativeCodexTurnIdentity {
   threadId: string;
   turnId: string;
+}
+
+interface HttpTurnLifecycleObserver {
+  onIdentityBound?: (identity: NativeCodexTurnIdentity, endpoint: HttpTrackedEndpoint) => void;
+  onClientDetached?: (identity: NativeCodexTurnIdentity, endpoint: HttpTrackedEndpoint) => void;
 }
 
 export interface HttpStreamFailureEvidence {
@@ -122,29 +229,29 @@ export class HttpTurnCounter {
     done: Promise<void>;
     finish: () => void;
     identity?: NativeCodexTurnIdentity;
+    pendingInterrupts: Map<string, unknown>;
   }>();
-  private readonly interrupted = new Map<string, unknown>();
   private nextId = 1;
 
   private identityKey(identity: NativeCodexTurnIdentity): string {
     return `${identity.threadId}\u0000${identity.turnId}`;
   }
 
-  private rememberInterrupted(identity: NativeCodexTurnIdentity, reason: unknown): void {
-    const key = this.identityKey(identity);
-    this.interrupted.delete(key);
-    this.interrupted.set(key, reason);
-    while (this.interrupted.size > 1_024) {
-      const oldest = this.interrupted.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.interrupted.delete(oldest);
-    }
-  }
-
-  constructor(private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure) {}
+  constructor(
+    private readonly reportStreamFailure: HttpStreamFailureReporter = reportHttpStreamFailure,
+    private readonly lifecycleObserver: HttpTurnLifecycleObserver = {},
+  ) {}
 
   count(): number {
     return this.active.size;
+  }
+
+  hasConnectedTurn(identity: NativeCodexTurnIdentity): boolean {
+    return [...this.active.values()].some(turn => (
+      !turn.abort.signal.aborted
+      && turn.identity?.threadId === identity.threadId
+      && turn.identity.turnId === identity.turnId
+    ));
   }
 
   async cancelAll(reason: unknown = new Error("Active HTTP turns cancelled")): Promise<number> {
@@ -169,10 +276,17 @@ export class HttpTurnCounter {
     identity: NativeCodexTurnIdentity,
     reason: unknown = new DOMException("Codex turn interrupted", "AbortError"),
   ): { cancelled: number; settlement: Promise<void> } {
-    this.rememberInterrupted(identity, reason);
-    const turns = [...this.active.values()].filter(turn => (
-      turn.identity?.threadId === identity.threadId && turn.identity.turnId === identity.turnId
-    ));
+    const key = this.identityKey(identity);
+    const turns = [...this.active.values()].filter(turn => {
+      if (!turn.identity) {
+        // Interrupts can beat request parsing/identity binding. Remember that race only on HTTP
+        // requests that were already in flight. Native steering reuses the same turn_id, so a
+        // process-wide tombstone would incorrectly abort the replacement request too.
+        turn.pendingInterrupts.set(key, reason);
+        return false;
+      }
+      return turn.identity.threadId === identity.threadId && turn.identity.turnId === identity.turnId;
+    });
     for (const turn of turns) {
       if (!turn.abort.signal.aborted) turn.abort.abort(reason);
     }
@@ -200,9 +314,11 @@ export class HttpTurnCounter {
       done: Promise<void>;
       finish: () => void;
       identity?: NativeCodexTurnIdentity;
-    } = { abort, done, finish };
+      pendingInterrupts: Map<string, unknown>;
+    } = { abort, done, finish, pendingInterrupts: new Map() };
     this.active.set(id, tracked);
     let released = false;
+    let clientDetached = clientSignal?.aborted === true;
     let clientAbortListener: (() => void) | undefined;
     let streamAbortListener: (() => void) | undefined;
     const release = () => {
@@ -216,7 +332,11 @@ export class HttpTurnCounter {
       if (streamAbortListener) abort.signal.removeEventListener("abort", streamAbortListener);
       finish();
     };
-    clientAbortListener = () => abort.abort(clientSignal?.reason);
+    clientAbortListener = () => {
+      clientDetached = true;
+      if (tracked.identity) this.lifecycleObserver.onClientDetached?.(tracked.identity, endpoint);
+      abort.abort(clientSignal?.reason);
+    };
     if (clientSignal?.aborted) abort.abort(clientSignal.reason);
     else clientSignal?.addEventListener("abort", clientAbortListener, { once: true });
 
@@ -230,7 +350,10 @@ export class HttpTurnCounter {
           throw new Error("An HTTP request cannot change its native Codex turn identity");
         }
         tracked.identity = identity;
-        const interruptedReason = this.interrupted.get(this.identityKey(identity));
+        this.lifecycleObserver.onIdentityBound?.(identity, endpoint);
+        if (clientDetached) this.lifecycleObserver.onClientDetached?.(identity, endpoint);
+        const interruptedReason = tracked.pendingInterrupts.get(this.identityKey(identity));
+        tracked.pendingInterrupts.clear();
         if (interruptedReason !== undefined && !abort.signal.aborted) abort.abort(interruptedReason);
       });
       if (!response.body) {
@@ -356,10 +479,18 @@ type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapt
 export interface ResponseRequestOptions {
   /** DEV and other in-process harnesses can keep continuation state in their own canonical store. */
   rememberState?: boolean;
+  /** Durable authorization for exact post-compaction native continuations. Omitted tests stay in-memory. */
+  compactionContinuationStore?: ChatGptCompactionContinuationStore;
+  /** Durable `/goal` lineage bound to an exact human revision and completed compaction checkpoint. */
+  goalContinuationStore?: ChatGptGoalContinuationStore;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
   onAdapterEvent?: (event: AdapterEvent) => void;
   /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
   onTurnIdentity?: (identity: NativeCodexTurnIdentity) => void;
+  /** Internal recursion guard: one oversized native->Web transition may compact at most once. */
+  transitionCompactionAttempted?: boolean;
+  /** Preserve original native context pressure after the temporary reduced continuation is parsed. */
+  nativeUsageInputTokenFloor?: number;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -459,9 +590,10 @@ function toolBridgeMaps(parsed: CodexParsedRequest): {
   const freeformToolNames = new Set<string>();
   const toolSearchToolNames = new Set<string>();
   for (const tool of parsed.context.tools ?? []) {
-    if (tool.namespace) toolNsMap.set(namespacedToolName(tool.namespace, tool.name), { namespace: tool.namespace, name: tool.name });
-    if (tool.freeform) freeformToolNames.add(tool.name);
-    if (tool.toolSearch) toolSearchToolNames.add(tool.name);
+    const wireName = namespacedToolName(tool.namespace, tool.name);
+    if (tool.namespace) toolNsMap.set(wireName, { namespace: tool.namespace, name: tool.name });
+    if (tool.freeform) freeformToolNames.add(wireName);
+    if (tool.toolSearch) toolSearchToolNames.add(wireName);
   }
   return { toolNsMap, freeformToolNames, toolSearchToolNames };
 }
@@ -510,6 +642,18 @@ export async function responseRequest(
   try {
     parsed = parseRequest(expanded);
     route = routeChatGptWebRequest(parsed, config);
+    if (options.compactionContinuationStore) {
+      bindCompactionContinuationStore(parsed, options.compactionContinuationStore);
+    }
+    if (options.goalContinuationStore) {
+      bindGoalContinuationStore(parsed, options.goalContinuationStore);
+    }
+    if (options.nativeUsageInputTokenFloor !== undefined) {
+      if (!Number.isFinite(options.nativeUsageInputTokenFloor) || options.nativeUsageInputTokenFloor < 0) {
+        throw new Error("Native usage input token floor must be a non-negative finite number");
+      }
+      parsed._nativeUsageInputTokenFloor = Math.floor(options.nativeUsageInputTokenFloor);
+    }
     const identity = extractChatGptTurnIdentity(parsed);
     if (identity.threadId && identity.turnId) {
       options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
@@ -534,6 +678,93 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
+  if (
+    !compaction
+    && route.backendModel === CHATGPT_WEB_BACKEND_MODEL
+    && options.transitionCompactionAttempted !== true
+  ) {
+    const limits = resolveChatGptWebContextLimits(
+      route.backendModel,
+      route.adapterEffort,
+      config,
+    );
+    const nativeInputTokens = estimateChatGptWebNativeInputTokens(parsed);
+    if (nativeInputTokens >= limits.autoCompactTokenLimit) {
+      let revision;
+      try {
+        revision = extractChatGptTurnUserRevisionRecord(parsed);
+      } catch (error) {
+        return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+      }
+      const body = parsed._rawBody;
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return formatErrorResponse(400, "invalid_request_error", "Transition compaction requires an object request body");
+      }
+      const sourceBody = body as Record<string, unknown>;
+      const sourceInput = Array.isArray(sourceBody.input) ? sourceBody.input : [];
+      const activeInput = sourceInput[revision.inputIndex];
+      if (activeInput === undefined) {
+        return formatErrorResponse(
+          400,
+          "invalid_request_error",
+          "Transition compaction could not locate the provenance-validated active request in native input.",
+        );
+      }
+
+      const { previous_response_id: _previousResponseId, ...standaloneBody } = sourceBody;
+      const compactHeaders = new Headers(req.headers);
+      compactHeaders.set("content-type", "application/json");
+      const compact = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+        method: "POST",
+        headers: compactHeaders,
+        body: JSON.stringify({ ...standaloneBody, model: route.slug, stream: false }),
+        signal: req.signal,
+      }), config, adapterFactory, {
+        onTurnIdentity: options.onTurnIdentity,
+        compactionContinuationStore: options.compactionContinuationStore,
+        goalContinuationStore: options.goalContinuationStore,
+      });
+      if (!compact.ok) return compact;
+
+      let compacted: { output?: unknown };
+      try {
+        compacted = await compact.json() as { output?: unknown };
+      } catch {
+        return formatErrorResponse(502, "invalid_response_error", "Transition compaction returned invalid JSON");
+      }
+      if (!Array.isArray(compacted.output)) {
+        return formatErrorResponse(502, "invalid_response_error", "Transition compaction returned no replacement history");
+      }
+
+      let replacementInput: unknown[];
+      try {
+        replacementInput = preserveTransitionActiveInput(compacted.output, activeInput);
+      } catch (error) {
+        return formatErrorResponse(502, "invalid_response_error", error instanceof Error ? error.message : String(error));
+      }
+
+      const continuationHeaders = new Headers(req.headers);
+      continuationHeaders.set("content-type", "application/json");
+      return responseRequest(new Request(req.url, {
+        method: "POST",
+        headers: continuationHeaders,
+        body: JSON.stringify({
+          ...standaloneBody,
+          model: route.slug,
+          stream: parsed.stream,
+          input: replacementInput,
+        }),
+        signal: req.signal,
+      }), config, adapterFactory, {
+        ...options,
+        transitionCompactionAttempted: true,
+        // The replacement history above is the authoritative checkpoint. Carrying the source
+        // request's pre-compaction pressure beyond this point makes the new task immediately look
+        // over the auto-compact threshold and can trigger another compaction on the next turn.
+        nativeUsageInputTokenFloor: undefined,
+      });
+    }
+  }
   const compactionItem = compaction && parsed._compactionResponseFormat !== "message";
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
@@ -559,7 +790,7 @@ export async function responseRequest(
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
     const v1Source = extractChatGptCompactionSourceRevision({
       ...parsed,
-      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
+      _rawBody: { ...body, input: routedCompactV1Output(body.input, summary, route, config) },
     });
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
@@ -684,7 +915,7 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
-  options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
+  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "compactionContinuationStore" | "goalContinuationStore"> = {},
 ): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
@@ -794,17 +1025,27 @@ export async function compactRequest(
   if (!summary?.trim()) {
     return formatErrorResponse(502, "invalid_response_error", "Compaction turn produced an empty summary");
   }
-  return Response.json({ output: buildCompactV1Output(extractCompactUserMessages(input), summary) });
+  return Response.json({ output: routedCompactV1Output(input, summary, route, config) });
 }
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    nativeTurnReconnectGraceMs?: number;
+  } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
   const startedAt = Date.now();
+  const compactionContinuationStore = new ChatGptCompactionContinuationStore(
+    join(getConfigDir(), "runtime", "compaction-continuations.json"),
+  );
+  const goalContinuationStore = new ChatGptGoalContinuationStore(
+    join(getConfigDir(), "runtime", "goal-continuations.json"),
+  );
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
   if (config.mode === "full") {
     void turnBroker!.listen().catch(error => {
@@ -821,7 +1062,65 @@ export function startServer(
   let lastModelCatalogResult: {
     request: number; at: string; status: number; failure?: ModelCatalogFailure;
   } | null = null;
-  const httpTurns = new HttpTurnCounter();
+  const nativeTurnReconnectGraceMs = dependencies.nativeTurnReconnectGraceMs ?? 2_000;
+  if (!Number.isFinite(nativeTurnReconnectGraceMs) || nativeTurnReconnectGraceMs < 0) {
+    throw new Error("Native turn reconnect grace must be a non-negative number");
+  }
+  const detachedNativeTurns = new Map<string, ReturnType<typeof setTimeout>>();
+  const nativeTurnKey = (identity: NativeCodexTurnIdentity): string => (
+    `${identity.threadId}\u0000${identity.turnId}`
+  );
+  const clearDetachedNativeTurn = (identity: NativeCodexTurnIdentity): void => {
+    const key = nativeTurnKey(identity);
+    const pending = detachedNativeTurns.get(key);
+    if (!pending) return;
+    clearTimeout(pending);
+    detachedNativeTurns.delete(key);
+  };
+  let httpTurns!: HttpTurnCounter;
+  const scheduleDetachedNativeTurn = (
+    identity: NativeCodexTurnIdentity,
+    endpoint: HttpTrackedEndpoint,
+  ): void => {
+    if (endpoint !== "responses" && endpoint !== "compact") return;
+    clearDetachedNativeTurn(identity);
+    const key = nativeTurnKey(identity);
+    const timer = setTimeout(() => {
+      if (detachedNativeTurns.get(key) !== timer) return;
+      detachedNativeTurns.delete(key);
+      // An exact reconnect reclaimed the same native turn. Its next disconnect will arm a fresh
+      // grace window; never cancel a currently connected observer because an older socket vanished.
+      if (httpTurns.hasConnectedTurn(identity)) return;
+      const reason = new DOMException("Codex turn observer disconnected without reconnect", "AbortError");
+      const browserCancellation = chatGptTurnSessions.cancelNativeTurn(
+        identity.threadId,
+        identity.turnId,
+        reason,
+      );
+      const compactionCancellation = cancelStructuredCompactionNativeTurn(
+        identity.threadId,
+        identity.turnId,
+        reason,
+      );
+      void Promise.allSettled([
+        browserCancellation.settlement,
+        compactionCancellation.settlement,
+      ]).then(results => {
+        for (const result of results) {
+          if (result.status === "rejected") {
+            console.error(
+              `[chatgpt-web] detached native turn cleanup failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+            );
+          }
+        }
+      });
+    }, nativeTurnReconnectGraceMs);
+    detachedNativeTurns.set(key, timer);
+  };
+  httpTurns = new HttpTurnCounter(reportHttpStreamFailure, {
+    onIdentityBound: identity => clearDetachedNativeTurn(identity),
+    onClientDetached: scheduleDetachedNativeTurn,
+  });
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
@@ -844,6 +1143,8 @@ export function startServer(
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
+          responses_transport: "http-sse",
+          websocket_negotiation: "http-426-expected",
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
@@ -852,6 +1153,7 @@ export function startServer(
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
           model_catalog_requests: modelCatalogRequests,
           last_model_catalog_result: lastModelCatalogResult,
+          tooling: turnBroker?.toolingHealth() ?? { status: "not_configured" },
           ...activity(),
         });
       }
@@ -1048,7 +1350,11 @@ export function startServer(
       if (req.method === "GET" && url.pathname === "/v1/responses") {
         return new Response("Responses WebSocket transport is not enabled on this local route", {
           status: 426,
-          headers: { "content-type": "text/plain; charset=utf-8" },
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "x-codex-responses-transport": "http-sse",
+          },
         });
       }
       if (req.method === "POST" && url.pathname === "/v1/responses") {
@@ -1058,7 +1364,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, compactionContinuationStore, goalContinuationStore },
           ),
           req.signal,
           process.platform,
@@ -1072,7 +1378,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, compactionContinuationStore, goalContinuationStore },
           ),
           req.signal,
           process.platform,

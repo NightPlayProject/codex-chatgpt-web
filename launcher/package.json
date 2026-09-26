@@ -1,17 +1,18 @@
 {
   "name": "codex-web-gpt-launcher",
-  "version": "6.1.0",
+  "version": "6.1.0-test.2",
   "private": true,
   "description": "Desktop control center for Codex ChatGPT Web",
   "author": "miuuyy",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
-    "dev": "bun run scripts/dev.cjs",
+    "dev": "bun run build:metal && bun run scripts/dev.cjs",
     "audit": "bun audit",
     "typecheck": "tsc --noEmit",
     "build:renderer": "vite build",
-    "build": "bun run typecheck && bun run build:renderer",
+    "build:metal": "bun run scripts/build-metal-send.cjs",
+    "build": "bun run build:metal && bun run typecheck && bun run build:renderer",
     "build:runtime": "bun run scripts/prepare-runtime.cjs",
     "package": "bun run build && bun run build:runtime && bun run scripts/package.cjs",
     "package:mac": "bun run build && bun run build:runtime && bun run scripts/package.cjs --mac",
@@ -22,6 +23,7 @@
     "start": "electron ."
   },
   "dependencies": {
+    "metal-fx": "2.0.10",
     "motion": "^12.42.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
@@ -38,7 +40,8 @@
   },
   "overrides": {
     "@xmldom/xmldom": "0.8.15",
-    "fast-uri": "3.1.6"
+    "fast-uri": "3.1.6",
+    "js-yaml": "4.3.2"
   },
   "build": {
     "appId": "dev.codexwebgpt.launcher",
@@ -54,6 +57,7 @@
     "files": [
       "dist/**",
       "electron/**",
+      "wallpapers/**",
       "assets/icon.png",
       "assets/linux-appimage-runner.sh",
       "package.json"
@@ -62,6 +66,10 @@
       {
         "from": "build/runtime",
         "to": "runtime"
+      },
+      {
+        "from": "native/open-computer-use",
+        "to": "native/open-computer-use"
       }
     ],
     "mac": {

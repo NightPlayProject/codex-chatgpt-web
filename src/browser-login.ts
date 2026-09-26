@@ -184,7 +184,11 @@ export async function inspectBrowserLoginCapabilities(config: AppConfig): Promis
   if (!browserLoginStateExists(config)) throw new Error("ChatGPT login state is missing or unverified");
   const inspected = await inspectStoredState(config, config.storageStatePath);
   writeVerificationMarker(config.storageStatePath, inspected);
-  return { solAvailable: inspected.solAvailable, extraHighAvailable: inspected.extraHighAvailable, proAvailable: inspected.proAvailable };
+  return {
+    solAvailable: inspected.solAvailable,
+    extraHighAvailable: inspected.extraHighAvailable,
+    proAvailable: inspected.proAvailable,
+  };
 }
 
 export function storedBrowserLoginCapabilities(

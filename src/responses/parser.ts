@@ -10,10 +10,17 @@ import type {
   CodexThinkingContent,
   CodexTool,
   CodexToolCall,
+  CodexUserMessage,
 } from "../types";
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
-import { compactionItemToText, isNativeTextCompaction } from "./compaction";
+import {
+  compactionItemToText,
+  isNativeTextCompaction,
+  isNativeGoalContextItem,
+  isOnePixelPngDataUrl,
+  isReadableCompactionSummaryText,
+} from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 
@@ -27,7 +34,114 @@ type InputBlock =
   | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
   | { type: "input_file"; file_id?: string; filename?: string };
 
-function inputContentParts(blocks: unknown[] | string | undefined): string | CodexContentPart[] {
+const PRE_COMPACTION_IMAGE_NOTE =
+  "[pre-compaction image not reattached; rely on the compaction summary for retained visual context]";
+/** Keep only a small exact source as native-goal history; larger sources are represented by the checkpoint. */
+const REMOTE_V2_GOAL_LINEAGE_MAX_CHARS = 2_000 * 4;
+
+function inputBlocksText(blocks: unknown[] | string | undefined): string {
+  if (typeof blocks === "string") return blocks;
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .filter((block): block is { type: "input_text" | "text"; text: string } => (
+      isObj(block)
+      && (block.type === "input_text" || block.type === "text")
+      && typeof block.text === "string"
+    ))
+    .map(block => block.text)
+    .join("");
+}
+
+function latestCompactionBoundaryIndex(input: readonly unknown[]): number {
+  let boundary = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    const effectiveType = typeof item.type === "string"
+      ? item.type
+      : "role" in item
+        ? "message"
+        : undefined;
+    if (
+      effectiveType === "compaction"
+      || effectiveType === "compaction_summary"
+      || effectiveType === "context_compaction"
+    ) {
+      boundary = index;
+      continue;
+    }
+    if (
+      effectiveType === "message"
+      && item.role === "user"
+      && isReadableCompactionSummaryText(inputBlocksText(item.content as unknown[] | string | undefined))
+    ) {
+      boundary = index;
+    }
+  }
+  return boundary;
+}
+
+/**
+ * Remote v2 compaction keeps the source items on the native wire next to a special compaction
+ * item, but that item semantically replaces the earlier model history. Routed providers cannot
+ * send the special item to ChatGPT directly, so replay only its decoded checkpoint plus items that
+ * follow it. Keep the raw request untouched: revision/continuation authorization still hashes the
+ * exact native source there.
+ *
+ * V1 is intentionally different: its replacement history already contains a deliberately bounded
+ * set of recent user messages followed by a readable summary message, so those retained messages
+ * must remain visible to the routed model.
+ */
+function latestRemoteV2CompactionBoundaryIndex(input: readonly unknown[]): number {
+  let boundary = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    if (item.type === "compaction" || item.type === "compaction_summary") {
+      boundary = index;
+      continue;
+    }
+    if (item.type === "context_compaction" && typeof item.encrypted_content === "string") {
+      boundary = index;
+    }
+  }
+  return boundary;
+}
+
+function remoteV2GoalLineageInputIndex(input: readonly unknown[], boundary: number): number {
+  if (boundary < 0 || !input.slice(boundary + 1).some(isNativeGoalContextItem)) return -1;
+  for (let index = boundary - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!isObj(item)) continue;
+    const effectiveType = typeof item.type === "string"
+      ? item.type
+      : "role" in item
+        ? "message"
+        : undefined;
+    if (effectiveType !== "message" || item.role !== "user" || isNativeGoalContextItem(item)) continue;
+    const metadata = isObj(item.internal_chat_message_metadata_passthrough)
+      ? item.internal_chat_message_metadata_passthrough
+      : undefined;
+    const kinds = metadata?.content_item_kinds;
+    if (Array.isArray(kinds) && kinds.length > 0
+      && !kinds.some(kind => kind === "user.text")) continue;
+    const text = inputBlocksText(item.content as unknown[] | string | undefined);
+    // The helper is a type predicate because most callers pass unknown input. Here `text` is
+    // already known to be a string, so pass it as unknown to avoid narrowing the false branch to
+    // `never` while preserving the same runtime check.
+    if (isReadableCompactionSummaryText(text as unknown)) continue;
+    // The newest real human source is the authorization lineage. Never fall back to an older,
+    // smaller prompt when this source is large; its exact identity remains in _rawBody and the
+    // checkpoint is the browser-safe semantic representation.
+    return text.length <= REMOTE_V2_GOAL_LINEAGE_MAX_CHARS ? index : -1;
+  }
+  return -1;
+}
+
+function inputContentParts(
+  blocks: unknown[] | string | undefined,
+  omitImages = false,
+): string | CodexContentPart[] {
   if (typeof blocks === "string") return blocks;
   if (!blocks) return [];
   const parts: CodexContentPart[] = [];
@@ -38,6 +152,11 @@ function inputContentParts(blocks: unknown[] | string | undefined): string | Cod
     } else if (block.type === "input_image") {
       const b = block as { image_url?: string; file_id?: string; detail?: string };
       if (b.image_url) {
+        if (omitImages) {
+          if (isOnePixelPngDataUrl(b.image_url)) continue;
+          parts.push({ type: "text", text: PRE_COMPACTION_IMAGE_NOTE });
+          continue;
+        }
         // Preserve the image as a structured part — adapters send it as a native image block.
         // NEVER inline the (often base64 data-URL) image_url as text: that explodes the token count.
         parts.push({ type: "image", imageUrl: b.image_url, ...(b.detail ? { detail: normalizeImageDetail(b.detail) } : {}) });
@@ -99,7 +218,14 @@ function mapToolChoice(value: unknown): CodexRequestOptions["toolChoice"] {
 
 function allowedToolName(tool: unknown): string | undefined {
   if (!isObj(tool)) return undefined;
-  if (typeof tool.name === "string" && tool.name.length > 0) return tool.name;
+  if (typeof tool.name === "string" && tool.name.length > 0) {
+    const namespace = typeof tool.namespace === "string"
+      && tool.namespace.length > 0
+      && tool.namespace !== DEFAULT_FUNCTION_NAMESPACE
+      ? tool.namespace
+      : undefined;
+    return namespacedToolName(namespace, tool.name);
+  }
   if (tool.type === "web_search" || tool.type === "web_search_preview") return "web_search";
   if (tool.type === "tool_search") return "tool_search";
   return undefined;
@@ -137,20 +263,115 @@ function normalizedToolNamespace(value: unknown): string | undefined {
     : undefined;
 }
 
-function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
-  if (!tools) return undefined;
+/**
+ * Codex has emitted tool collections as arrays, namespace descriptors with an array of children,
+ * and object maps across Responses and Responses Lite revisions. Preserve map keys when a
+ * descriptor omits its name; those keys are often the only exact wire name available for a native
+ * MCP or Computer Use tool.
+ *
+ * A newer native registry shape nests a namespace directly as a map, for example:
+ * `{ "Microsoft.windows.Computer": { "get_app_state": { ... } } }`.
+ * Treat that outer key as a namespace instead of manufacturing a zero-argument function named
+ * `Microsoft.windows.Computer`. This keeps every child callable while retaining punctuation in the
+ * exact namespace and wire name.
+ */
+function toolContainerEntries(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter(isObj);
+  if (!isObj(value)) return [];
+
+  const looksLikeDescriptor = typeof value.type === "string"
+    || typeof value.name === "string"
+    || typeof value.description === "string"
+    || "tools" in value
+    || "parameters" in value
+    || "input_schema" in value
+    || "inputSchema" in value
+    || "schema" in value
+    || "format" in value;
+  if (looksLikeDescriptor) return [value];
+
+  return Object.entries(value).flatMap(([key, raw]) => {
+    if (Array.isArray(raw)) {
+      return [{ type: "namespace", name: key, tools: raw }];
+    }
+    if (!isObj(raw)) return [];
+    const rawLooksLikeDescriptor = typeof raw.type === "string"
+      || typeof raw.name === "string"
+      || typeof raw.description === "string"
+      || "tools" in raw
+      || "parameters" in raw
+      || "input_schema" in raw
+      || "inputSchema" in raw
+      || "schema" in raw
+      || "format" in raw;
+    if (!rawLooksLikeDescriptor) {
+      return [{ type: "namespace", name: key, tools: raw }];
+    }
+    const entry = { ...raw };
+    // Namespace maps use the key as the namespace and retain an explicitly supplied child name.
+    // Direct tool maps use the key as the exact callable wire name.
+    if (entry.type === "namespace" || "tools" in entry) {
+      if (typeof entry.name !== "string" || entry.name.length === 0) entry.name = key;
+    } else {
+      entry.name = key;
+    }
+    return [entry];
+  });
+}
+
+function markToolSpecSource(
+  entries: Record<string, unknown>[],
+  source: Exclude<NonNullable<CodexTool["source"]>, "declared">,
+): Record<string, unknown>[] {
+  return entries.map(entry => ({ ...entry, __codexSource: source }));
+}
+
+function toolSpecsFromWireContainer(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.flatMap(item => {
+      if (isObj(item) && (item.type === "additional_tools" || item.type === "tool_search_output")) {
+        return toolContainerEntries(item.tools);
+      }
+      return isObj(item) ? [item] : [];
+    });
+  }
+  if (isObj(value) && (value.type === "additional_tools" || value.type === "tool_search_output")) {
+    return toolContainerEntries(value.tools);
+  }
+  return toolContainerEntries(value);
+}
+
+type CodexToolSource = NonNullable<CodexTool["source"]>;
+
+function toolSource(value: unknown, fallback: CodexToolSource): CodexToolSource {
+  return value === "declared" || value === "additional_tools" || value === "tool_search_output"
+    ? value
+    : fallback;
+}
+
+function buildTools(tools: unknown, defaultSource: CodexToolSource = "declared"): CodexTool[] | undefined {
+  const entries = toolContainerEntries(tools);
+  if (entries.length === 0) return undefined;
   const out: CodexTool[] = [];
-  const pushFn = (t: Record<string, unknown>, namespace?: string) => {
+  const parametersOf = (t: Record<string, unknown>): Record<string, unknown> => {
+    const value = [t.parameters, t.inputSchema, t.input_schema, t.schema]
+      .find(candidate => isObj(candidate));
+    return (value ?? {}) as Record<string, unknown>;
+  };
+  const pushFn = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
     const tool: CodexTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
-      parameters: (t.parameters ?? {}) as Record<string, unknown>,
+      parameters: parametersOf(t),
+      source,
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
     if (namespace) tool.namespace = namespace;
+    if (t.freeform === true) tool.freeform = true;
+    if (t.toolSearch === true) tool.toolSearch = true;
     out.push(tool);
   };
-  const pushFreeform = (t: Record<string, unknown>) => {
+  const pushFreeform = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
     const tool: CodexTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
@@ -165,57 +386,69 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
         required: ["input"],
       },
       freeform: true,
+      source,
     };
+    if (namespace) tool.namespace = namespace;
     out.push(tool);
   };
-  for (const t of tools) {
-    if (!isObj(t)) continue;
-    if (t.type === "function" && typeof t.name === "string") {
-      pushFn(t);
-    } else if (t.type === "namespace" && Array.isArray(t.tools)) {
-      // Responses Lite groups ordinary native functions and the native freeform `exec` tool under
-      // the default `functions` namespace. Flatten normal functions from every namespace, and the
-      // official freeform variant only from that default namespace. Non-default custom namespaces
-      // need a distinct round-trip contract and must not be silently exposed as function calls.
-      const ns = normalizedToolNamespace(t.name);
-      for (const inner of t.tools as unknown[]) {
-        if (!isObj(inner) || typeof inner.name !== "string") continue;
-        if (inner.type === "function") pushFn(inner, ns);
-        else if (t.name === DEFAULT_FUNCTION_NAMESPACE && inner.type === "custom") pushFreeform(inner);
-      }
+  const pushToolSearch = (t: Record<string, unknown>, namespace: string | undefined, source: CodexToolSource) => {
+    const tool: CodexTool = {
+      name: typeof t.name === "string" && t.name.length > 0 ? t.name : "tool_search",
+      description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
+      parameters: (parametersOf(t) && Object.keys(parametersOf(t)).length > 0 ? parametersOf(t) : {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query for tools to load." },
+          limit: { type: "number", description: "Maximum number of tools to return." },
+        },
+        required: ["query"],
+      }) as Record<string, unknown>,
+      toolSearch: true,
+      source,
+    };
+    if (namespace) tool.namespace = namespace;
+    out.push(tool);
+  };
+  const append = (
+    t: Record<string, unknown>,
+    inheritedNamespace?: string,
+    inheritedSource: CodexToolSource = defaultSource,
+  ): void => {
+    const source = toolSource(t.__codexSource, inheritedSource);
+    if (t.type === "namespace") {
+      const namespace = normalizedToolNamespace(t.name) ?? inheritedNamespace;
+      for (const inner of toolContainerEntries(t.tools)) append(inner, namespace, source);
+      return;
     }
-    else if (t.type === "custom" && typeof t.name === "string") {
+
+    const namespace = normalizedToolNamespace(t.namespace) ?? inheritedNamespace;
+    if (t.toolSearch === true || t.type === "tool_search") {
+      // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
+      // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
+      pushToolSearch(t, namespace, source);
+      return;
+    }
+
+    const name = typeof t.name === "string" && t.name.length > 0 ? t.name : undefined;
+    if (!name) return;
+    if (t.freeform === true || t.type === "custom"
+      || (isObj(t.format) && t.format.type === "grammar")) {
       // Freeform custom tool (e.g. apply_patch). Chat models can't emit a lark grammar, so expose a
       // function with a single string `input` carrying the raw tool body; the bridge relays the model's
       // call back as a custom_tool_call (Codex's freeform handler rejects a function_call → fatal abort).
-      pushFreeform(t);
-    }
-    else if (t.type === "tool_search") {
-      // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
-      // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
-      out.push({
-        name: "tool_search",
-        description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: (isObj(t.parameters) ? t.parameters : {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Search query for tools to load." },
-            limit: { type: "number", description: "Maximum number of tools to return." },
-          },
-          required: ["query"],
-        }) as Record<string, unknown>,
-        toolSearch: true,
-      });
-    }
-    else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
+      pushFreeform(t, namespace, source);
+    } else if (t.type === "function") {
+      pushFn(t, namespace, source);
+    } else if (t.type !== "web_search" && t.type !== "image_generation") {
       // Any other named tool (for example a native computer-use tool type this parser does not
       // model) is client-executed. Pass it through as a function so the routed model can call it
       // naturally and the bridge can relay it as a function_call.
-      pushFn(t);
+      pushFn(t, namespace, source);
     }
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
     // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
-  }
+  };
+  for (const t of entries) append(t);
   return out.length > 0 ? out : undefined;
 }
 
@@ -232,7 +465,10 @@ function ensureAssistantPlaceholder(messages: CodexMessage[], modelId: string, n
  * `input_image` items): returns content parts when any image is present, else a plain joined string.
  * Never inlines an image_url as text (that would explode the token count).
  */
-function outputToToolResultContent(output: string | unknown[] | undefined): string | CodexContentPart[] {
+function outputToToolResultContent(
+  output: string | unknown[] | undefined,
+  omitImages = false,
+): string | CodexContentPart[] {
   if (typeof output === "string") return output;
   if (!Array.isArray(output)) return "";
   const parts: CodexContentPart[] = [];
@@ -244,8 +480,13 @@ function outputToToolResultContent(output: string | unknown[] | undefined): stri
     } else if (raw.type === "refusal" && typeof raw.refusal === "string") {
       parts.push({ type: "text", text: `[refusal: ${raw.refusal}]` });
     } else if (raw.type === "input_image" && typeof raw.image_url === "string") {
-      parts.push({ type: "image", imageUrl: raw.image_url, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
-      hasImage = true;
+      if (omitImages) {
+        if (isOnePixelPngDataUrl(raw.image_url)) continue;
+        parts.push({ type: "text", text: PRE_COMPACTION_IMAGE_NOTE });
+      } else {
+        parts.push({ type: "image", imageUrl: raw.image_url, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
+        hasImage = true;
+      }
     } else if (raw.type === "encrypted_content") {
       // codex-rs FunctionCallOutputContentItem::EncryptedContent — opaque to routed models.
       parts.push({ type: "text", text: "[encrypted content omitted]" });
@@ -276,8 +517,46 @@ function findToolById(messages: CodexMessage[], callId: string): { name: string;
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
+function nativeMessageSource(
+  value: unknown,
+  inputIndex: number,
+): { _sourceInputIndex: number; _sourceItemId?: string; _sourceTurnId?: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { _sourceInputIndex: inputIndex };
+  const item = value as Record<string, unknown>;
+  const metadata = item.internal_chat_message_metadata_passthrough;
+  const turnId = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as { turn_id?: unknown }).turn_id
+    : undefined;
+  return {
+    _sourceInputIndex: inputIndex,
+    ...(typeof item.id === "string" && item.id.length > 0 ? { _sourceItemId: item.id } : {}),
+    ...(typeof turnId === "string" && turnId.length > 0 ? { _sourceTurnId: turnId } : {}),
+  };
+}
+
+function attachNativeMessageSource<T extends CodexUserMessage | CodexAgentMessage>(
+  message: T,
+  value: unknown,
+  inputIndex: number,
+): T {
+  const source = nativeMessageSource(value, inputIndex);
+  for (const [key, fieldValue] of Object.entries(source)) {
+    Object.defineProperty(message, key, {
+      value: fieldValue,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return message;
+}
+
 export function parseRequest(body: unknown): CodexParsedRequest {
   const replayedInputPrefixLength = previousResponseReplayPrefixLength(body);
+  // Zod deliberately normalizes public Responses items and strips unknown passthrough fields from
+  // ordinary user messages. Native provenance metadata lives on the untouched wire item, so keep a
+  // positional view of the raw input for authoritative classifications such as goal.internal_context.
+  const rawInput = isObj(body) && Array.isArray(body.input) ? body.input : undefined;
   const parsed = responsesRequestSchema.safeParse(body);
   if (!parsed.success) {
     throw new Error(`responses parse error: ${parsed.error.message}`);
@@ -313,7 +592,22 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   if (typeof data.input === "string") {
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
-    for (const item of data.input) {
+    const compactionBoundaryIndex = latestCompactionBoundaryIndex(data.input);
+    const remoteV2CompactionBoundaryIndex = latestRemoteV2CompactionBoundaryIndex(data.input);
+    const remoteV2GoalLineageIndex = remoteV2GoalLineageInputIndex(
+      rawInput ?? data.input,
+      remoteV2CompactionBoundaryIndex,
+    );
+    for (let itemIndex = 0; itemIndex < data.input.length; itemIndex += 1) {
+      const item = data.input[itemIndex]!;
+      // A completed compaction checkpoint semantically replaces the earlier visual history. Keep
+      // the canonical native items for provenance and textual replay, but do not physically upload
+      // their images into each fresh ChatGPT Temporary Chat. Only images introduced after the most
+      // recent checkpoint are new browser attachments.
+      const omitHistoricalImages = compactionBoundaryIndex >= 0 && itemIndex < compactionBoundaryIndex;
+      const omitRemoteV2History = remoteV2CompactionBoundaryIndex >= 0
+        && itemIndex < remoteV2CompactionBoundaryIndex
+        && itemIndex !== remoteV2GoalLineageIndex;
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
@@ -328,8 +622,22 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // merge through the exact buildTools path so surface detection (collabSurface)
         // and chat-model tool listing see them. The item itself never becomes a message;
         // the native passthrough keeps it verbatim in _rawBody.
-        const at = item as { tools?: unknown[] };
-        if (Array.isArray(at.tools)) loadedToolSpecs.push(...at.tools);
+        const at = item as { tools?: unknown };
+        loadedToolSpecs.push(...markToolSpecSource(toolSpecsFromWireContainer(at.tools), "additional_tools"));
+        continue;
+      }
+
+      if (omitRemoteV2History) {
+        // Deferred tool declarations are capability state rather than conversation history. Keep
+        // them available after compaction, but do not replay the old tool-search transcript.
+        if (effectiveType === "tool_search_output") {
+          const out = item as { tools?: unknown };
+          loadedToolSpecs.push(...markToolSpecSource(
+            toolSpecsFromWireContainer(out.tools),
+            "tool_search_output",
+          ));
+        }
+        pendingReasoning.length = 0;
         continue;
       }
 
@@ -342,11 +650,11 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         const encrypted = (item as { encrypted_content?: unknown }).encrypted_content;
         if (effectiveType === "context_compaction" && typeof encrypted !== "string") continue;
         pendingReasoning.length = 0;
-        messages.push({
+        messages.push(attachNativeMessageSource<CodexUserMessage>({
           role: "user",
           content: compactionItemToText(typeof encrypted === "string" ? encrypted : undefined),
           timestamp: now,
-        });
+        }, rawInput?.[itemIndex] ?? item, itemIndex));
         continue;
       }
 
@@ -363,18 +671,19 @@ export function parseRequest(body: unknown): CodexParsedRequest {
 
         const content = inputContentParts(
           agentMessage.content as unknown[] | string | undefined,
+          omitHistoricalImages,
         );
 
         // An agent_message is external input delivered to the parent agent. Keep its distinct
         // role and routing metadata so Web history remains semantically equivalent to Responses.
         pendingReasoning.length = 0;
-        const message: CodexAgentMessage = {
+        const message = attachNativeMessageSource<CodexAgentMessage>({
           role: "agentMessage",
           ...(typeof agentMessage.author === "string" ? { author: agentMessage.author } : {}),
           ...(typeof agentMessage.recipient === "string" ? { recipient: agentMessage.recipient } : {}),
           content,
           timestamp: now,
-        };
+        }, rawInput?.[itemIndex] ?? item, itemIndex);
         messages.push(message);
 
         continue;
@@ -390,19 +699,36 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         switch (msg.role) {
           case "system": {
             pendingReasoning.length = 0;
-            const text = inputContentParts(msg.content as unknown[] | string | undefined);
+            const text = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
             const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
             if (flat.length > 0) systemPrompt.push(flat);
             break;
           }
-          case "user":
+          case "user": {
+            // `/goal` is emitted by native Codex as a user-role runtime item. Keep its exact wire
+            // metadata in `_rawBody` for lineage validation, but never serialize its body into the
+            // ChatGPT task envelope as if a human had written it. Mixed/unknown native kinds remain
+            // ordinary user input and therefore fail closed instead of being dropped by text shape.
+            if (isNativeGoalContextItem(rawInput?.[itemIndex] ?? item)) {
+              pendingReasoning.length = 0;
+              break;
+            }
+            pendingReasoning.length = 0;
+            const content = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
+            const kinds = msg.internal_chat_message_metadata_passthrough?.content_item_kinds;
+            const selectedSkill = kinds?.length === 1 && kinds[0] === "skills.selected_skill_instructions";
+            messages.push(attachNativeMessageSource<CodexUserMessage>({
+              role: "user",
+              ...(selectedSkill ? { origin: "codex_skill" as const } : {}),
+              content,
+              timestamp: now,
+            }, rawInput?.[itemIndex] ?? item, itemIndex));
+            break;
+          }
           case "developer": {
             pendingReasoning.length = 0;
-            const content = inputContentParts(msg.content as unknown[] | string | undefined);
-            const kinds = msg.internal_chat_message_metadata_passthrough?.content_item_kinds;
-            const selectedSkill = msg.role === "user" && kinds?.length === 1
-              && kinds[0] === "skills.selected_skill_instructions";
-            messages.push({ role: msg.role, content, timestamp: now, ...(selectedSkill ? { origin: "codex_skill" as const } : {}) });
+            const content = inputContentParts(msg.content as unknown[] | string | undefined, omitHistoricalImages);
+            messages.push({ role: "developer", content, timestamp: now });
             break;
           }
           case "assistant": {
@@ -529,22 +855,12 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       if (effectiveType === "tool_search_output") {
         pendingReasoning.length = 0;
         // Pair the tool_search call with its result so the model sees what was loaded.
-        const out = item as { call_id?: string; status?: string; tools?: unknown[] };
-        const specs = Array.isArray(out.tools) ? (out.tools as Record<string, unknown>[]) : [];
-        loadedToolSpecs.push(...specs);
+        const out = item as { call_id?: string; status?: string; tools?: unknown };
+        const specs = toolSpecsFromWireContainer(out.tools);
+        loadedToolSpecs.push(...markToolSpecSource(specs, "tool_search_output"));
         // List the EXACT wire names the model must call (flattened for namespaced specs), matching
         // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
-        const wireNames: string[] = [];
-        for (const spec of specs) {
-          if (spec.type === "namespace" && Array.isArray(spec.tools)) {
-            const namespace = normalizedToolNamespace(spec.name);
-            for (const inner of spec.tools as Record<string, unknown>[]) {
-              if (typeof inner.name === "string") wireNames.push(namespacedToolName(namespace, inner.name));
-            }
-          } else if (typeof spec.name === "string") {
-            wireNames.push(spec.name);
-          }
-        }
+        const wireNames = (buildTools(specs) ?? []).map(tool => namespacedToolName(tool.namespace, tool.name));
         const failed = typeof out.status === "string" && out.status !== "completed" && out.status !== "success";
         messages.push({
           role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
@@ -565,7 +881,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
-          content: outputToToolResultContent(output.output), isError: false, timestamp: now,
+          content: outputToToolResultContent(output.output, omitHistoricalImages), isError: false, timestamp: now,
         });
         continue;
       }
@@ -579,13 +895,29 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
           // Same payload shape as function_call_output (codex-rs FunctionCallOutputPayload):
           // string or content items — normalize arrays instead of leaking raw wire blocks.
-          content: outputToToolResultContent(output.output), isError: false, timestamp: now,
+          content: outputToToolResultContent(output.output, omitHistoricalImages), isError: false, timestamp: now,
         });
       }
     }
   }
 
-  const declaredTools = buildTools(data.tools as unknown[] | undefined) ?? [];
+  // Preserve clients that send deferred tool declarations as top-level Responses Lite fields.
+  // They are merged through the same exact flattening and provenance path as input items.
+  const topLevelBody = data as typeof data & { additional_tools?: unknown; tool_search_output?: unknown };
+  if (topLevelBody.additional_tools !== undefined) {
+    loadedToolSpecs.push(...markToolSpecSource(
+      toolSpecsFromWireContainer(topLevelBody.additional_tools),
+      "additional_tools",
+    ));
+  }
+  if (topLevelBody.tool_search_output !== undefined) {
+    loadedToolSpecs.push(...markToolSpecSource(
+      toolSpecsFromWireContainer(topLevelBody.tool_search_output),
+      "tool_search_output",
+    ));
+  }
+
+  const declaredTools = buildTools(data.tools) ?? [];
   const loadedTools = buildTools(loadedToolSpecs) ?? [];
   const seenTools = new Set<string>();
   const mergedTools = [...declaredTools, ...loadedTools]

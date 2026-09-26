@@ -3,9 +3,24 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import {
+  chatGptEnvironmentContextCarriesFilesystemAuthority,
+  chatGptTurnUserRevisionHistory,
+  extractChatGptCompactionSourceRevision,
+  extractChatGptTurnEnvironment,
+  extractChatGptTurnIdentity,
+  extractChatGptTurnUserRevision,
+} from "../src/adapters/chatgpt-web/environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
-import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import {
+  bindCompactionContinuationStore,
+  ChatGptCompactionContinuationStore,
+  rememberCompactionContinuation,
+} from "../src/adapters/chatgpt-web/compaction-continuation";
+import {
+  bindGoalContinuationStore,
+  ChatGptGoalContinuationStore,
+} from "../src/adapters/chatgpt-web/goal-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
@@ -78,6 +93,39 @@ function currentWire(
     },
   };
 }
+
+test("native user-role context kinds are not human revisions, while user.text markup remains a revision", () => {
+  const metadata = { thread_id: "thread_native_context_kinds", turn_id: "turn_native_context_kinds" };
+  const human = {
+    type: "message", role: "user", id: "msg_human_revision",
+    content: [{ type: "input_text", text: "Continue the implementation" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: "turn_human_revision", content_item_kinds: ["user.text"],
+    },
+  };
+  const nativeContext = {
+    type: "message", role: "user", id: "msg_native_context",
+    content: [{ type: "input_text", text: "<recommended_plugins>Example plugin</recommended_plugins>" }],
+    internal_chat_message_metadata_passthrough: {
+      turn_id: metadata.turn_id, content_item_kinds: ["plugins.recommendations"],
+    },
+  };
+  const parsed = {
+    modelId: "gpt-5.6-sol", stream: false, context: { messages: [] }, options: { reasoning: "high" },
+    _rawBody: {
+      input: [human, nativeContext],
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+    },
+  } as CodexParsedRequest;
+  expect(chatGptTurnUserRevisionHistory(parsed)).toEqual([{
+    turnId: "turn_human_revision", itemId: human.id, content: human.content,
+  }]);
+
+  nativeContext.internal_chat_message_metadata_passthrough.content_item_kinds = ["user.text"];
+  expect(chatGptTurnUserRevisionHistory(parsed).at(-1)).toEqual({
+    turnId: metadata.turn_id, itemId: nativeContext.id, content: nativeContext.content,
+  });
+});
 
 describe("trusted current Codex environment envelope", () => {
   test("native cross-task messages keep their instruction, environment and compaction source", () => {
@@ -706,6 +754,91 @@ describe("permission_profile sandbox detection (Codex CLI 0.146+)", () => {
 });
 
 describe("trusted Codex task environment continuity", () => {
+  test("operational-only environment deltas reuse same-thread authority without weakening filesystem checks", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    const first = currentWire();
+    expect(store.resolve(first).cwd).toBe(root);
+
+    const operationalOnly = currentWire({
+      environmentXml: "<environment_context><local_time>2026-09-10T12:49-05:00</local_time><timezone>America/Chicago</timezone></environment_context>",
+    });
+    const metadata = JSON.parse(
+      (operationalOnly._rawBody as { client_metadata: Record<string, string> })
+        .client_metadata["x-codex-turn-metadata"]!,
+    );
+    metadata.turn_id = "turn_operational_delta";
+    (operationalOnly._rawBody as { client_metadata: Record<string, string> })
+      .client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+
+    expect(chatGptEnvironmentContextCarriesFilesystemAuthority(
+      (operationalOnly._rawBody as { input: Array<{ content: Array<{ text: string }> }> }).input[0]!.content[1]!.text,
+    )).toBeFalse();
+    expect(store.resolve(operationalOnly).cwd).toBe(root);
+
+    const firstTurnOperationalOnly = structuredClone(operationalOnly);
+    (firstTurnOperationalOnly._rawBody as { client_metadata: Record<string, string> })
+      .client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, thread_id: "thread_without_authority" });
+    expect(() => new ChatGptThreadEnvironmentStore().resolve(firstTurnOperationalOnly)).toThrow("missing cwd");
+
+    const malformedFilesystemUpdate = currentWire({
+      environmentXml: "<environment_context><cwd/></environment_context>",
+    });
+    expect(chatGptEnvironmentContextCarriesFilesystemAuthority(
+      (malformedFilesystemUpdate._rawBody as { input: Array<{ content: Array<{ text: string }> }> }).input[0]!.content[1]!.text,
+    )).toBeTrue();
+    expect(() => store.resolve(malformedFilesystemUpdate)).toThrow("missing cwd");
+  });
+
+  test("historical filesystem replay can reuse only the exact authenticated thread cache", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    const first = currentWire();
+    expect(store.resolve(first).cwd).toBe(root);
+
+    const replay = currentWire();
+    const replayTools: CodexTool[] = [{ name: "replay_tool", description: "replay", parameters: { type: "object" } }];
+    replay.context.tools = replayTools;
+    const replayBody = replay._rawBody as {
+      client_metadata: Record<string, string>;
+      input: Array<Record<string, unknown>>;
+    };
+    replayBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_current", turn_id: "turn_replay_followup",
+    });
+    const historicalEnvironment = structuredClone(replayBody.input[0]!);
+    historicalEnvironment.id = "msg_historical_environment";
+    historicalEnvironment.internal_chat_message_metadata_passthrough = { turn_id: "turn_old" };
+    replayBody.input = [
+      historicalEnvironment,
+      { type: "message", role: "assistant", id: "msg_old_answer", content: [{ type: "output_text", text: "Done" }] },
+      { type: "message", role: "user", id: "msg_current_followup", content: [{ type: "input_text", text: "Continue" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_replay_followup", content_item_kinds: ["user.text"] } },
+    ];
+
+    expect(store.resolve(replay)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: replayTools,
+    });
+
+    const foreign = structuredClone(replay);
+    const foreignBody = foreign._rawBody as { client_metadata: Record<string, string> };
+    foreignBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_without_cached_authority", turn_id: "turn_foreign_followup",
+    });
+    expect(() => store.resolve(foreign)).toThrow("missing cwd");
+
+    const malformedCurrent = structuredClone(replay);
+    const malformedBody = malformedCurrent._rawBody as { input: Array<Record<string, unknown>> };
+    malformedBody.input.push({
+      type: "message", role: "user", id: "msg_current_bad_environment",
+      content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_replay_followup" },
+    });
+    expect(() => store.resolve(malformedCurrent)).toThrow("missing cwd");
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);
@@ -1252,6 +1385,111 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(request)).toThrow("current turn");
   });
 
+  test("native /goal continuation accepts its current environment only after exact checkpoint authorization", () => {
+    const { codexHome, request } = resumedRootFixture();
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    const checkpointTurnId = "01a06c66-1111-75c6-a0df-318f890ef6de";
+    const summary = "Goal environment checkpoint";
+    const sourceContent = [{ type: "input_text", text: "Continue the original human task" }];
+    const source = { turnId: oldTurnId, itemId: "msg_goal_environment_source", content: sourceContent };
+    const compactionStore = new ChatGptCompactionContinuationStore();
+    const checkpointRequest: CodexParsedRequest = {
+      ...request,
+      _compactionRequest: true,
+      _rawBody: {
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "compaction",
+            thread_id: rolloutThreadId,
+            turn_id: checkpointTurnId,
+            sandbox_mode: "danger-full-access",
+            workspaces: { [root]: {} },
+          }),
+        },
+        input: [{
+          type: "message", role: "user", id: source.itemId, content: sourceContent,
+          internal_chat_message_metadata_passthrough: { turn_id: oldTurnId, content_item_kinds: ["user.text"] },
+        }],
+      },
+    };
+    bindCompactionContinuationStore(checkpointRequest, compactionStore);
+    rememberCompactionContinuation(
+      checkpointRequest,
+      { threadId: rolloutThreadId, turnId: checkpointTurnId },
+      [source],
+      summary,
+    );
+
+    const body = request._rawBody as {
+      client_metadata: Record<string, string>;
+      input: Array<Record<string, unknown>>;
+    };
+    body.input = [
+      {
+        type: "message", role: "user", id: "msg_goal_current_environment",
+        content: [
+          { type: "input_text", text: "<recommended_plugins>runtime only</recommended_plugins>" },
+          { type: "input_text", text: environmentXml },
+        ],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+        },
+      },
+      {
+        type: "message", role: "user", id: source.itemId, content: sourceContent,
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId, content_item_kinds: ["user.text"] },
+      },
+      { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+      {
+        type: "message", role: "user", id: "msg_goal_runtime_environment",
+        content: [{ type: "input_text", text: [
+          '<codex_internal_context source="goal">',
+          "Continue working toward the active thread goal.",
+          "<objective>",
+          "runtime only",
+          "</objective>",
+          "</codex_internal_context>",
+        ].join("\n") }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["goal.internal_context"],
+        },
+      },
+    ];
+    request.context.messages = [{ role: "user", content: "Continue the original human task", timestamp: 1 }];
+    bindCompactionContinuationStore(request, compactionStore);
+    bindGoalContinuationStore(request, new ChatGptGoalContinuationStore());
+
+    const goalEnvironmentStore = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(goalEnvironmentStore.resolve(request)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+
+    const currentEnvironmentPart = body.input[0]!.content as Array<{ type: string; text: string }>;
+    currentEnvironmentPart[1]!.text = "<environment_context><local_time>2026-09-10T12:49-05:00</local_time></environment_context>";
+    expect(goalEnvironmentStore.resolve(request)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+    currentEnvironmentPart[1]!.text = environmentXml;
+
+    const unproven = structuredClone(request);
+    bindCompactionContinuationStore(unproven, compactionStore);
+    bindGoalContinuationStore(unproven, new ChatGptGoalContinuationStore());
+    const unprovenInput = (unproven._rawBody as { input: Array<Record<string, unknown>> }).input;
+    unprovenInput.pop();
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(unproven))
+      .toThrow("missing cwd");
+  });
+
   test("old untagged transcript context cannot block or replace current rollout authority after restart", () => {
     const { codexHome, request } = resumedRootFixture();
     const oldRoot = resolve(root, "previous-workspace");
@@ -1263,6 +1501,115 @@ describe("trusted Codex task environment continuity", () => {
       { type: "message", role: "assistant", id: "old_reply", content: [{ type: "output_text", text: "Completed" }] },
     );
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+  });
+
+  test.each(["goal", "ordinary"])("replayed untagged root environment stays historical during a %s turn", kind => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const historicalEnvironment = {
+      type: "message", role: "user", id: "msg_historical_environment",
+      content: [{ type: "input_text", text: environmentXml }],
+    };
+    const previousTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    const currentInstruction = kind === "goal"
+      ? {
+        type: "message", role: "user", id: "msg_current_goal",
+        content: [{ type: "input_text", text: '<codex_internal_context source="goal"><objective>Continue the task</objective></codex_internal_context>' }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId, content_item_kinds: ["goal.internal_context"],
+        },
+      }
+      : {
+        type: "message", role: "user", id: "msg_current_instruction",
+        content: [{ type: "input_text", text: "Continue the task" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId, content_item_kinds: ["user.text"],
+        },
+      };
+    body.input = [
+      historicalEnvironment,
+      {
+        type: "message", role: "user", id: "msg_previous_instruction",
+        content: [{ type: "input_text", text: "Original task" }],
+        internal_chat_message_metadata_passthrough: { turn_id: previousTurnId, content_item_kinds: ["user.text"] },
+      },
+      currentInstruction,
+    ];
+    const session = { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } };
+    writeFileSync(rolloutPath, [
+      session,
+      { type: "response_item", payload: historicalEnvironment },
+      { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } },
+      childTurnContext(),
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
+    expect(store.resolve(request).cwd).toBe(root);
+
+    // A current malformed update is not a historical message even if the workspace is unchanged.
+    body.input.push({
+      type: "message", role: "user", id: "msg_current_malformed_environment",
+      content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
+    });
+    expect(() => store.resolve(request)).toThrow("missing cwd");
+    body.input.pop();
+    const historicalPart = historicalEnvironment.content[0]!;
+    historicalPart.text = environmentXml.replace(root, resolve(root, "different-workspace"));
+    expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
+  });
+
+  test("proven steering may recover the exact current rollout when contextual user items break environment adjacency", () => {
+    const { codexHome, request } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    body.input = [
+      {
+        type: "message",
+        role: "user",
+        id: "msg_old_abort",
+        content: [{ type: "input_text", text: "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>" }],
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_environment",
+        content: [{ type: "input_text", text: environmentXml }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["environments.environment_context"],
+        },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_plugins",
+        content: [{ type: "input_text", text: "<recommended_plugins>none</recommended_plugins>" }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: rolloutTurnId,
+          content_item_kinds: ["plugins.recommendations"],
+        },
+      },
+      {
+        type: "message",
+        role: "user",
+        id: "msg_current_instruction",
+        content: [{ type: "input_text", text: "Continue with the revised instruction" }],
+        internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId, content_item_kinds: ["user.text"] },
+      },
+    ];
+    request.context.messages = [{ role: "user", content: "Continue with the revised instruction", timestamp: 1 }];
+
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(() => store.resolve(request)).toThrow("missing cwd");
+    expect(store.resolve(request, { allowCurrentFilesystemRolloutRecovery: true })).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
   });
 
   test("a resumed root cannot borrow a child rollout or an earlier turn's authority", () => {

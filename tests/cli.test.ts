@@ -26,6 +26,82 @@ async function runCli(args: string[], env: Record<string, string | undefined>) {
   return { exitCode, stdout, stderr };
 }
 
+async function runCliWithInput(
+  args: string[],
+  env: Record<string, string | undefined>,
+  input: string,
+) {
+  const child = Bun.spawn([
+    process.execPath,
+    resolve(import.meta.dir, "../src/cli.ts"),
+    ...args,
+  ], {
+    env,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (typeof child.stdin === "number" || child.stdin === undefined) {
+    throw new Error("CLI stdin is not writable");
+  }
+  child.stdin.write(input);
+  child.stdin.end();
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+test("Interrupt hook accepts a Windows PowerShell BOM without weakening exact turn identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-hook-bom-"));
+  const appHome = join(root, "app");
+  let observed: { authorization?: string; body?: unknown } = {};
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    observed = {
+      authorization: request.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    };
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "ok", cancelled_http_turns: 0, cancelled_browser_turns: 0 }));
+  });
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(0, "127.0.0.1", () => resolveListen());
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Interrupt hook test server did not bind a TCP port");
+    mkdirSync(appHome, { recursive: true });
+    const config = { ...defaultConfig("browser-only"), host: "127.0.0.1", port: address.port };
+    writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+
+    const threadId = "01a08451-a829-7863-ab3c-788946dac8f2";
+    const turnId = "01a08451-a839-7e13-bab2-f249bc56900d";
+    const result = await runCliWithInput([
+      "--home", appHome, "hook", "interrupt",
+    ], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    }, `\uFEFF${JSON.stringify({
+      hook_event_name: "Interrupt",
+      session_id: threadId,
+      turn_id: turnId,
+    })}\r\n`);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(observed.authorization).toBe(`Bearer ${config.controlToken}`);
+    expect(observed.body).toEqual({ threadId, turnId });
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("production and DEV setup reject the removed connector-name option before configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-fixed-connector-"));
   try {
@@ -308,7 +384,8 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       authenticated: true,
       temporary: true,
       solAvailable: true,
-      extraHighAvailable: false, proAvailable: false,
+      extraHighAvailable: false,
+      proAvailable: false,
       url: "https://chatgpt.com/?temporary-chat=true",
     }));
   });
@@ -361,7 +438,8 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
       solAvailable: true,
-      extraHighAvailable: false, proAvailable: false,
+      extraHighAvailable: false,
+      proAvailable: false,
     });
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);
     expect(existsSync(join(devHome, "codex-home", "config.toml"))).toBe(false);

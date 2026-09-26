@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import {
+  CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
+  CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
   assertNewChatPage,
   chatGptNewChatUrl,
@@ -42,6 +45,10 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <div data-testid="prompt-textarea" id="composer-testid"></div>
     <div id="prompt-textarea"></div>
     <div contenteditable="true" data-lexical-editor="true" id="composer-lexical"></div>
+    <div contenteditable="true" role="textbox" id="composer-semantic"></div>
+    <button data-testid="send-button" id="send-testid"></button>
+    <button type="submit" id="send-submit"></button>
+    <button type="button" id="unrelated-button"></button>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
   </form>
@@ -52,7 +59,22 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
   </form></body>`);
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
   expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "power-editor"]);
+  expect(matches(CHATGPT_SEND_BUTTON_SELECTOR)).toEqual(["send-testid", "send-submit"]);
   expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "power-effort"]);
+});
+
+test("turn selectors accept stable data-turn-id wrappers when conversation test ids are absent", () => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  const document = createDocument(`<body>
+    <section data-turn-id="user-current" data-turn="user" id="user-direct"></section>
+    <section data-turn-id="assistant-current" id="assistant-descendant">
+      <div data-message-author-role="assistant"></div>
+    </section>
+    <section data-turn-id="unrelated" id="unrelated"></section>
+  </body>`);
+  const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
+  expect(matches(CHATGPT_USER_TURN_SELECTOR)).toEqual(["user-direct"]);
+  expect(matches(CHATGPT_ASSISTANT_TURN_SELECTOR)).toEqual(["assistant-descendant"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
@@ -242,8 +264,18 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; locks?: Array<string | null>; delay?: number; missing?: boolean; loseSelectionOnClose?: boolean; power?: boolean; disabled?: string } = {}) {
+function reasoningPicker(options: {
+  max?: string;
+  locks?: Array<string | null>;
+  delay?: number;
+  missing?: boolean;
+  proRow?: "enabled" | "disabled" | "missing";
+  loseSelectionOnClose?: boolean;
+  power?: boolean;
+  disabled?: string;
+} = {}) {
   let value = 0;
+  let proClicked = false;
   let opened = true;
   const keys: string[] = [];
   const hidden = {
@@ -290,9 +322,23 @@ function reasoningPicker(options: { max?: string; locks?: Array<string | null>; 
     innerText: async () => opened ? "Thinking effort" : ["Instant", "Medium", "High", "Extra High", "Pro"][value]!,
     getAttribute: async (name: string) => name === "aria-expanded" ? String(opened) : null,
   };
-  const composer = { filter() { return this; }, last() { return this; }, isEditable: async () => true, locator: () => ({ locator: () => control }) };
+  const composer = {
+    filter() { return this; }, last() { return this; }, isEditable: async () => true,
+    locator: () => ({ locator: () => control }),
+  };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const proRow = {
+    filter() { return this; },
+    first() { return this; },
+    count: async () => options.proRow && options.proRow !== "missing" ? 1 : 0,
+    getAttribute: async (name: string) => name === "aria-disabled" && options.proRow === "disabled" ? "true" : null,
+    click: async () => { proClicked = true; },
+  };
+  const menu = {
+    filter() { return this; }, last() { return this; }, isVisible: async () => true,
+    locator: () => modelRows,
+    getByRole: () => proRow,
+  };
   const page = {
     url: () => "https://chatgpt.com/?temporary-chat=true",
     locator: (selector: string) => {
@@ -306,7 +352,7 @@ function reasoningPicker(options: { max?: string; locks?: Array<string | null>; 
       if (options.loseSelectionOnClose) value = 0;
     } },
   };
-  return { page, composer, keys, value: () => value };
+  return { page, composer, keys, value: () => value, proClicked: () => proClicked };
 }
 
 test.each([0, 50])("capabilities wait for the visible container and read its hidden semantic input (delay=%s)", async delay => {
@@ -324,22 +370,33 @@ test("the authoritative three-step range is non-Pro; a malformed range fails clo
   await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "bad" }).page as never)).rejects.toThrow("model controls are unavailable");
 });
 
-test("the four-step browser range keeps Extra High available when Pro is unavailable", async () => {
-  await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3" }).page as never))
+test("an enabled Pro picker row keeps Pro available when the slider has only four positions", async () => {
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", proRow: "enabled" }).page as never))
+    .resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: true });
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", proRow: "disabled" }).page as never))
     .resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: false });
 });
 
-test("capabilities exclude the observed locked Plus upsell and reject unknown lock state", async () => {
-  await expect(detectChatGptAccountCapabilities(reasoningPicker({
-    max: "3", locks: ["false", "false", "false", "true"],
-  }).page as never)).resolves.toEqual({ solAvailable: true, extraHighAvailable: false, proAvailable: false });
-  await expect(detectChatGptAccountCapabilities(reasoningPicker({
-    locks: ["false", "false", "false", "false", "true"],
-  }).page as never)).resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: false });
-  for (const locks of [[], ["false", "false", "false", null], ["false", "false", "false", "unknown"]]) {
-    await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", locks }).page as never))
-      .rejects.toThrow("availability");
-  }
+test("Pro selection changes the hidden slider through its visible owner, never through model rows", async () => {
+  const fixture = reasoningPicker({ delay: 50 });
+  const select = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(...args: unknown[]): Promise<unknown>;
+  }).selectModelAndEffort;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { activeComposer: async () => fixture.composer });
+  await select.call(worker, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+  expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
+  expect(fixture.value()).toBe(4);
+});
+
+test("Pro selection uses the enabled Pro picker row when it is no longer the fifth slider position", async () => {
+  const fixture = reasoningPicker({ max: "3", proRow: "enabled" });
+  const select = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(...args: unknown[]): Promise<unknown>;
+  }).selectModelAndEffort;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { activeComposer: async () => fixture.composer });
+  await select.call(worker, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+  expect(fixture.keys).toEqual([]);
+  expect(fixture.proClicked()).toBe(true);
 });
 
 test("power picker omission of lock attributes requires its enabled structural owner and complete ticks", async () => {

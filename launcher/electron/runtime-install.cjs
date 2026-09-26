@@ -6,7 +6,20 @@ const { runtimeBundlePaths } = require("./runtime-command.cjs");
 
 const DEFAULT_SOURCE_WAIT_TIMEOUT_MS = 30_000;
 const DEFAULT_SOURCE_WAIT_INTERVAL_MS = 50;
+const WINDOWS_CLEANUP_RETRY_DELAYS_MS = [25, 50, 100, 150, 250, 350, 500];
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+
+function removeRuntimePath(target) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { fs.rmSync(target, { recursive: true, force: true }); return; }
+    catch (error) {
+      const retryable = process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(error?.code);
+      const delay = WINDOWS_CLEANUP_RETRY_DELAYS_MS[attempt];
+      if (!retryable || delay === undefined) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+    }
+  }
+}
 
 function comparePaths(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -259,7 +272,7 @@ function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
       renameAtomicFile(temporary, destination);
       validateRuntimeBundle(destination, expectedIdentity);
     } catch (error) {
-      fs.rmSync(destination, { recursive: true, force: true });
+      removeRuntimePath(destination);
       if (previousMoved) {
         try {
           renameAtomicFile(previous, destination);
@@ -274,11 +287,13 @@ function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
       throw error;
     }
     if (previousMoved) {
-      fs.rmSync(previous, { recursive: true, force: true });
+      // Windows can keep a replaced Electron/Bun file handle open briefly. The new runtime is
+      // already validated, so stale backup cleanup must not fail startup.
+      try { removeRuntimePath(previous); } catch {}
       previousMoved = false;
     }
   } finally {
-    fs.rmSync(temporary, { recursive: true, force: true });
+    try { removeRuntimePath(temporary); } catch {}
     if (previousMoved && fs.existsSync(previous) && !fs.existsSync(destination)) {
       renameAtomicFile(previous, destination);
       previousMoved = false;

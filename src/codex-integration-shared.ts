@@ -8,6 +8,9 @@ import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
 export const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
 export const MANAGED_ROUTE_COMMENT =
   "# Managed by codex-chatgpt-web: Responses use the local bridge; Voice stays on ChatGPT.";
+export const MANAGED_PROVIDER_ID = "codex-chatgpt-web";
+export const MANAGED_PROVIDER_BEGIN = "# >>> codex-chatgpt-web managed provider >>>";
+export const MANAGED_PROVIDER_END = "# <<< codex-chatgpt-web managed provider <<<";
 export const CODEX_REALTIME_WEBRTC_CALL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 export const MANAGED_REMOTE_COMPACTION_LINE =
   "remote_compaction_v2 = false # Managed by codex-chatgpt-web: bounds retained Web image history.";
@@ -51,6 +54,30 @@ export interface InstalledCodexInterruptHook {
 }
 
 export interface CodexIntegrationJournal {
+  version: 11;
+  active: boolean;
+  configPath: string;
+  installed: {
+    openai_base_url: string;
+    model_provider: typeof MANAGED_PROVIDER_ID;
+    experimental_realtime_webrtc_call_base_url: string;
+    subagent_protocol: SubagentProtocol;
+    agent_max_depth?: number;
+  };
+  providerBlock: string;
+  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  previousRealtimeWebrtcCallBaseUrl: PreviousAssignment;
+  interruptHook: InstalledCodexInterruptHook;
+  previousMultiAgent?: PreviousFeatureAssignment;
+  previousMultiAgentV2?: PreviousFeatureAssignment;
+  previousAgentMaxDepth?: PreviousAgentAssignment;
+  format?: {
+    lineEnding: "\n" | "\r\n" | "\r";
+    trailingNewline: boolean;
+  };
+}
+
+export interface LegacyCodexIntegrationJournalV10 {
   version: 10;
   active: boolean;
   configPath: string;
@@ -209,6 +236,7 @@ export interface LegacyCodexIntegrationJournal {
 
 export type ManagedRouteJournal =
   | CodexIntegrationJournal
+  | LegacyCodexIntegrationJournalV10
   | LegacyCodexIntegrationJournalV9
   | LegacyCodexIntegrationJournalV8
   | LegacyCodexIntegrationJournalV7

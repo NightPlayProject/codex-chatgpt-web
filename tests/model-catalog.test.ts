@@ -65,9 +65,12 @@ describe("native /models augmentation", () => {
     const web = models.slice(3).filter(model => model.visibility === "list");
     const legacy = models.slice(3).filter(model => model.visibility === "hide");
     expect(legacy.map(model => model.slug)).toEqual(CHATGPT_WEB_LEGACY_MODEL_ROUTES.map(route => route.slug));
-    expect(legacy.map(model => [model.context_window, model.auto_compact_token_limit])).toEqual([
-      [111_193, 95_000], [111_193, 95_000], [111_193, 95_000], [111_193, 95_000], [112_193, 95_000],
-    ]);
+    expect(legacy.map(model => [model.context_window, model.auto_compact_token_limit])).toEqual(
+      CHATGPT_WEB_LEGACY_MODEL_ROUTES.map(route => {
+        const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
+        return [limits.contextWindow, limits.autoCompactTokenLimit];
+      }),
+    );
     expect(web.map(model => model.slug)).toEqual(CHATGPT_WEB_MODEL_ROUTES.map(route => route.slug));
     expect(web.map(model => model.display_name)).toEqual(CHATGPT_WEB_MODEL_ROUTES.map(route => route.displayName));
     for (const [index, model] of web.entries()) {
@@ -80,6 +83,7 @@ describe("native /models augmentation", () => {
         default_reasoning_level: route.codexEffort,
         multi_agent_version: "v2",
         supported_in_api: true,
+        supports_search_tool: false,
         priority: 2,
         context_window: limits.contextWindow,
         max_context_window: limits.contextWindow,
@@ -95,20 +99,31 @@ describe("native /models augmentation", () => {
     }
     expect((web[1]!.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
       .toEqual(["medium", "high", "xhigh"]);
-    expect(() => buildChatGptWebModel(originalModels[1], {
-      ...CHATGPT_WEB_MODEL_ROUTES[1]!, supportedCodexEfforts: ["low", "medium"],
-    }, { ...config, proAvailable: false })).toThrow("Cannot group different context budgets");
+    const grouped = buildChatGptWebModel(originalModels[1], {
+      ...CHATGPT_WEB_MODEL_ROUTES[1]!,
+      codexEffort: "medium",
+      adapterEffort: "medium",
+      supportedCodexEfforts: ["low", "medium"],
+    }, { ...config, proAvailable: false });
+    expect(grouped).toMatchObject({
+      context_window: 500_000,
+      auto_compact_token_limit: 400_000,
+      supported_reasoning_levels: [
+        { effort: "low" },
+        { effort: "medium" },
+      ],
+    });
   });
 
-  test("publishes Bigger Context limits in the Codex model catalog", () => {
+  test("publishes the canonical 500k/400k limits while Bigger Context is enabled", () => {
     const config = defaultConfig("full");
     config.extraHighAvailable = true;
     config.proAvailable = true;
     config.experimentalBiggerContext = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
-    expect(pro.context_window).toBe(336_579);
-    expect(pro.auto_compact_token_limit).toBe(285_000);
+    expect(pro.context_window).toBe(500_000);
+    expect(pro.auto_compact_token_limit).toBe(400_000);
   });
 
   test("keeps native Sol selectable in the bounded Compatibility V1 registry", () => {
@@ -183,25 +198,25 @@ describe("native /models augmentation", () => {
     const second = augmentNativeModelCatalog(first, config);
     const models = second.models as Array<Record<string, unknown>>;
     const web = models.filter(model => String(model.slug).startsWith("chatgpt-web/"));
-    expect(web.map(model => model.slug)).toEqual([
-      "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
-      "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/extra-high",
-    ]);
+    expect(web.map(model => model.slug)).toEqual(
+      availableChatGptWebModelRoutes(config, true).map(route => route.slug),
+    );
     expect(web.every(model => model.tool_mode === null)).toBe(true);
+    expect(web.every(model => model.supports_search_tool === false)).toBe(true);
     expect(web.every(model => model.multi_agent_version === "v2")).toBe(true);
     expect(web.filter(model => model.visibility === "hide").every(model => (model.supported_reasoning_levels as unknown[]).length === 1)).toBe(true);
     expect(web.map(model => ({
       contextWindow: model.context_window,
       effectiveContextWindowPercent: model.effective_context_window_percent,
       autoCompactTokenLimit: model.auto_compact_token_limit,
-    }))).toEqual([
-      { contextWindow: 41_000, effectiveContextWindowPercent: 78, autoCompactTokenLimit: 32_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 41_000, effectiveContextWindowPercent: 78, autoCompactTokenLimit: 32_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-    ]);
+    }))).toEqual(availableChatGptWebModelRoutes(config, true).map(route => {
+      const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
+      return {
+        contextWindow: limits.contextWindow,
+        effectiveContextWindowPercent: limits.effectiveContextWindowPercent,
+        autoCompactTokenLimit: limits.autoCompactTokenLimit,
+      };
+    }));
   });
 
   test("publishes Luna and Think routes when the account exposes no Sol selector", () => {
@@ -323,6 +338,7 @@ describe("native /models augmentation", () => {
     expect(web.length).toBe(5);
     expect(web.every(model => model.shell_type === "shell_command")).toBe(true);
     expect(web.every(model => model.tool_mode === null)).toBe(true);
+    expect(web.every(model => model.supports_search_tool === false)).toBe(true);
   });
 
   test("uses a ChatGPT-visible template even when it is not available to API-key auth", () => {

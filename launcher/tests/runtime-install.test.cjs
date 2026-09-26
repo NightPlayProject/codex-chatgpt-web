@@ -331,6 +331,32 @@ test("failed candidate validation preserves the previous validated runtime", () 
   }
 });
 
+test("locked candidate promotion restores the previous runtime", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-locked-promotion-"));
+  const resourcesPath = runtimeFixture(root, "0.2.0");
+  const coreHome = path.join(root, "core-home");
+  const app = { isPackaged: true, getVersion: () => "0.2.0" };
+  const originalRename = fs.renameSync;
+  try {
+    const installed = ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    const previous = fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8");
+    const source = path.join(resourcesPath, "runtime");
+    fs.writeFileSync(path.join(source, "app", "cli.js"), "updated cli");
+    writeRuntimeManifest(source);
+    fs.renameSync = (from, to) => {
+      if (String(from).includes(".tmp-") && to === installed) {
+        const error = new Error("candidate is locked"); error.code = "EACCES"; throw error;
+      }
+      return originalRename(from, to);
+    };
+    assert.throws(() => ensurePackagedRuntime({ app, coreHome, resourcesPath }), /locked/);
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), previous);
+    fs.renameSync = originalRename;
+    ensurePackagedRuntime({ app, coreHome, resourcesPath });
+    assert.equal(fs.readFileSync(path.join(installed, "app", "cli.js"), "utf8"), "updated cli");
+  } finally { fs.renameSync = originalRename; fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("packaged runtime replaces stale files when a release is refreshed under the same version", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-refresh-"));
   const resourcesPath = runtimeFixture(root, "0.2.0");

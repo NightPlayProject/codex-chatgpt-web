@@ -7,7 +7,7 @@ import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adap
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
-import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
+import { CHATGPT_MAX_MULTIPART_PARTS, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
 
@@ -31,6 +31,7 @@ interface RunMessage {
     nativeConnector?: boolean;
     resumeAvailable?: boolean;
     retainConversation?: boolean;
+    resumeAnswerDigest?: string;
     requireRetainedConversation?: boolean;
     conversationKey?: string;
     compaction?: boolean;
@@ -226,6 +227,7 @@ async function run(message: RunMessage): Promise<void> {
     prepare: prepareSelected,
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
+    ...(message.turn.resumeAnswerDigest ? { resumeAnswerDigest: message.turn.resumeAnswerDigest } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     abortSignal: abortController.signal,
@@ -420,7 +422,9 @@ input.on("line", line => {
     if (prepared.multipart !== undefined) {
       const multipart = prepared.multipart;
       if (!multipart || !Array.isArray(multipart.parts)
-        || !isChatGptWebMultipartPartCount(multipart.parts.length)
+        || !Number.isInteger(multipart.parts.length)
+        || multipart.parts.length < 2
+        || multipart.parts.length > CHATGPT_MAX_MULTIPART_PARTS
         || multipart.parts.some(part => typeof part !== "string")
         || typeof multipart.commit !== "string") {
         writeProtocol({ type: "error", id: message.id, message: "Browser helper multipart prompt is invalid" });

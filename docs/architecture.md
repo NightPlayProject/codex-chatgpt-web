@@ -49,6 +49,11 @@ launcher-owned codex-chatgpt-web daemon
   runtime registry and can invoke an exact listed name through bridge-owned code. Full mode also
   preserves Codex's native freeform `exec`; its tool registry enforces the same bounded
   `wait_agent` contract as direct and structured calls.
+- The `codex_tool_capabilities` report records the live outer catalog hash, source provenance, and
+  direct, deferred, and gateway-backed logical surfaces. `codex_tool_inventory` can filter that
+  catalog by surface and returns exact wire names and schemas; `codex_tool_call` invokes only names
+  returned by that catalog. A catalog epoch identifies when ChatGPT is using a stale connector
+  contract, while the outer Codex environment remains the authority for execution and approvals.
 - Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
 
 ### Repository DEV driver
@@ -253,7 +258,11 @@ context, and service tiers are otherwise unchanged.
 
 The built-in provider attempts a Responses WebSocket prewarm. The local route explicitly returns
 HTTP `426`, which is Codex's native capability-negotiation signal for an immediate, session-sticky
-switch to its HTTP/SSE transport. No model or provider fallback occurs.
+switch to its HTTP/SSE transport. The response and `/healthz` both identify `http-sse` explicitly so
+diagnostics can distinguish this expected negotiation from an actual transport failure. No model or
+provider fallback occurs. Current Codex releases mark the legacy `responses_websockets` feature
+switches as removed; avoiding the prewarm would therefore require changing the model-provider route,
+which this bridge intentionally does not do just to suppress a harmless negotiation response.
 
 Setup never restarts an already loaded daemon implicitly. A requested stop, restart, replacement,
 or uninstall first calls a private authenticated drain endpoint. The daemon rejects new turns and

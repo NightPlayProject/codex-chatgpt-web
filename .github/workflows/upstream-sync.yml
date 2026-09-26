@@ -1,0 +1,89 @@
+name: Upstream Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and fork branches
+        run: |
+          git remote add upstream https://github.com/miuuyy/codex-chatgpt-web.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main
+          if git ls-remote --exit-code --heads origin refs/heads/nightplay >/dev/null 2>&1; then
+            git fetch --no-tags origin nightplay
+          fi
+
+      - name: Fast-forward mirrored main
+        id: mirror
+        run: |
+          before="$(git rev-parse origin/main)"
+          upstream="$(git rev-parse upstream/main)"
+
+          if ! git merge-base --is-ancestor "$before" "$upstream"; then
+            echo "origin/main is not an ancestor of miuuyy/main; refusing to rewrite fork main." >&2
+            exit 1
+          fi
+
+          if [ "$before" = "$upstream" ]; then
+            echo "advanced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push origin "$upstream":refs/heads/main
+          echo "advanced=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh upstream PR into nightplay
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! git show-ref --verify --quiet refs/remotes/origin/nightplay; then
+            echo "nightplay does not exist; main was mirrored and no custom-branch PR is needed."
+            exit 0
+          fi
+
+          git fetch --no-tags origin main nightplay
+          if git merge-base --is-ancestor origin/main origin/nightplay; then
+            echo "nightplay already contains the mirrored upstream main."
+            exit 0
+          fi
+
+          existing="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base nightplay \
+            --head main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          body="Upstream \`miuuyy/codex-chatgpt-web:main\` advanced. This PR merges the fast-forward mirrored \`main\` branch into \`nightplay\` so fork-specific patches remain isolated and reviewable. No release is created by this workflow."
+
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "chore: sync upstream main into nightplay" \
+              --body "$body"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base nightplay \
+              --head main \
+              --title "chore: sync upstream main into nightplay" \
+              --body "$body"
+          fi

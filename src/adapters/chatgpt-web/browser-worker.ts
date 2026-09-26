@@ -1504,7 +1504,10 @@ export function chatGptSubmissionEvidence(state: {
   generationRunning: boolean;
 }): ChatGptSubmissionEvidence | undefined {
   if (chatGptNewTurnIdentity(state.initialTurnIdentities, state.userIdentities)) return "user_turn";
-  if (chatGptNewTurnIdentity(state.initialTurnIdentities, state.responseIdentities)) return "assistant_turn";
+  // A new conversation may briefly expose an assistant shell from the old document before
+  // the submitted user turn mounts in the destination. It cannot confirm this submission.
+  const legacyResponses = state.responseIdentities.filter(identity => !identity.startsWith("group:assistant:"));
+  if (chatGptNewTurnIdentity(state.initialTurnIdentities, legacyResponses)) return "assistant_turn";
   if (state.generationRunning) return "generation_running";
   return undefined;
 }
@@ -1610,6 +1613,25 @@ export function chatGptNewTurnIdentity(
     throw new Error(`ChatGPT exposed ${added.length} new conversation turns for one submitted message`);
   }
   return added[0];
+}
+
+export function chatGptSubmittedAssistantIdentity(
+  initial: readonly string[],
+  users: readonly string[],
+  responses: readonly string[],
+): string | undefined {
+  const submittedUser = chatGptNewTurnIdentity(initial, users);
+  // The power renderer owns both roles under one data-turn-key. A transient assistant with
+  // a different key can be an old or partially navigated response, even if it appeared first.
+  if (submittedUser?.startsWith("group:user:")) {
+    const pairedAssistant = `group:assistant:${submittedUser.slice("group:user:".length)}`;
+    return responses.includes(pairedAssistant) ? pairedAssistant : undefined;
+  }
+  // Legacy assistant turns have their own IDs and can mount before the user bubble.
+  return chatGptNewTurnIdentity(
+    initial,
+    responses.filter(identity => !identity.startsWith("group:assistant:")),
+  );
 }
 
 export function chatGptReboundTurnIdentity(
@@ -3193,8 +3215,9 @@ export class ChatGptBrowserWorker {
     signal?: AbortSignal,
   ): Promise<string> {
     const state = await this.submissionDomState(page, baseline.domCache, signal);
-    const identity = chatGptNewTurnIdentity(
+    const identity = chatGptSubmittedAssistantIdentity(
       baseline.initialTurnIdentities,
+      state.userIdentities,
       state.responseIdentities,
     );
     if (!identity) return "";
@@ -3290,8 +3313,9 @@ export class ChatGptBrowserWorker {
       // acknowledging its boundary; the pre-probe snapshot can otherwise leave the broker waiting
       // despite this exact iteration having successfully observed the page.
       progress = externalProgress?.snapshot();
-      const identity = chatGptNewTurnIdentity(
+      const identity = chatGptSubmittedAssistantIdentity(
         observationBaseline.initialTurnIdentities,
+        state.userIdentities,
         state.responseIdentities,
       );
       if (progress
@@ -3311,11 +3335,10 @@ export class ChatGptBrowserWorker {
         locator: observationPage.locator(chatGptAssistantTurnSelector(identity)),
         acceptedTurnIdentities: state.turnIdentities,
       };
-      // A newly accepted user turn plus a visible Stop control proves ongoing generation even
-      // before ChatGPT mounts its assistant wrapper. Long reasoning must not consume the idle grace.
-      if (state.visibleStopButtonCount > 0 && chatGptNewTurnIdentity(
-        observationBaseline.initialTurnIdentities, state.userIdentities,
-      )) {
+      // A visible Stop control after an accepted send proves generation is still running.
+      // New-conversation navigation can mount the submitted user after the assistant shell,
+      // so waiting for the paired turn must not consume the idle grace.
+      if (state.visibleStopButtonCount > 0) {
         responseDeadline = Math.min(deadline ?? Number.POSITIVE_INFINITY, Date.now() + graceMs);
       }
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
@@ -4311,10 +4334,20 @@ export class ChatGptBrowserWorker {
       const selectChatGptAnswerRoots = (
         markdownRoots: HTMLElement[],
         statusContainers: HTMLElement[],
+        activityHeaders: HTMLElement[],
       ): { commentaryRoots: HTMLElement[]; answerRoots: HTMLElement[] } => {
         const firstStatusContainer = statusContainers[0];
+        // The current agent-activity renderer puts its header and its Markdown body in
+        // separate descendants of one activity block. Neither carries the older status
+        // or cot-v5 attributes. The semantic header class identifies that block; three
+        // ancestors reach its body wrapper without relying on the generated block class.
+        const activityBlocks = activityHeaders
+          .map(header => header.parentElement?.parentElement?.parentElement)
+          .filter(block => block !== null && block !== undefined);
         const commentary = markdownRoots.filter(candidate => (
           candidate.closest("[data-streaming-response-status]") !== null
+          || candidate.closest(".group\\/activity-header") !== null
+          || activityBlocks.some(block => block.contains(candidate))
           // Chain-of-thought components carry reasoning, never the final answer, so containment is
           // a position-independent commentary signal. Position alone cannot separate "commentary
           // between two status containers" from "answer between two tool calls".
@@ -4334,7 +4367,11 @@ export class ChatGptBrowserWorker {
         };
       };
       // CHATGPT_COMMENTARY_CLASSIFIER_END
-      const classified = selectChatGptAnswerRoots(allMarkdownRoots, streamingStatusContainers);
+      const classified = selectChatGptAnswerRoots(
+        allMarkdownRoots,
+        streamingStatusContainers,
+        [...root.querySelectorAll<HTMLElement>(".group\\/activity-header")].filter(renderedInDom),
+      );
       const commentaryRoots = classified.commentaryRoots;
       const renderedRoots = classified.answerRoots;
       // CHATGPT_MARKDOWN_CONTENT_BEGIN

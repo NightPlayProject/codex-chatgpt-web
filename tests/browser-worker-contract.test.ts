@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { waitForOperationalChatGptViewport } from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptSubmittedAssistantIdentity } from "../src/adapters/chatgpt-web/browser-worker";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
@@ -171,6 +172,65 @@ test("assistant tracking rebinds only one proven replacement after React detache
     "conversation-turn-2",
     ["conversation-turn-1", "conversation-turn-3", "conversation-turn-4"],
   )).toThrow("2 new conversation turns");
+});
+
+test("assistant binding waits for the submitted user and selects its paired power response", async () => {
+  const initial = ["group:user:history", "group:assistant:history"];
+  expect(chatGptSubmittedAssistantIdentity(
+    initial, [], ["group:assistant:transient"],
+  )).toBeUndefined();
+  expect(chatGptSubmittedAssistantIdentity(
+    ["legacy-before"], [], ["legacy-before", "legacy-new"],
+  )).toBe("legacy-new");
+  expect(chatGptSubmissionEvidence({
+    initialTurnIdentities: initial,
+    userIdentities: [],
+    responseIdentities: ["group:assistant:transient", "group:assistant:another-transient"],
+    generationRunning: true,
+  })).toBe("generation_running");
+  expect(chatGptSubmittedAssistantIdentity(
+    initial, ["group:user:submitted"],
+    ["group:assistant:transient", "group:assistant:submitted"],
+  )).toBe("group:assistant:submitted");
+  expect(() => chatGptSubmittedAssistantIdentity(
+    initial, ["group:user:submitted", "group:user:other"],
+    ["group:assistant:submitted", "group:assistant:other"],
+  )).toThrow("2 new conversation turns");
+
+  const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+  const page = {
+    isClosed: () => false,
+    locator: (selector: string) => selector.startsWith("[data-turn-key=") ? { selector } : hidden,
+  } as unknown as Page;
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web",
+    baseUrl: `browser://paired-response-${Math.random()}`,
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+  }) as unknown as {
+    waitForNewAssistantTurn(page: Page, baseline: unknown, deadline: number | undefined): Promise<{
+      identity: string; acceptedTurnIdentities: string[];
+    }>;
+    submissionDomState(): Promise<unknown>;
+    waitForTurnDomOrExternalProgress(): Promise<void>;
+  };
+  let observation = 0;
+  worker.submissionDomState = async () => observation === 0
+    ? {
+      turnIdentities: [...initial, "group:user:transient", "group:assistant:transient"],
+      userIdentities: [], responseIdentities: ["group:assistant:transient"], visibleStopButtonCount: 1,
+    }
+    : {
+      turnIdentities: [...initial, "group:user:submitted", "group:assistant:submitted"],
+      userIdentities: ["group:user:submitted"], responseIdentities: ["group:assistant:submitted"],
+      visibleStopButtonCount: 1,
+    };
+  worker.waitForTurnDomOrExternalProgress = async () => { observation += 1; };
+  const binding = await worker.waitForNewAssistantTurn(page, {
+    initialTurnIdentities: initial, domCache: {},
+  }, undefined);
+  expect(observation).toBe(1);
+  expect(binding.identity).toBe("group:assistant:submitted");
+  expect(binding.acceptedTurnIdentities).toContain("group:user:submitted");
 });
 
 test("power turn identity separates roles and keeps virtualized groups in the submission baseline", async () => {
@@ -4595,7 +4655,7 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
     .replace(/\):\s*\{[^}]*\}\s*=>/, ") =>");
   const selectChatGptAnswerRoots = new Function(
     `${javascript}; return selectChatGptAnswerRoots;`,
-  )() as (roots: unknown[], statuses: unknown[]) => { answerRoots: Array<{ textContent: string }> };
+  )() as (roots: unknown[], statuses: unknown[], activityHeaders: unknown[]) => { answerRoots: Array<{ textContent: string }> };
 
   const answerFor = (html: string): string => {
     const document = createDocument(`<body>${html}</body>`);
@@ -4603,7 +4663,8 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
     const roots = Array.from(document.body.querySelectorAll(".markdown"))
       .filter(candidate => !candidate.parentElement?.closest(".markdown"));
     const statuses = Array.from(document.body.querySelectorAll("[data-streaming-response-status]"));
-    return selectChatGptAnswerRoots(roots, statuses).answerRoots
+    const activityHeaders = Array.from(document.body.querySelectorAll(".group\\/activity-header"));
+    return selectChatGptAnswerRoots(roots, statuses, activityHeaders).answerRoots
       .map(root => (root.textContent ?? "").trim())
       .filter(Boolean)
       .join(" | ");
@@ -4642,6 +4703,11 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
 
   // A turn with no status container at all is entirely answer.
   expect(answerFor('<div class="markdown">ONLY ANSWER</div>')).toBe("ONLY ANSWER");
+  expect(answerFor(
+    '<div class="activity"><div class="markdown">PROGRESS BODY</div>'
+    + '<div><div><div class="group/activity-header">Checking files</div></div></div></div>'
+    + '<div class="markdown">FINAL ANSWER</div>',
+  )).toBe("FINAL ANSWER");
 });
 
 test("embedded chart hydration cannot replace Markdown answer content with renderer UI", () => {

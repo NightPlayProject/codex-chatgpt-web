@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import type { Locator } from "playwright-core";
-import { ChatGptBrowserWorker, ChatGptCompletionTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptVisibleTraceTracker, CHATGPT_COMPLETION_SETTLE_MS, type ChatGptVisibleTraceBlock } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
 
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
@@ -14,7 +14,7 @@ type Snapshot = {
   fullHtml: string;
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
-  traceBlocks: { kind: string; text: string }[];
+  traceBlocks: ChatGptVisibleTraceBlock[];
 };
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
@@ -135,4 +135,34 @@ test("DIL response extraction preserves ownership, commentary and completion bou
   const noCopy = await snapshot(smokeHtml.replace('data-testid="copy-turn-action-button"', 'data-testid="other-action"'));
   expect(noCopy.visibleText).toBe("CODEX WEB GPT READY");
   expect(noCopy.completionActionVisible).toBeFalse();
+});
+
+test("agent activity header and sibling body become commentary while the final block remains answer", async () => {
+  // Issue #680: the current activity renderer has neither a streaming-status nor a cot-v5
+  // ancestor. Its Markdown body is a sibling of the activity header, not a descendant.
+  const html = '<section id="turn"><div data-content-search-unit-key="unit">'
+    + '<div data-conversation-role="assistant">'
+    + '<div class="block-generated-one"><div class="flex flex-col gap-2 pt-2 pb-1">'
+    + '<div data-markdown-text-style="assistant-message"><p>Planning the work.</p></div>'
+    + '<div class="min-w-0 text-size-chat"><div class="flex min-w-0 flex-col">'
+    + '<div class="group/activity-header"><span><span>'
+    + '<div data-markdown-text-style="assistant-message"><p>Checking files</p></div>'
+    + '</span></span></div></div></div>'
+    + '<div data-markdown-text-style="assistant-message"><p>Found the relevant code.</p></div>'
+    + '</div></div>'
+    + '<div class="block-generated-two"><div data-markdown-text-style="assistant-message">'
+    + '<p>Final result.</p></div></div>'
+    + '</div></div><button data-testid="copy-turn-action-button">Copy</button></section>';
+  const response = await snapshot(html);
+  expect(response.visibleText).toBe("Final result.");
+  expect(response.traceBlocks.map(({ kind, text }) => ({ kind, text }))).toEqual([
+    { kind: "commentary", text: "Planning the work." },
+    { kind: "commentary", text: "Checking files" },
+    { kind: "commentary", text: "Found the relevant code." },
+    { kind: "answer", text: "Final result." },
+  ]);
+  const forwarded = new ChatGptVisibleTraceTracker(0).observe(response.traceBlocks, true);
+  expect(forwarded.filter(event => event.kind === "commentary").map(event => event.text)).toEqual([
+    "Planning the work.", "Checking files", "Found the relevant code.",
+  ]);
 });

@@ -4769,7 +4769,7 @@ export class ChatGptBrowserWorker {
             ? [...candidate.querySelectorAll<HTMLElement>("[id]")]
               .find(element => element.id === labelId)?.innerText.trim()
             : undefined;
-          return label || candidate.innerText.split("\n")
+          return (label || candidate.innerText).split(/\r?\n/)
             .map(line => line.trim()).filter((line, index, lines) => line && line !== lines[index - 1])
             .join("\n");
         }
@@ -4825,6 +4825,9 @@ export class ChatGptBrowserWorker {
         'button, [role="status"], [aria-busy="true"], [data-testid*="cot"], [data-testid*="reason"], [data-testid*="thought"]',
       ).forEach(candidate => {
         if (completionActionSet.has(candidate)) return;
+        // The Activity heading owns its label. Nested disclosure/status controls can mirror
+        // the same animated text, but must not become a second trace item.
+        if (activityHeaders.some(header => header.contains(candidate))) return;
         if (overlapsRenderedAnswer(candidate) || overlapsCommentary(candidate)) return;
         const semantic = statusSemantic(candidate);
         // A renderer may wrap the final Markdown in a reason/status container. That wrapper and
@@ -4838,7 +4841,8 @@ export class ChatGptBrowserWorker {
         }
       });
       root.querySelectorAll<HTMLElement>("[data-streaming-response-status]").forEach(container => {
-        if (!overlapsRenderedAnswer(container)
+        if (!activityHeaders.some(header => header.contains(container))
+          && !overlapsRenderedAnswer(container)
           && !overlapsCommentary(container)
           && ![...candidates.keys()].some(candidate => container.contains(candidate))) {
           candidates.set(container, "status");

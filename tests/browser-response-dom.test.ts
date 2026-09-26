@@ -295,3 +295,20 @@ test("plain Activity headings stream as commentary while the turn is running", a
   expect(complete.visibleText).toBe("Finished.");
   expect(complete.traceBlocks.some(block => block.kind === "commentary" && block.text === activity)).toBeFalse();
 });
+
+test("animated Activity heading copies produce one progress event", async () => {
+  const title = "Reconstructing Attached Lua File to Source";
+  const markup = (label: string) => '<div id="turn" data-turn-key="live">'
+    + '<div class="group/activity-header"><button aria-labelledby="activity-title"></button>'
+    + `<span id="activity-title">${label}\n${label}</span>`
+    + `<span role="status">${label}</span></div></div>`;
+  const progress = await snapshot(markup(title));
+  expect(progress.traceBlocks.map(({ kind, text }) => ({ kind, text }))).toEqual([
+    { kind: "commentary", text: title },
+  ]);
+  const tracker = new ChatGptVisibleTraceTracker(0);
+  expect(tracker.observe(progress.traceBlocks, false)).toEqual([{ kind: "commentary", text: title }]);
+
+  const generic = await snapshot(markup("Thinking"));
+  expect(generic.traceBlocks).toEqual([]);
+});

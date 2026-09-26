@@ -13,6 +13,7 @@ import type {
   CodexUserMessage,
 } from "../types";
 import { namespacedToolName } from "../types";
+import { CHATGPT_WEB_MODEL_PREFIX } from "../chatgpt-web-models";
 import { responsesRequestSchema } from "./schema";
 import {
   compactionItemToText,
@@ -26,6 +27,13 @@ import { decodeReasoningEnvelope } from "./reasoning-envelope";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isRecursiveChatGptBridgeTool(tool: CodexTool): boolean {
+  // Some Codex Apps catalogs echo this bridge's own connector back into the outer tool list.
+  // Calling that entry creates a function_call that Codex cannot dispatch to an outer handler.
+  // Keep other mcp__codex_apps tools: only the codex_native connector is self-referential.
+  return /^mcp__codex_apps__codex_native\d*_+/.test(namespacedToolName(tool.namespace, tool.name));
 }
 
 type InputBlock =
@@ -577,8 +585,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     }
     return holder;
   };
-  // Tool specs surfaced by a prior tool_search (deferred tools, e.g. subagents). Codex does not
-  // re-list these in `tools`, but chat models can only call listed tools — so we re-inject them.
+  // Deferred tool schemas are exposed only when this request supplied them after the latest
+  // compaction boundary; historical declarations cannot prove current handler availability.
   const loadedToolSpecs: unknown[] = [];
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
@@ -593,6 +601,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
     const compactionBoundaryIndex = latestCompactionBoundaryIndex(data.input);
+    // History before a compaction marker or a server-replayed previous response carries schemas,
+    // but cannot prove that the current Codex round still has their callable handlers.
+    const activeDeclarationStart = Math.max(compactionBoundaryIndex + 1, replayedInputPrefixLength);
     const remoteV2CompactionBoundaryIndex = latestRemoteV2CompactionBoundaryIndex(data.input);
     const remoteV2GoalLineageIndex = remoteV2GoalLineageInputIndex(
       rawInput ?? data.input,
@@ -618,25 +629,17 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       if (effectiveType === "additional_tools") {
         // Codex Desktop responses_lite WS path: tools ride INSIDE input as an
         // `additional_tools` item ({type, role, tools:[...]}) instead of body.tools.
-        // Same spec wire shapes (function/namespace/custom/tool_search) — collect and
-        // merge through the exact buildTools path so surface detection (collabSurface)
-        // and chat-model tool listing see them. The item itself never becomes a message;
-        // the native passthrough keeps it verbatim in _rawBody.
+        // The same wire shapes use buildTools after the active-history check. The item itself
+        // never becomes a message; native passthrough keeps it verbatim in _rawBody.
         const at = item as { tools?: unknown };
-        loadedToolSpecs.push(...markToolSpecSource(toolSpecsFromWireContainer(at.tools), "additional_tools"));
+        if (itemIndex >= activeDeclarationStart) {
+          loadedToolSpecs.push(...markToolSpecSource(toolSpecsFromWireContainer(at.tools), "additional_tools"));
+        }
         continue;
       }
 
       if (omitRemoteV2History) {
-        // Deferred tool declarations are capability state rather than conversation history. Keep
-        // them available after compaction, but do not replay the old tool-search transcript.
-        if (effectiveType === "tool_search_output") {
-          const out = item as { tools?: unknown };
-          loadedToolSpecs.push(...markToolSpecSource(
-            toolSpecsFromWireContainer(out.tools),
-            "tool_search_output",
-          ));
-        }
+        // The checkpoint replaces this history, including its old tool-search transcript.
         pendingReasoning.length = 0;
         continue;
       }
@@ -856,7 +859,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         pendingReasoning.length = 0;
         // Pair the tool_search call with its result so the model sees what was loaded.
         const out = item as { call_id?: string; status?: string; tools?: unknown };
-        const specs = toolSpecsFromWireContainer(out.tools);
+        const historical = itemIndex < activeDeclarationStart;
+        const specs = historical ? [] : toolSpecsFromWireContainer(out.tools);
         loadedToolSpecs.push(...markToolSpecSource(specs, "tool_search_output"));
         // List the EXACT wire names the model must call (flattened for namespaced specs), matching
         // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
@@ -864,7 +868,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         const failed = typeof out.status === "string" && out.status !== "completed" && out.status !== "success";
         messages.push({
           role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
-          content: failed && wireNames.length === 0
+          content: historical
+            ? "Historical tool search result; it does not establish a callable handler in the current Codex round."
+            : failed && wireNames.length === 0
             ? `Tool search failed (status: ${out.status}).`
             : wireNames.length
               ? `Tool search loaded these tools — they are now in your available tools. Call one by its EXACT name: ${wireNames.join(", ")}.`
@@ -923,6 +929,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   const mergedTools = [...declaredTools, ...loadedTools]
     .filter(t => {
       const k = namespacedToolName(t.namespace, t.name);
+      if (data.model.startsWith(CHATGPT_WEB_MODEL_PREFIX) && isRecursiveChatGptBridgeTool(t)) return false;
       if (seenTools.has(k)) return false;
       seenTools.add(k);
       return true;

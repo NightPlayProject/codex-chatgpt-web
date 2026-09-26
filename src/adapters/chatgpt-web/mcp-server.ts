@@ -304,6 +304,7 @@ function toolCapabilityReport(
     visibleTools,
     gateway: execGateway(bound),
     contract,
+    localExecutionRecovery: bound.localExecutionRecovery,
   });
 }
 
@@ -925,6 +926,16 @@ export async function runChatGptMcpServer(options: {
           ...(yield_time_ms !== undefined ? { timeout_ms: yield_time_ms } : {}),
           ...permissions,
         };
+        if (contract === "native" && bound.localExecutionRecovery === true) {
+          return asMcpResult(await callTurnBroker<BrokerToolResult>(options.brokerSocketPath, {
+            method: "invoke_local_exec",
+            bindingId: claimed.bindingId,
+            arguments: execCommandArguments,
+            invocationKey: mcpInvocationKey(extra, claimed.bindingId,
+              { name: "codex_local_exec", description: "", parameters: {} },
+              { arguments: execCommandArguments }),
+          }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal));
+        }
         const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
         if (tool) {
           // Never silently discard an approval request on a native registry that cannot express it.
@@ -969,6 +980,22 @@ export async function runChatGptMcpServer(options: {
       async claimed => {
         const { session_id, chars, yield_time_ms, max_output_tokens } = input;
         const bound = claimed.environment;
+        if (contract === "native" && bound.localExecutionRecovery === true) {
+          const arguments_ = {
+            session_id,
+            ...(chars !== undefined ? { chars } : {}),
+            ...(yield_time_ms !== undefined ? { yield_time_ms } : {}),
+            ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
+          };
+          return asMcpResult(await callTurnBroker<BrokerToolResult>(options.brokerSocketPath, {
+            method: "invoke_local_stdin",
+            bindingId: claimed.bindingId,
+            arguments: arguments_,
+            invocationKey: mcpInvocationKey(extra, claimed.bindingId,
+              { name: "codex_local_stdin", description: "", parameters: {} },
+              { arguments: arguments_ }),
+          }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal));
+        }
         const tool = exactTool(bound, "write_stdin");
         const payload = { arguments: {
           session_id,

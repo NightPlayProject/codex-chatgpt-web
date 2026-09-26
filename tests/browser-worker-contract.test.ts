@@ -174,6 +174,60 @@ test("assistant tracking rebinds only one proven replacement after React detache
   )).toThrow("2 new conversation turns");
 });
 
+test("a remounted submitted user turn cannot supersede its own assistant response", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const window = createWindow('<div data-turn-key="hydrated"><div data-user-message-bubble>'
+    + '<div data-search-result-target>Review this folder</div></div>'
+    + '<div data-conversation-role="assistant">Review completed</div></div>'
+    + '<div data-turn-key="foreign"><div data-user-message-bubble>'
+    + '<div data-search-result-target>Different request</div></div>'
+    + '<div data-conversation-role="assistant">Different result</div></div>');
+  const elementsFor = (elements: () => Element[]) => ({
+    count: async () => elements().length,
+    evaluate: async (callback: Function, arg?: unknown) => callback(elements()[0], arg),
+  });
+  const page = {
+    locator(selector: string) {
+      const key = selector.match(/^\[data-turn-key="([^"]+)"\]/)?.[1];
+      return elementsFor(() => key ? [...window.document.querySelectorAll(`[data-turn-key="${key}"]`)] : []);
+    },
+  } as unknown as Page;
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  let state = {
+    turnIdentities: ["group:user:hydrated", "group:assistant:hydrated"],
+    userIdentities: ["group:user:hydrated"],
+    responseIdentities: ["group:assistant:hydrated"],
+  };
+  worker.submissionDomState = async () => state;
+  worker.responseDomSnapshot = async () => ({ responsePresent: true, visibleText: "Different result" });
+  const binding = {
+    identity: "group:assistant:temporary",
+    locator: elementsFor(() => []),
+    acceptedTurnIdentities: ["group:assistant:temporary"],
+  };
+  const baseline = {
+    initialTurnIdentities: [] as string[],
+    acceptedUserIdentity: "group:user:hydrated",
+    submittedText: "Review this folder",
+    domCache: {},
+  };
+  await expect(worker.reconcileAssistantTurnBinding(page, baseline, binding))
+    .resolves.toMatchObject({ identity: "group:assistant:hydrated" });
+
+  // A React remount may assign the same submitted bubble a new key. Its full prompt still proves
+  // it belongs to this send; an unrelated prompt cannot take over the bound assistant response.
+  baseline.acceptedUserIdentity = "group:user:temporary";
+  await expect(worker.reconcileAssistantTurnBinding(page, baseline, binding))
+    .resolves.toMatchObject({ identity: "group:assistant:hydrated" });
+  state = {
+    turnIdentities: ["group:user:foreign", "group:assistant:foreign"],
+    userIdentities: ["group:user:foreign"],
+    responseIdentities: ["group:assistant:foreign"],
+  };
+  await expect(worker.reconcileAssistantTurnBinding(page, baseline, binding, undefined, "Review completed"))
+    .rejects.toThrow("opened another user turn");
+});
+
 test("assistant binding waits for the submitted user and selects its paired power response", async () => {
   const initial = ["group:user:history", "group:assistant:history"];
   expect(chatGptSubmittedAssistantIdentity(
@@ -4817,6 +4871,48 @@ test("proven MCP progress vetoes completion, not only the health verdicts", () =
   expect(tracker.update(finishedLooking, 5_100)).toBeFalse();
   expect(tracker.update(finishedLooking, 5_599)).toBeFalse();
   expect(tracker.update(finishedLooking, 5_600)).toBeTrue();
+});
+
+test("a settled completed response can survive DOM detachment without bypassing tool progress", () => {
+  const tracker = new ChatGptCompletionTracker(500);
+  const finished = {
+    responsePresent: true,
+    running: false,
+    currentText: "final review",
+    currentHtml: "<p>final review</p>",
+    completionActionVisible: true,
+  };
+  expect(tracker.update(finished, 1_000)).toBeFalse();
+  expect(tracker.detachedCompletionReady(finished, 0, false, 1_499)).toBeFalse();
+  expect(tracker.detachedCompletionReady(finished, 0, false, 1_500)).toBeTrue();
+  expect(tracker.detachedCompletionReady(finished, 1, false, 1_500)).toBeFalse();
+  expect(tracker.detachedCompletionReady(finished, 0, true, 1_500)).toBeFalse();
+  expect(tracker.detachedCompletionReady({ ...finished, completionActionVisible: false }, 0, false, 1_500))
+    .toBeFalse();
+});
+
+test("an explicit post-tool completion survives immediate DOM detachment after the tool settles", () => {
+  const tracker = new ChatGptCompletionTracker(500);
+  expect(tracker.observeToolBatch(1, "answer before tool")).toBeTrue();
+  const finished = {
+    responsePresent: true,
+    running: false,
+    currentText: "final answer after tool",
+    currentHtml: "<p>final answer after tool</p>",
+    completionActionVisible: true,
+  };
+
+  expect(tracker.detachedCompletionReady(finished, 1, false, 1_000)).toBeTrue();
+  expect(tracker.detachedCompletionReady({
+    ...finished,
+    currentText: "answer before tool",
+    currentHtml: "<p>answer before tool</p>",
+  }, 1, false, 1_000)).toBeFalse();
+  expect(tracker.detachedCompletionReady(finished, 2, false, 1_000)).toBeFalse();
+  expect(tracker.detachedCompletionReady(finished, 1, true, 1_000)).toBeFalse();
+  expect(tracker.detachedCompletionReady({ ...finished, running: true }, 1, false, 1_000)).toBeFalse();
+  expect(tracker.detachedCompletionReady({ ...finished, completionActionVisible: false }, 1, false, 1_000))
+    .toBeFalse();
 });
 
 test("Full mode has no fixed post-tool final-answer deadline", () => {

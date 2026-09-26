@@ -193,10 +193,17 @@ export function resolveChatGptWebContextLimits(
   ) {
     throw new Error(`ChatGPT Plus context limit is not defined for unavailable effort: ${effort}`);
   }
-  limits = solContextLimits(
-    CHATGPT_WEB_SOL_CONTEXT_WINDOW,
-    CHATGPT_WEB_SOL_AUTO_COMPACT_TOKEN_LIMIT,
-  );
+  // Standard Context must compact before its browser preflight limit. The 500k canonical window
+  // is not a reliable single-message transport size; Bigger Context can keep the 400k interval.
+  // Medium and High share one catalog row, so both use High's safer measured trigger.
+  const autoCompactTokenLimit = capabilities.experimentalBiggerContext
+    ? CHATGPT_WEB_SOL_AUTO_COMPACT_TOKEN_LIMIT
+    : capabilities.proAvailable
+      ? CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT
+      : effort === "low"
+        ? CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT
+        : CHATGPT_WEB_HIGH_RELIABLE_AUTO_COMPACT_TOKEN_LIMIT;
+  limits = solContextLimits(CHATGPT_WEB_SOL_CONTEXT_WINDOW, autoCompactTokenLimit);
   // Bigger Context expands browser transport across multiple acknowledged messages. It does not
   // enlarge Codex's canonical model window: multiplying this value used to advertise 1.5M/1.2M,
   // which let native history outrun the intended 500k/400k compaction boundary and made model

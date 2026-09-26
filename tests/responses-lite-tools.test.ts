@@ -227,6 +227,75 @@ test("Responses Lite flattens object-mapped tool-search output and reports calla
   );
 });
 
+test("post-compaction requests do not expose historical tool declarations as callable handlers", () => {
+  const history = [
+    { type: "additional_tools", role: "developer", tools: responsesLiteTools().slice(0, 1) },
+    { type: "tool_search_call", id: "old_search", call_id: "old_search", arguments: "{}" },
+    { type: "tool_search_output", call_id: "old_search", status: "completed", tools: objectMappedComputerUseTools() },
+    { type: "context_compaction" },
+    { type: "message", role: "user", content: "continue after compaction" },
+  ];
+  const missingCatalog = parseRequest({ model: "chatgpt-web/high", input: history });
+  expect(missingCatalog.context.tools ?? []).toEqual([]);
+  const oldSearchResult = missingCatalog.context.messages.find(message => message.role === "toolResult");
+  expect(oldSearchResult?.role === "toolResult" ? oldSearchResult.content : "")
+    .toContain("does not establish a callable handler");
+
+  const freshCatalog = parseRequest({
+    model: "chatgpt-web/high",
+    input: [
+      ...history,
+      { type: "additional_tools", role: "developer", tools: responsesLiteTools().slice(1) },
+    ],
+  });
+  expect(freshCatalog.context.tools).toEqual([
+    expect.objectContaining({ name: "run_script", namespace: "mcp__python" }),
+  ]);
+});
+
+test("ChatGPT Web never routes its echoed Codex Native connector back into Codex", () => {
+  const recursive = {
+    type: "namespace", name: "mcp__codex_apps", tools: [
+      { type: "function", name: "codex_native2___codex_exec", description: "Run a command", parameters: { type: "object" } },
+      { type: "function", name: "codex_native2_codex_tool_call", description: "Call a tool", parameters: { type: "object" } },
+    ],
+  };
+  const web = parseRequest({
+    model: "chatgpt-web/high",
+    tools: [recursive],
+    input: [{ type: "additional_tools", role: "developer", tools: [recursive] }],
+  });
+  expect(web.context.tools ?? []).toEqual([]);
+
+  const otherApp = {
+    type: "namespace", name: "mcp__codex_apps", tools: [
+      { type: "function", name: "calendar_search", description: "Find events", parameters: { type: "object" } },
+    ],
+  };
+  const mixed = parseRequest({ model: "chatgpt-web/high", tools: [recursive, otherApp] });
+  expect(mixed.context.tools).toEqual([
+    expect.objectContaining({ namespace: "mcp__codex_apps", name: "calendar_search" }),
+  ]);
+
+  const native = parseRequest({ model: "gpt-5.2", tools: [recursive] });
+  expect(native.context.tools).toEqual(expect.arrayContaining([
+    expect.objectContaining({ namespace: "mcp__codex_apps", name: "codex_native2___codex_exec" }),
+  ]));
+});
+
+test("remote v2 compaction never replays a retired tool-search catalog", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/high",
+    input: [
+      { type: "tool_search_call", id: "old_search", call_id: "old_search", arguments: "{}" },
+      { type: "tool_search_output", call_id: "old_search", status: "completed", tools: objectMappedComputerUseTools() },
+      { type: "compaction", encrypted_content: "opaque-history" },
+      { type: "message", role: "user", content: "continue" },
+    ],
+  });
+  expect(parsed.context.tools ?? []).toEqual([]);
+});
+
 test("Responses Lite relays a static Computer Use call through its namespace", async () => {
   const config = defaultConfig("full");
   config.solAvailable = false;

@@ -149,17 +149,17 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
       contextWindow: 500_000,
       effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 400_000,
+      autoCompactTokenLimit: 32_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toEqual({
       contextWindow: 500_000,
       effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 400_000,
+      autoCompactTokenLimit: 70_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toEqual({
       contextWindow: 500_000,
       effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 400_000,
+      autoCompactTokenLimit: 70_000,
     });
     expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toBe(32_000);
     expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toBe(80_000);
@@ -180,19 +180,19 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", pro)).toEqual({
       contextWindow: 500_000,
       effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 400_000,
+      autoCompactTokenLimit: 95_000,
     });
     for (const effort of ["medium", "high", "xhigh"] as const) {
       expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toEqual({
         contextWindow: 500_000,
         effectiveContextWindowPercent: 100,
-        autoCompactTokenLimit: 400_000,
+        autoCompactTokenLimit: 95_000,
       });
     }
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", pro)).toEqual({
       contextWindow: 500_000,
       effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 400_000,
+      autoCompactTokenLimit: 95_000,
     });
     for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
       expect(resolveChatGptWebBrowserStagingTokenLimit(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toBe(95_000);

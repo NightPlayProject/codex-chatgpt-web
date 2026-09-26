@@ -22,16 +22,20 @@ const PROVIDER_QUOTA_RUNTIME_KEY = "__codexWebGptProviderQuotaRuntime";
 const PROVIDER_QUOTA_SOURCE_NEEDLE = 'Rt=X(RK)&&et===`local`';
 const PROVIDER_QUOTA_NEXT_NEEDLE = ",zt=";
 const PROVIDER_QUOTA_SUBMIT_NEEDLE = "cn=ye||$e||ot||nt||Rt";
-const PROVIDER_MODEL_RENDER_NEEDLE = "rateLimitSendBlocked:";
-const PROVIDER_MODEL_SELECTED_NEEDLE = "selectedModel:";
-const PROVIDER_MODEL_CHANGE_NEEDLE = ",onModelChange:";
+const ACTIVE_MODEL_SETTER_NEEDLE = "zt=function(e,t){return(oe?.selectModelAndReasoningEffort??ne)(Bt(e),t,()=>{";
+const ACTIVE_MODEL_CALLBACK_NEEDLE = "Sn=(e,t)=>{zt(e,t)}";
+const ACTIVE_MODEL_PROP_NEEDLE = "onSelectModel:Sn";
+const ACTIVE_COMPOSER_START_NEEDLE = "function q3t(e){";
+const ACTIVE_COMPOSER_QUOTA_NEEDLE = "rn=X(dA)&&gt===`local`";
+const ACTIVE_COMPOSER_SEND_NEEDLE = "let Nn=Ee||Qe&&$e||mt||St||Yt?.isLoading===!0||vt||rn,Pn;";
+const ACTIVE_COMPOSER_SUBMIT_NEEDLE = "submitDisabled:Nn";
 
 function providerQuotaBreakpointCondition(quotaVariable) {
   return `globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true&&(${quotaVariable}=false)`;
 }
 
 function providerSelectionBreakpointCondition(modelVariable) {
-  return `(globalThis.${PROVIDER_SELECTED_STATE_KEY}=!!(${modelVariable}&&typeof ${modelVariable}.slug===\"string\"&&${modelVariable}.slug.startsWith(\"chatgpt-web/\")),false)`;
+  return `(globalThis.${PROVIDER_SELECTED_STATE_KEY}=typeof ${modelVariable}===\"string\"&&${modelVariable}.startsWith(\"chatgpt-web/\"),false)`;
 }
 
 function sourceLocationForIndex(source, index) {
@@ -116,45 +120,60 @@ function providerQuotaBreakpointSite(source) {
   };
 }
 
-function providerAuthoritativeModelBreakpointSite(source, quotaIndexOverride = null) {
+function providerActiveComposerQuotaBreakpointSite(source) {
   const text = String(source ?? "");
-  const renders = [];
-  let render = -1;
-  while ((render = text.indexOf(PROVIDER_MODEL_RENDER_NEEDLE, render + 1)) >= 0) renders.push(render);
-  if (renders.length === 0) return { found: false, reason: "model-render-needle-missing" };
-
-  const candidates = [];
-  for (let index = 0; index < renders.length; index += 1) {
-    const renderIndex = renders[index];
-    const nextRenderIndex = renders[index + 1] ?? text.length;
-    const selected = text.indexOf(PROVIDER_MODEL_SELECTED_NEEDLE, renderIndex + PROVIDER_MODEL_RENDER_NEEDLE.length);
-    if (selected < 0 || selected >= nextRenderIndex) continue;
-    const change = text.indexOf(PROVIDER_MODEL_CHANGE_NEEDLE, selected + PROVIDER_MODEL_SELECTED_NEEDLE.length);
-    if (change < 0 || change >= nextRenderIndex || change - selected > 20_000) continue;
-    const valueIndex = selected + PROVIDER_MODEL_SELECTED_NEEDLE.length;
-    const modelMatch = text.slice(valueIndex, valueIndex + 128).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
-    if (!modelMatch) continue;
-    const memoBoundary = text.indexOf("}),t[", change + PROVIDER_MODEL_CHANGE_NEEDLE.length);
-    if (memoBoundary < 0 || memoBoundary >= nextRenderIndex || memoBoundary - change > 20_000) continue;
-    const breakpointIndex = memoBoundary + 3;
-    candidates.push({ renderIndex, change, valueIndex, breakpointIndex, modelVariable: modelMatch[1] });
+  const start = text.indexOf(ACTIVE_COMPOSER_START_NEEDLE);
+  if (start < 0) return { found: false, reason: "active-composer-missing" };
+  if (text.indexOf(ACTIVE_COMPOSER_START_NEEDLE, start + ACTIVE_COMPOSER_START_NEEDLE.length) >= 0) {
+    return { found: false, reason: "active-composer-ambiguous" };
   }
-  if (candidates.length === 0) return { found: false, reason: "model-render-layout-changed" };
-
-  const quotaIndex = Number.isInteger(quotaIndexOverride)
-    ? quotaIndexOverride
-    : text.indexOf(PROVIDER_QUOTA_SOURCE_NEEDLE);
-  const beforeQuota = quotaIndex < 0 ? candidates : candidates.filter(candidate => candidate.renderIndex < quotaIndex);
-  const chosen = (beforeQuota.length > 0 ? beforeQuota : candidates).at(-1);
+  const nextFunction = text.indexOf("function ", start + ACTIVE_COMPOSER_START_NEEDLE.length);
+  const end = nextFunction < 0 ? text.length : nextFunction;
+  const body = text.slice(start, end);
+  const quota = body.indexOf(ACTIVE_COMPOSER_QUOTA_NEEDLE);
+  const send = body.indexOf(ACTIVE_COMPOSER_SEND_NEEDLE);
+  const submit = body.indexOf(ACTIVE_COMPOSER_SUBMIT_NEEDLE);
+  if (quota < 0 || send < 0 || submit < 0
+    || body.indexOf(ACTIVE_COMPOSER_QUOTA_NEEDLE, quota + 1) >= 0
+    || body.indexOf(ACTIVE_COMPOSER_SEND_NEEDLE, send + 1) >= 0
+    || body.indexOf(ACTIVE_COMPOSER_SUBMIT_NEEDLE, submit + 1) >= 0
+    || send <= quota || send - quota > 12_000 || submit <= send) {
+    return { found: false, reason: "active-composer-quota-layout-changed" };
+  }
+  // The breakpoint must run after rn was computed, before Nn consumes it.
+  const expressionIndex = start + send + "let Nn=".length;
   return {
     found: true,
     reason: null,
-    modelVariable: chosen.modelVariable,
-    candidateCount: candidates.length,
-    candidateIndex: chosen.breakpointIndex,
-    candidate: sourceLocationForIndex(text, chosen.breakpointIndex),
-    endIndex: chosen.breakpointIndex + 256,
-    end: sourceLocationForIndex(text, Math.min(text.length, chosen.breakpointIndex + 256)),
+    quotaVariable: "rn",
+    candidateIndex: expressionIndex,
+    candidate: sourceLocationForIndex(text, expressionIndex),
+    submitIndex: start + submit,
+    submit: sourceLocationForIndex(text, start + submit),
+  };
+}
+
+function providerActiveModelChangeBreakpointSite(source) {
+  const text = String(source ?? "");
+  const setter = text.indexOf(ACTIVE_MODEL_SETTER_NEEDLE);
+  const callback = text.indexOf(ACTIVE_MODEL_CALLBACK_NEEDLE, setter + ACTIVE_MODEL_SETTER_NEEDLE.length);
+  const prop = text.indexOf(ACTIVE_MODEL_PROP_NEEDLE, callback + ACTIVE_MODEL_CALLBACK_NEEDLE.length);
+  if (setter < 0 || callback < 0 || prop < 0
+    || text.indexOf(ACTIVE_MODEL_SETTER_NEEDLE, setter + 1) >= 0
+    || text.indexOf(ACTIVE_MODEL_CALLBACK_NEEDLE, callback + 1) >= 0
+    || text.indexOf(ACTIVE_MODEL_PROP_NEEDLE, prop + 1) >= 0
+    || callback - setter > 10_000 || prop - callback > 10_000) {
+    return { found: false, reason: "active-model-change-layout-changed" };
+  }
+  const breakpointIndex = setter + "zt=function(e,t){".length;
+  return {
+    found: true,
+    reason: null,
+    modelVariable: "Bt(e)",
+    candidateIndex: breakpointIndex,
+    candidate: sourceLocationForIndex(text, breakpointIndex),
+    endIndex: breakpointIndex + 80,
+    end: sourceLocationForIndex(text, breakpointIndex + 80),
   };
 }
 
@@ -969,15 +988,26 @@ async function installProviderAwareComposerQuotaPatch(contents) {
   const source = String(sourceResult?.scriptSource ?? "");
   const site = providerQuotaBreakpointSite(source);
   if (!site.found) return { applied: false, reason: site.reason };
-  const modelSite = providerAuthoritativeModelBreakpointSite(source, site.sourceIndex);
+  const modelSite = providerActiveModelChangeBreakpointSite(source);
   if (!modelSite.found) return { applied: false, reason: modelSite.reason };
+  const activeSite = providerActiveComposerQuotaBreakpointSite(source);
+  if (!activeSite.found) return { applied: false, reason: activeSite.reason };
   await contents.executeJavaScript(providerAwareComposerQuotaRuntimeScript(true));
   const initialModelState = await contents.executeJavaScript(providerAuthoritativeModelStateScript());
-
+  const modelPossibleResult = await contents.sendCommand("Debugger.getPossibleBreakpoints", {
+    start: { scriptId: script.scriptId, ...modelSite.candidate },
+    end: { scriptId: script.scriptId, ...modelSite.end },
+    restrictToFunction: false,
+  });
+  const modelLocation = (modelPossibleResult?.locations || []).find(candidate => (
+    candidate.lineNumber === modelSite.candidate.lineNumber
+    && candidate.columnNumber === modelSite.candidate.columnNumber
+  ));
+  if (!modelLocation) return { applied: false, reason: "active-model-breakpoint-location-missing" };
   const modelBreakpoint = await contents.sendCommand("Debugger.setBreakpointByUrl", {
     url: script.url,
-    lineNumber: modelSite.candidate.lineNumber,
-    columnNumber: modelSite.candidate.columnNumber,
+    lineNumber: modelLocation.lineNumber,
+    columnNumber: modelLocation.columnNumber,
     condition: providerSelectionBreakpointCondition(modelSite.modelVariable),
   });
   if (typeof modelBreakpoint?.breakpointId !== "string") {
@@ -1011,6 +1041,34 @@ async function installProviderAwareComposerQuotaPatch(contents) {
     await contents.sendCommand("Debugger.removeBreakpoint", { breakpointId: modelBreakpoint.breakpointId }).catch(() => {});
     return { applied: false, reason: "quota-breakpoint-install-failed" };
   }
+  const activePossibleResult = await contents.sendCommand("Debugger.getPossibleBreakpoints", {
+    start: { scriptId: script.scriptId, ...activeSite.candidate },
+    end: { scriptId: script.scriptId, ...activeSite.submit },
+    restrictToFunction: false,
+  });
+  // A later pause point would be too late: Nn could already contain the native block.
+  const activeLocation = (activePossibleResult?.locations || []).find(candidate => (
+    candidate.lineNumber === activeSite.candidate.lineNumber
+    && candidate.columnNumber === activeSite.candidate.columnNumber
+  ));
+  if (!activeLocation) {
+    await Promise.all([modelBreakpoint.breakpointId, breakpoint.breakpointId].map(breakpointId => (
+      contents.sendCommand("Debugger.removeBreakpoint", { breakpointId }).catch(() => {})
+    )));
+    return { applied: false, reason: "active-quota-breakpoint-location-missing" };
+  }
+  const activeBreakpoint = await contents.sendCommand("Debugger.setBreakpointByUrl", {
+    url: script.url,
+    lineNumber: activeLocation.lineNumber,
+    columnNumber: activeLocation.columnNumber,
+    condition: providerQuotaBreakpointCondition(activeSite.quotaVariable),
+  });
+  if (typeof activeBreakpoint?.breakpointId !== "string") {
+    await Promise.all([modelBreakpoint.breakpointId, breakpoint.breakpointId].map(breakpointId => (
+      contents.sendCommand("Debugger.removeBreakpoint", { breakpointId }).catch(() => {})
+    )));
+    return { applied: false, reason: "active-quota-breakpoint-install-failed" };
+  }
   const rerender = initialModelState?.webSelected === true
     ? await contents.executeJavaScript(providerComposerQuotaRerenderScript())
     : { dispatched: false, reason: "web-model-not-selected" };
@@ -1018,7 +1076,8 @@ async function installProviderAwareComposerQuotaPatch(contents) {
     applied: true,
     reason: null,
     breakpointId: breakpoint.breakpointId,
-    breakpointIds: [modelBreakpoint.breakpointId, breakpoint.breakpointId],
+    breakpointIds: [modelBreakpoint.breakpointId, breakpoint.breakpointId, activeBreakpoint.breakpointId],
+    activeBreakpointId: activeBreakpoint.breakpointId,
     modelBreakpointId: modelBreakpoint.breakpointId,
     modelVariable: modelSite.modelVariable,
     quotaVariable: site.quotaVariable,
@@ -1027,7 +1086,8 @@ async function installProviderAwareComposerQuotaPatch(contents) {
     rerender,
     url: script.url,
     location: { lineNumber: location.lineNumber, columnNumber: location.columnNumber },
-    modelLocation: { lineNumber: modelSite.candidate.lineNumber, columnNumber: modelSite.candidate.columnNumber },
+    activeLocation: { lineNumber: activeLocation.lineNumber, columnNumber: activeLocation.columnNumber },
+    modelLocation: { lineNumber: modelLocation.lineNumber, columnNumber: modelLocation.columnNumber },
   };
 }
 
@@ -1215,6 +1275,7 @@ function createOfficialCodexWallpaperController({
             rateLimitUsageCheckedAt: 0,
             rateLimitUsage: null,
             nativeQuotaBlocked: null,
+            authoritativeWebSelected: null,
             providerGateActive: false,
             rateLimitRecoveryCooldownUntil: 0,
           };
@@ -1237,6 +1298,7 @@ function createOfficialCodexWallpaperController({
             entry.providerQuotaPatchApplied = false;
             entry.providerQuotaPatchAttemptedAt = 0;
             entry.providerQuotaPatchUnavailableReason = null;
+            entry.authoritativeWebSelected = null;
             if (wallpapersEnabled) {
               applied += 1;
               logger.info("wallpapers.official_codex_applied", {
@@ -1266,6 +1328,8 @@ function createOfficialCodexWallpaperController({
                   modelLineNumber: patch.modelLocation?.lineNumber ?? null,
                   modelColumnNumber: patch.modelLocation?.columnNumber ?? null,
                   modelVariable: patch.modelVariable ?? null,
+                  activeLineNumber: patch.activeLocation?.lineNumber ?? null,
+                  activeColumnNumber: patch.activeLocation?.columnNumber ?? null,
                 });
               } else {
                 if (entry.providerQuotaPatchUnavailableReason !== patch.reason) {
@@ -1279,7 +1343,13 @@ function createOfficialCodexWallpaperController({
             }
             await readRateLimitUsage(entry, target.id, checkedAt);
             await entry.contents.executeJavaScript(nativeQuotaStateScript(entry.nativeQuotaBlocked === true));
-            await entry.contents.executeJavaScript(providerAuthoritativeModelStateScript());
+            const previousWebSelection = entry.authoritativeWebSelected;
+            const authoritativeModel = await entry.contents.executeJavaScript(providerAuthoritativeModelStateScript());
+            entry.authoritativeWebSelected = authoritativeModel?.webSelected === true;
+            if (entry.providerQuotaPatchApplied && entry.nativeQuotaBlocked === true
+              && previousWebSelection !== null && previousWebSelection !== entry.authoritativeWebSelected) {
+              await entry.contents.executeJavaScript(providerComposerQuotaRerenderScript());
+            }
             await maybeRecoverStaleRateLimit(entry, target.id);
           } else {
             await entry.contents.executeJavaScript(nativeQuotaStateScript(false));
@@ -1505,6 +1575,7 @@ function createOfficialCodexWallpaperController({
           )));
         }
         entry.providerQuotaPatchApplied = false;
+        entry.authoritativeWebSelected = null;
         entry.providerQuotaBreakpointIds = [];
         entry.providerQuotaBreakpointUrl = null;
         entry.providerGateActive = false;
@@ -1583,6 +1654,8 @@ module.exports = {
   officialAppTarget,
   installProviderAwareComposerQuotaPatch,
   providerQuotaBreakpointSite,
+  providerActiveComposerQuotaBreakpointSite,
+  providerActiveModelChangeBreakpointSite,
   providerAwareComposerQuotaRuntimeScript,
   providerAuthoritativeModelStateScript,
   providerComposerQuotaRerenderScript,

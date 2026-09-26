@@ -1647,6 +1647,13 @@ export function chatGptReboundTurnIdentity(
   return chatGptNewTurnIdentity(initial, current);
 }
 
+class ChatGptDetachedAssistantSupersededError extends Error {
+  constructor() {
+    super("ChatGPT opened another user turn while the bound assistant response was detached");
+    this.name = "ChatGptDetachedAssistantSupersededError";
+  }
+}
+
 export class ChatGptCompletionTracker {
   private candidate?: { signature: string; since: number };
   private actionlessCandidate?: { signature: string; since: number };
@@ -1677,6 +1684,29 @@ export class ChatGptCompletionTracker {
     this.candidate = undefined;
     this.actionlessCandidate = undefined;
     return true;
+  }
+
+  detachedCompletionReady(
+    state: Parameters<typeof chatGptTurnIsComplete>[0],
+    currentToolBatchRevision: number,
+    externalToolCallsInFlight: boolean,
+    now = Date.now(),
+  ): boolean {
+    if (!Number.isSafeInteger(currentToolBatchRevision) || currentToolBatchRevision < this.lastToolBatchRevision) {
+      throw new Error("ChatGPT completion received an invalid tool-batch revision");
+    }
+    if (externalToolCallsInFlight || currentToolBatchRevision > this.lastToolBatchRevision) return false;
+    if (!chatGptTurnIsComplete(state)) return false;
+    const signature = `${state.currentText}\0${state.currentHtml ?? state.currentText}`;
+    if (this.candidate?.signature === signature && now - this.candidate.since >= this.stableMs) return true;
+    // Tool activity deliberately resets the ordinary settle candidate. If ChatGPT then renders an
+    // explicit completed post-tool answer and immediately detaches that assistant subtree, there
+    // is no second DOM sample from which to rebuild the settle window. Preserve that terminal
+    // projection only after every observed tool has settled and only when the answer moved beyond
+    // the exact pre-tool boundary. The outer completion fence still rejects a racing new batch.
+    return this.lastToolBatchRevision > 0
+      && this.postToolAnswerBaselineText !== undefined
+      && state.currentText !== this.postToolAnswerBaselineText;
   }
 
   update(
@@ -3401,11 +3431,44 @@ export class ChatGptBrowserWorker {
     }
   }
 
+  private async submittedPromptMatchesUserIdentity(
+    page: Page,
+    identity: string,
+    submittedText: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (submittedText === undefined) return false;
+    const groupPrefix = "group:user:";
+    const grouped = identity.startsWith(groupPrefix);
+    const selector = grouped
+      ? `[data-turn-key=${JSON.stringify(identity.slice(groupPrefix.length))}]`
+      : `[data-turn-id=${JSON.stringify(identity)}]`;
+    const root = page.locator(selector);
+    if (await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(root.count(), signal)) !== 1) return false;
+    const observed = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(root.evaluate((element, isGrouped) => {
+      const message = isGrouped
+        ? element.querySelector("[data-user-message-bubble]")
+        : element.matches('[data-message-author-role="user"]')
+          ? element
+          : element.querySelector('[data-message-author-role="user"]');
+      if (!message) return undefined;
+      const clone = message.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll(
+        '[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name], .turn-action-controls',
+      ).forEach(part => part.remove());
+      const contents = clone.querySelectorAll("[data-search-result-target]");
+      return (contents.length === 1 ? contents[0]!.textContent : clone.textContent ?? "")?.trimStart();
+    }, grouped), signal));
+    const normalize = (text: string) => text.replace(/\r\n?/g, "\n");
+    return observed !== undefined && this.promptTextEquivalent(normalize(submittedText), normalize(observed));
+  }
+
   private async reconcileAssistantTurnBinding(
     page: Page,
     baseline: ChatGptSubmissionBaseline,
     binding: ChatGptAssistantTurnBinding,
     signal?: AbortSignal,
+    knownResponseText?: string,
   ): Promise<ChatGptAssistantTurnBinding> {
     const boundCount = await withChatGptBrowserObservationTimeout(
       withBrowserTurnAbort(binding.locator.count(), signal),
@@ -3427,40 +3490,32 @@ export class ChatGptBrowserWorker {
       binding.identity,
       state.responseIdentities,
     );
-    const newUsers = state.userIdentities.filter(identity => !acceptedTurns.has(identity));
+    const newUsers = state.userIdentities.filter(identity => (
+      !acceptedTurns.has(identity) && identity !== baseline.acceptedUserIdentity
+    ));
     if (newUsers.length > 0) {
-      // Activity can unmount the accepted user group while it renders a temporary
-      // assistant group. Its return must match the ID that acknowledged Send. If no
-      // user ID was observed then, require the entire submitted text instead. A
-      // surviving old group or any competing new turn remains foreign.
-      const user = newUsers[0]!;
-      const replacement = identity && newUsers.length === 1
-        && binding.identity.startsWith("group:assistant:")
-        && user.startsWith("group:user:")
-        && identity === `group:assistant:${user.slice("group:user:".length)}`
-        && !state.turnIdentities.includes(binding.identity)
-        && state.turnIdentities.every(turn => acceptedTurns.has(turn) || turn === user || turn === identity);
-      let matches = false;
-      if (replacement) {
-        const locator = page.locator(chatGptAssistantTurnSelector(identity!));
-        matches = baseline.acceptedUserIdentity
-          ? user === baseline.acceptedUserIdentity
-          : Boolean(baseline.submittedText) && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, submitted) => {
-          const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
-          const contents = bubbles.length === 1
-            ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]")
-            : [];
-          const normalize = (text: string) => text.replace(/\r\n?/g, "\n");
-          // The bubble also contains Show more and accessibility spacing. Only its
-          // observed message-content target represents the submitted prompt.
-          return contents.length === 1 && normalize(contents[0]!.innerText) === normalize(submitted);
-        }, baseline.submittedText!), signal));
-        if (matches) {
-          const response = await this.responseDomSnapshot(locator, {});
-          matches = response.responsePresent && response.completionActionVisible;
-        }
+      const user = newUsers.length === 1 ? newUsers[0]! : undefined;
+      const pairedReplacement = user !== undefined
+        && identity?.startsWith("group:assistant:") === true
+        && user === `group:user:${identity.slice("group:assistant:".length)}`;
+      const promptMatches = user !== undefined && await this.submittedPromptMatchesUserIdentity(
+        page, user, baseline.submittedText, signal,
+      );
+      let responseContinues = false;
+      if (!promptMatches && pairedReplacement && identity !== binding.identity && knownResponseText) {
+        const rebound = await this.responseDomSnapshot(page.locator(chatGptAssistantTurnSelector(identity!)), {});
+        responseContinues = rebound.responsePresent
+          && rebound.visibleText.length >= knownResponseText.length
+          && this.promptEquivalentPrefixLength(knownResponseText, rebound.visibleText) === knownResponseText.length;
       }
-      if (!matches) throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      if (!promptMatches && !responseContinues) throw new ChatGptDetachedAssistantSupersededError();
+      baseline.acceptedUserIdentity = user;
+    }
+    if (identity?.startsWith("group:assistant:") && identity !== binding.identity) {
+      const matchingUser = `group:user:${identity.slice("group:assistant:".length)}`;
+      if (matchingUser !== baseline.acceptedUserIdentity && !acceptedTurns.has(matchingUser)) {
+        throw new Error("ChatGPT replacement assistant turn did not match the accepted submitted user turn");
+      }
     }
     if (!identity || identity === binding.identity) return binding;
     return {
@@ -5616,6 +5671,9 @@ export class ChatGptBrowserWorker {
       let internalObservationFaults = 0;
       let observedThisIteration = false;
       let completionFenceRevision: number | undefined;
+      let lastObservedResponseText = "";
+      let lastObservedResponseSnapshot: ChatGptResponseDomSnapshot | undefined;
+      let lastObservedResponseRunning = true;
       for (;;) {
         // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
         // a defect in the caller must not be retried as though the page could not be read.
@@ -5654,7 +5712,25 @@ export class ChatGptBrowserWorker {
         }
 
         let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
+        let detachedCompletionSnapshot = false;
         if (!snapshot.responsePresent) {
+          const preserveSettledDetachedCompletion = (): boolean => {
+            if (!lastObservedResponseSnapshot) return false;
+            const progress = turn.externalProgress?.snapshot();
+            if (!completionTracker.detachedCompletionReady({
+              responsePresent: true,
+              running: lastObservedResponseRunning,
+              currentText: lastObservedResponseSnapshot.visibleText,
+              currentHtml: lastObservedResponseSnapshot.fullHtml,
+              completionActionVisible: lastObservedResponseSnapshot.completionActionVisible,
+            }, progress?.lastToolBatchRevision ?? 0, chatGptExternalToolCallsAreInFlight(progress))) return false;
+            snapshot = lastObservedResponseSnapshot;
+            detachedCompletionSnapshot = true;
+            console.warn(
+              `[chatgpt-web] browser turn ${turn.traceId} preserved settled completion after ChatGPT detached its bound assistant DOM`,
+            );
+            return true;
+          };
           try {
             const rebound = await withChatGptBrowserObservationTimeout(
               this.reconcileAssistantTurnBinding(
@@ -5662,6 +5738,7 @@ export class ChatGptBrowserWorker {
                 submissionBaseline,
                 responseTurn,
                 turn.abortSignal,
+                lastObservedResponseText,
               ),
             );
             if (rebound.identity !== responseTurn.identity) {
@@ -5671,30 +5748,35 @@ export class ChatGptBrowserWorker {
               snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
             }
           } catch (error) {
-            if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
-            consecutiveObservationRebinds += 1;
-            if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
-              throw new Error(
-                `ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
-                { cause: error },
-              );
+            if (error instanceof ChatGptDetachedAssistantSupersededError) {
+              if (!preserveSettledDetachedCompletion()) throw error;
+            } else {
+              if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
+              consecutiveObservationRebinds += 1;
+              if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
+                throw new Error(
+                  `ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
+                  { cause: error },
+                );
+              }
+              await rebindLauncherPage(consecutiveObservationRebinds, error, turn.abortSignal);
+              submissionBaseline = {
+                ...submissionBaseline,
+                userTurns: page.locator(CHATGPT_USER_TURN_SELECTOR),
+                responseTurns: page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR),
+                domCache: {},
+              };
+              responseTurn = {
+                ...responseTurn,
+                locator: page.locator(chatGptAssistantTurnSelector(responseTurn.identity)),
+              };
+              responseDomCache.key = undefined;
+              responseDomCache.snapshot = undefined;
+              await diagnostics.capture(page, "response-page-rebound");
+              continue;
             }
-            await rebindLauncherPage(consecutiveObservationRebinds, error, turn.abortSignal);
-            submissionBaseline = {
-              ...submissionBaseline,
-              userTurns: page.locator(CHATGPT_USER_TURN_SELECTOR),
-              responseTurns: page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR),
-              domCache: {},
-            };
-            responseTurn = {
-              ...responseTurn,
-              locator: page.locator(chatGptAssistantTurnSelector(responseTurn.identity)),
-            };
-            responseDomCache.key = undefined;
-            responseDomCache.snapshot = undefined;
-            await diagnostics.capture(page, "response-page-rebound");
-            continue;
           }
+          if (!snapshot.responsePresent) preserveSettledDetachedCompletion();
         }
         if (snapshot.stoppedThinkingVisible) throw chatGptStoppedThinkingError();
         if (snapshot.responsePresent) consecutiveObservationRebinds = 0;
@@ -5712,6 +5794,10 @@ export class ChatGptBrowserWorker {
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
           );
+          // A newly accepted batch invalidates any terminal projection captured before that tool.
+          // Otherwise a detached pre-tool answer could be returned as the post-tool result.
+          lastObservedResponseSnapshot = undefined;
+          lastObservedResponseText = "";
           await turn.externalProgress.acknowledgeToolBatch(externalProgressSnapshot.lastToolBatchRevision);
         }
         const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
@@ -5728,9 +5814,14 @@ export class ChatGptBrowserWorker {
           continue;
         }
         const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
-        const running = await stop.isVisible().catch(() => false);
+        const running = detachedCompletionSnapshot ? false : await stop.isVisible().catch(() => false);
         if (running) sawRunning = true;
         if (snapshot.responsePresent) {
+          lastObservedResponseText = snapshot.visibleText;
+          if (!detachedCompletionSnapshot) {
+            lastObservedResponseSnapshot = snapshot;
+            lastObservedResponseRunning = running;
+          }
           if (!capturedResponse) {
             capturedResponse = true;
             await diagnostics.capture(page, "response-visible");

@@ -21,6 +21,8 @@ export interface ChatGptTurnEnvironment {
   writableRoots: string[];
   sandboxPolicy: ChatGptSandboxPolicy;
   tools: CodexTool[];
+  /** An unrestricted, trusted Web turn whose current Codex round omitted a callable command handler. */
+  localExecutionRecovery?: true;
 }
 
 export interface ChatGptTurnIdentity {

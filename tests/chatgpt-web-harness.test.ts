@@ -292,6 +292,54 @@ function canonicalJson(value: unknown): string {
 }
 
 describe("ChatGPT outer-native harness v4", () => {
+  test.each([false, true, "mixed" as const])("missing native command handler uses trusted unrestricted recovery only when tool_choice permits it (%s)", async variant => {
+    const disabled = variant === true;
+    const tools: CodexTool[] = variant === "mixed"
+      ? [{ name: "view_image", description: "View an image", parameters: { type: "object" } }]
+      : [];
+    const socketPath = brokerTestEndpoint(`cgw-local-policy-${process.pid}-${Date.now()}-${variant}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-local-policy-${Date.now()}-${variant}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "local-policy-launcher.json"),
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+      expect(token).toBeDefined();
+      const claimed = await callTurnBroker<{ activityId: string; environment: { localExecutionRecovery?: true; tools: CodexTool[] } }>(
+        socketPath, { method: "claim", token },
+      );
+      expect(claimed.environment.tools).toEqual(tools);
+      expect(claimed.environment.localExecutionRecovery).toBe(disabled ? undefined : true);
+      await callTurnBroker(socketPath, { method: "activity_complete", token, activityId: claimed.activityId });
+      prepared.release();
+      turn.onTextDelta("Recovery policy checked");
+      return "Recovery policy checked";
+    };
+    try {
+      const request = canonicalCurrentWireRequest(environmentXml);
+      request.context.tools = tools;
+      if (disabled) request.options.toolChoice = "none";
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
   test("extracts authoritative environment, tool registry, and turn identity from the Codex wire envelope", () => {
     const request = rawWireRequest(environmentXml);
     expect(extractChatGptTurnEnvironment(request)).toEqual({

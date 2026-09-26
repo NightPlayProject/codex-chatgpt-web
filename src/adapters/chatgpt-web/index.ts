@@ -1009,6 +1009,20 @@ export function createChatGptWebAdapter(
         if (mode.localTools) {
           try {
             environment = environmentStore.resolve(parsed, { allowCurrentFilesystemRolloutRecovery });
+            // A saved schema is not a callable native handler. Codex can omit its catalog after
+            // compaction (or a model switch); replaying old definitions makes the browser emit a
+            // function_call that the active Codex round rejects, aborting the whole response.
+            // Only an unrestricted trusted environment may use the bridge-owned command fallback.
+            const nativeCommandAvailable = environment.tools.some(tool => !tool.namespace && (
+              tool.name === "exec_command" || tool.name === "shell_command"
+              || (tool.name === "exec" && tool.freeform === true)
+            ));
+            if (!manualRequest && !nativeCommandAvailable
+              && environment.sandboxPolicy.type === "dangerFullAccess"
+              && parsed.options.toolChoice !== "none") {
+              environment = { ...environment, localExecutionRecovery: true };
+              console.info("[chatgpt-web] native command handler absent; unrestricted local command recovery enabled");
+            }
           } catch (error) {
             const identity = extractChatGptTurnIdentity(parsed);
             console.warn(

@@ -8,6 +8,7 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import { ChatGptLocalExecution } from "./local-execution";
 import {
   buildChatGptToolCapabilityReport,
   chatGptToolingHealth,
@@ -79,6 +80,7 @@ interface TurnChannel {
   invocationKeys: Map<string, string>;
   /** Bounded result replay cache closes the late-response gap after a native call already ran. */
   completedInvocationResults: Map<string, BrokerToolResult>;
+  localInvocations: Map<string, Promise<BrokerToolResult>>;
   waiters: Set<ToolWaiter>;
   compactionRequested: boolean;
   compactionResult?: BrokerToolResult;
@@ -103,6 +105,8 @@ interface BrokerRequest {
     | "resolve"
     | "release"
     | "invoke"
+    | "invoke_local_exec"
+    | "invoke_local_stdin"
     | "owner_status"
     | "owner_register"
     | "owner_register_safe"
@@ -206,7 +210,10 @@ function ownerEnvironment(value: unknown): ChatGptTurnEnvironment {
     || !environment.sandboxPolicy || !["dangerFullAccess", "workspaceWrite", "readOnly"].includes(environment.sandboxPolicy.type)
     || !Array.isArray(environment.tools)
     || environment.tools.some(tool => !tool || typeof tool.name !== "string" || typeof tool.description !== "string"
-      || !tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters))) {
+      || !tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters))
+    || (environment.localExecutionRecovery !== undefined
+      && (environment.localExecutionRecovery !== true
+        || environment.sandboxPolicy.type !== "dangerFullAccess"))) {
     throw new Error("turn owner environment is invalid");
   }
   return structuredClone(environment as ChatGptTurnEnvironment);
@@ -264,6 +271,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private readonly pending = new Map<string, TurnChannel>();
   private readonly compactionTransactions = new CompactionTransactionStore();
   private readonly bindings = new Map<string, { token: string; channel: TurnChannel }>();
+  private readonly localExecution = new ChatGptLocalExecution();
   // The Codex context replayed into ChatGPT still carries the handles of finished turns, so a model
   // can present one. Remembering which turn retired a handle is what separates "you are holding a
   // previous turn's handle" from "this handle never existed".
@@ -286,10 +294,12 @@ export class TurnBroker implements TurnBrokerOwner {
       visibleTools: environment.tools,
       ...(gateway ? { gateway } : {}),
       contract: "native",
+      localExecutionRecovery: environment.localExecutionRecovery,
     });
     const snapshot = chatGptToolingHealth(report);
     const changed = this.latestToolingHealth?.report.catalog_hash !== snapshot.catalog_hash
-      || this.latestToolingHealth?.report.outer_catalog_hash !== snapshot.outer_catalog_hash;
+      || this.latestToolingHealth?.report.outer_catalog_hash !== snapshot.outer_catalog_hash
+      || this.latestToolingHealth?.report.local_execution_recovery_available !== snapshot.local_execution_recovery_available;
     this.latestToolingHealth = {
       observedAt: new Date().toISOString(),
       report: snapshot,
@@ -298,7 +308,8 @@ export class TurnBroker implements TurnBrokerOwner {
     console.info(
       `[chatgpt-web] tooling trace=${traceId} catalog=${report.catalog_hash.slice(0, 12)}`
       + ` outer=${report.outer_tool_count} direct=${report.direct_tool_count}`
-      + ` gateway=${report.gateway.available} toolSearch=${report.discovery.tool_search}`,
+      + ` gateway=${report.gateway.available} localRecovery=${snapshot.local_execution_recovery_available}`
+      + ` toolSearch=${report.discovery.tool_search}`,
     );
   }
 
@@ -355,6 +366,7 @@ export class TurnBroker implements TurnBrokerOwner {
       invocations: new Map(),
       invocationKeys: new Map(),
       completedInvocationResults: new Map(),
+      localInvocations: new Map(),
       waiters: new Set(),
       compactionRequested: false,
       compactionDeliveryCount: 0,
@@ -687,6 +699,7 @@ export class TurnBroker implements TurnBrokerOwner {
       completionCommitted: channel.completionCommitted,
     })}`);
     this.channels.delete(token);
+    this.localExecution.retire(token);
     this.pending.delete(token);
     if (channel.bindingId) {
       this.bindings.delete(channel.bindingId);
@@ -802,6 +815,7 @@ export class TurnBroker implements TurnBrokerOwner {
   async close(): Promise<void> {
     this.compactionTransactions.close();
     for (const token of [...this.channels.keys()]) this.revoke(token);
+    this.localExecution.close();
     const server = this.server;
     this.server = undefined;
     this.startPromise = undefined;
@@ -958,7 +972,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "invoke_local_exec", "invoke_local_stdin", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -1191,6 +1205,33 @@ export class TurnBroker implements TurnBrokerOwner {
         `[chatgpt-web] broker trace=${binding.channel.traceId} intercepted a post-compaction MCP call`,
       );
       return structuredClone(result);
+    }
+
+    if (request.method === "invoke_local_exec" || request.method === "invoke_local_stdin") {
+      const channel = binding.channel;
+      if (channel.environment.localExecutionRecovery !== true
+        || channel.environment.sandboxPolicy.type !== "dangerFullAccess") {
+        throw new Error("Local command recovery is unavailable for this Codex turn");
+      }
+      const key = request.invocationKey;
+      if (typeof key !== "string" || key.length < 1 || key.length > 512) {
+        throw new Error("Local command recovery requires an invocation key");
+      }
+      const completed = channel.completedInvocationResults.get(key);
+      if (completed) return structuredClone(completed);
+      const pending = channel.localInvocations.get(key);
+      if (pending) return pending;
+      const arguments_ = request.arguments ?? {};
+      const invocation = request.method === "invoke_local_exec"
+        ? this.localExecution.exec(binding.token, channel.environment.cwd, arguments_)
+        : this.localExecution.write(binding.token, arguments_);
+      channel.localInvocations.set(key, invocation);
+      void invocation.then(value => {
+        if (this.channels.get(binding.token) === channel) this.rememberCompletedInvocation(channel, key, value);
+      }, () => {}).finally(() => {
+        if (channel.localInvocations.get(key) === invocation) channel.localInvocations.delete(key);
+      });
+      return invocation;
     }
 
     const wireName = request.wireName?.trim();

@@ -18,7 +18,7 @@ export const CHATGPT_TOOL_SURFACE_IDS = [
 ] as const;
 
 export type ChatGptToolSurfaceId = typeof CHATGPT_TOOL_SURFACE_IDS[number];
-export type ChatGptToolAvailability = "direct" | "gateway" | "unavailable";
+export type ChatGptToolAvailability = "direct" | "gateway" | "local" | "unavailable";
 export type ChatGptToolSource = "declared" | "additional_tools" | "tool_search_output";
 
 export interface ChatGptToolSurfaceReport {
@@ -41,6 +41,13 @@ export interface ChatGptToolCapabilityReport {
     available: boolean;
     wire_name: string | null;
     can_discover_deferred: boolean;
+  };
+  local_execution_recovery?: {
+    available: true;
+    execution: "codex_exec";
+    command_sessions: "codex_write_stdin";
+    filesystem: "Use filesystem commands through codex_exec";
+    sandbox: "dangerFullAccess";
   };
   discovery: {
     tool_search: boolean;
@@ -186,11 +193,17 @@ export function buildChatGptToolCapabilityReport(options: {
   visibleTools: readonly CodexTool[];
   gateway?: CodexTool;
   contract: "native" | "safe";
+  localExecutionRecovery?: boolean;
 }): ChatGptToolCapabilityReport {
   const gateway = options.gateway;
   const gatewayAvailable = Boolean(gateway?.freeform === true);
   const toolSearch = options.visibleTools.some(tool => tool.toolSearch === true || tool.name === "tool_search");
   const surfaces = surfaceReports(options.visibleTools, gatewayAvailable);
+  const localRecovery = options.contract === "native" && options.localExecutionRecovery === true;
+  if (localRecovery) {
+    if (surfaces.execution.availability !== "direct") surfaces.execution.availability = "local";
+    if (surfaces.filesystem.availability !== "direct") surfaces.filesystem.availability = "local";
+  }
   const unavailable = CHATGPT_TOOL_SURFACE_IDS
     .filter(surface => surfaces[surface].availability === "unavailable")
     .map(surface => ({
@@ -207,7 +220,7 @@ export function buildChatGptToolCapabilityReport(options: {
   };
   for (const tool of options.visibleTools) sourceCounts[tool.source ?? "declared"] += 1;
   const directReady = options.visibleTools.length > 0;
-  const status = directReady || gatewayAvailable
+  const status = directReady || gatewayAvailable || localRecovery
     ? unavailable.length === 0 ? "ready" : "partial"
     : "unavailable";
   return {
@@ -224,6 +237,13 @@ export function buildChatGptToolCapabilityReport(options: {
       wire_name: gatewayAvailable ? namespacedToolName(gateway!.namespace, gateway!.name) : null,
       can_discover_deferred: gatewayAvailable,
     },
+    ...(localRecovery ? { local_execution_recovery: {
+      available: true as const,
+      execution: "codex_exec" as const,
+      command_sessions: "codex_write_stdin" as const,
+      filesystem: "Use filesystem commands through codex_exec" as const,
+      sandbox: "dangerFullAccess" as const,
+    } } : {}),
     discovery: {
       tool_search: toolSearch,
       inventory: true,
@@ -238,7 +258,9 @@ export function buildChatGptToolCapabilityReport(options: {
     },
     recovery: {
       status,
-      next_action: gatewayAvailable
+      next_action: localRecovery
+        ? "Use codex_exec for local commands and filesystem work; use codex_write_stdin to poll a returned session_id."
+        : gatewayAvailable
         ? "Use codex_tool_inventory for the focused surface, then call the exact returned wire_name with codex_tool_call."
         : directReady
           ? "Use the exact direct tool name and schema from this catalog."
@@ -269,6 +291,7 @@ export function chatGptToolingHealth(report: ChatGptToolCapabilityReport): {
   direct_tool_count: number;
   source_counts: Record<ChatGptToolSource, number>;
   gateway_available: boolean;
+  local_execution_recovery_available: boolean;
   tool_search_available: boolean;
   surfaces: Record<ChatGptToolSurfaceId, { availability: ChatGptToolAvailability; direct_count: number; deferred_possible: boolean }>;
 } {
@@ -281,6 +304,7 @@ export function chatGptToolingHealth(report: ChatGptToolCapabilityReport): {
     direct_tool_count: report.direct_tool_count,
     source_counts: report.source_counts,
     gateway_available: report.gateway.available,
+    local_execution_recovery_available: report.local_execution_recovery?.available === true,
     tool_search_available: report.discovery.tool_search,
     surfaces: Object.fromEntries(
       CHATGPT_TOOL_SURFACE_IDS.map(surface => [surface, {

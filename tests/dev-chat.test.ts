@@ -254,7 +254,7 @@ test("Bigger Context preserves the canonical DEV compaction window and fails clo
   const store = new DevChatStore(join(root, "chats"));
   const normal = new DevChatDriver(config, store, factory, root);
   const normalState = normal.open("normal-window", "chatgpt-web/high").state;
-  expect(normal.status(normalState).autoCompactTokenLimit).toBe(400_000);
+  expect(normal.status(normalState).autoCompactTokenLimit).toBe(95_000);
 
   const biggerConfig = { ...config, experimentalBiggerContext: true };
   const bigger = new DevChatDriver(biggerConfig, store, factory, root, { biggerContext: true });

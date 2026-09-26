@@ -62,6 +62,31 @@ test("missing native capabilities produce an actionable outer-catalog diagnosis"
   expect(message).toContain("codex_tool_capabilities");
 });
 
+test("local command recovery reports executable and filesystem surfaces without inventing native tools", () => {
+  const report = buildChatGptToolCapabilityReport({
+    outerTools: [], visibleTools: [], contract: "native", localExecutionRecovery: true,
+  });
+  expect(report.outer_tool_count).toBe(0);
+  expect(report.direct_tool_count).toBe(0);
+  expect(report.gateway.available).toBeFalse();
+  expect(report.surfaces.execution.availability).toBe("local");
+  expect(report.surfaces.filesystem.availability).toBe("local");
+  expect(report.unavailable.map(entry => entry.surface)).not.toContain("execution");
+  expect(report.unavailable.map(entry => entry.surface)).not.toContain("filesystem");
+  expect(report.local_execution_recovery?.execution).toBe("codex_exec");
+  expect(report.recovery.status).toBe("partial");
+  expect(report.recovery.next_action).toContain("codex_exec");
+
+  const mixed = buildChatGptToolCapabilityReport({
+    outerTools: [{ name: "view_image", description: "View an image", parameters: { type: "object" } }],
+    visibleTools: [{ name: "view_image", description: "View an image", parameters: { type: "object" } }],
+    contract: "native", localExecutionRecovery: true,
+  });
+  expect(mixed.surfaces.execution.availability).toBe("local");
+  expect(mixed.surfaces.filesystem.availability).toBe("direct");
+  expect(mixed.local_execution_recovery?.available).toBeTrue();
+});
+
 test("catalog hashes are order independent but change when the advertised contract changes", () => {
   const command = { name: "exec_command", description: "Run", parameters: { type: "object" } };
   const image = { name: "view_image", description: "View", parameters: { type: "object" } };

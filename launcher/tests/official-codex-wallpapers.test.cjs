@@ -13,6 +13,8 @@ const {
   installProviderAwareComposerQuotaPatch,
   officialAppTarget,
   providerQuotaBreakpointSite,
+  providerActiveComposerQuotaBreakpointSite,
+  providerActiveModelChangeBreakpointSite,
   providerAwareComposerQuotaRuntimeScript,
   providerAwareRateLimitGateScript,
   RATE_LIMIT_GATE_PROBE_SCRIPT,
@@ -20,6 +22,34 @@ const {
   usageAllowsRateLimitRecovery,
   usageShowsNativeQuotaExhaustion,
 } = require("../electron/official-codex-wallpapers.cjs");
+
+const activeComposerSource = 'function q3t(e){let rn=X(dA)&&gt===`local`,an=1;let Nn=Ee||Qe&&$e||mt||St||Yt?.isLoading===!0||vt||rn,Pn;return {submitDisabled:Nn}}';
+const activeModelSource = 'zt=function(e,t){return(oe?.selectModelAndReasoningEffort??ne)(Bt(e),t,()=>{done()})};Sn=(e,t)=>{zt(e,t)};onSelectModel:Sn';
+
+test("active model setter breakpoint updates selection before the model changes", () => {
+  const result = providerActiveModelChangeBreakpointSite(activeModelSource);
+  assert.equal(result.found, true);
+  assert.equal(result.modelVariable, "Bt(e)");
+  assert.equal(activeModelSource.slice(result.candidateIndex, result.candidateIndex + 6), "return");
+  assert.equal(providerActiveModelChangeBreakpointSite(activeModelSource.replace('onSelectModel:Sn', 'onSelectModel:other')).found, false);
+});
+
+test("active Codex composer breakpoint precedes the Send gate and requires the native quota term", () => {
+  const source = `before\n${activeComposerSource}\nafter`;
+  const result = providerActiveComposerQuotaBreakpointSite(source);
+  assert.equal(result.found, true);
+  assert.equal(source.slice(result.candidateIndex, result.candidateIndex + 2), "Ee");
+  assert.ok(result.candidateIndex > source.indexOf("rn=X(dA)"));
+  assert.ok(result.candidateIndex < result.submitIndex);
+  assert.equal(result.quotaVariable, "rn");
+});
+
+test("active Codex composer breakpoint fails closed on changed or ambiguous source", () => {
+  assert.equal(providerActiveComposerQuotaBreakpointSite("no active composer").reason, "active-composer-missing");
+  assert.equal(providerActiveComposerQuotaBreakpointSite(`${activeComposerSource}${activeComposerSource}`).reason, "active-composer-ambiguous");
+  assert.equal(providerActiveComposerQuotaBreakpointSite(activeComposerSource.replace('||vt||rn', '||vt||other')).reason, "active-composer-quota-layout-changed");
+  assert.equal(providerActiveComposerQuotaBreakpointSite(activeComposerSource.replace('submitDisabled:Nn', 'submitDisabled:other')).reason, "active-composer-quota-layout-changed");
+});
 
 test("official Codex quota breakpoint site is between the native quota term and submit aggregate", () => {
   const source = 'before\nlet Rt=X(RK)&&et===`local`,zt=1;let cn=ye||$e||ot||nt||Rt;after';
@@ -134,7 +164,7 @@ class FakeWebSocket {
 test("provider-aware composer quota patch installs a conditional breakpoint without live source editing", async () => {
   const calls = [];
   const breakpointParams = [];
-  const source = 'before\nrateLimitSendBlocked:ue,foo:1,selectedModel:xe,onModelChange:Le}=e;middle\nrateLimitSendBlocked:Oi,foo:1,selectedModel:Vn,onModelChange:zi}),t[1]=Vn;function Tjt(e){let{rateLimitSendBlockReason:xe,rateLimitSendBlocked:Se,rateLimitConversationSendBlocked:Ce,selectedModel:Ie}=e,Gt=xe===void 0?null:xe,Kt=Se!==void 0&&Se,qt=Ce!==void 0&&Ce;let ai=Gyt({rateLimitSendBlocked:Kt}),us=1,ds=2,fs=gi||It||on||Kt||ds||us||De==null||Jt!==!0;return fs}after';
+  const source = `before\n${activeModelSource};function Tjt(e){let{rateLimitSendBlockReason:xe,rateLimitSendBlocked:Se,rateLimitConversationSendBlocked:Ce,selectedModel:Ie}=e,Gt=xe===void 0?null:xe,Kt=Se!==void 0&&Se,qt=Ce!==void 0&&Ce;let ai=Gyt({rateLimitSendBlocked:Kt}),us=1,ds=2,fs=gi||It||on||Kt||ds||us||De==null||Jt!==!0;return fs}${activeComposerSource}after`;
   class RuntimeWebSocket extends FakeWebSocket {
     send(raw) {
       const message = JSON.parse(raw);
@@ -172,8 +202,9 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
       if (message.method === "Debugger.setBreakpointByUrl") {
         breakpointParams.push(message.params);
         const modelBreakpoint = message.params.condition.includes('startsWith("chatgpt-web/")');
+        const activeBreakpoint = message.params.condition.includes('rn=false');
         reply({
-          breakpointId: modelBreakpoint ? "provider_model_bp" : "provider_quota_bp",
+          breakpointId: modelBreakpoint ? "provider_model_bp" : activeBreakpoint ? "active_quota_bp" : "provider_quota_bp",
           locations: [{ scriptId: "primary_1", lineNumber: message.params.lineNumber, columnNumber: message.params.columnNumber }],
         });
         return;
@@ -193,8 +224,9 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
     assert.equal(result.reason, null);
     assert.equal(result.breakpointId, "provider_quota_bp");
     assert.equal(result.modelBreakpointId, "provider_model_bp");
-    assert.deepEqual(result.breakpointIds, ["provider_model_bp", "provider_quota_bp"]);
-    assert.equal(result.modelVariable, "Vn");
+    assert.deepEqual(result.breakpointIds, ["provider_model_bp", "provider_quota_bp", "active_quota_bp"]);
+    assert.equal(result.activeBreakpointId, "active_quota_bp");
+    assert.equal(result.modelVariable, "Bt(e)");
     assert.equal(result.quotaVariable, "Kt");
     assert.equal(result.quotaSourceKind, "semantic-rate-limit");
     assert.equal(result.url, "app://-/assets/app-primary-test123.js");
@@ -206,17 +238,23 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
       "Debugger.getScriptSource",
       "Runtime.evaluate",
       "Runtime.evaluate",
+      "Debugger.getPossibleBreakpoints",
+      "Debugger.setBreakpointByUrl",
+      "Debugger.getPossibleBreakpoints",
       "Debugger.setBreakpointByUrl",
       "Debugger.getPossibleBreakpoints",
       "Debugger.setBreakpointByUrl",
     ]);
-    assert.equal(breakpointParams.length, 2);
+    assert.equal(breakpointParams.length, 3);
     assert.equal(breakpointParams[0].url, "app://-/assets/app-primary-test123.js");
-    assert.match(breakpointParams[0].condition, /slug\.startsWith\("chatgpt-web\/"\)/);
+    assert.match(breakpointParams[0].condition, /Bt\(e\)\.startsWith\("chatgpt-web\/"\)/);
     assert.match(breakpointParams[0].condition, /__codexWebGptWebProviderSelected/);
     assert.match(breakpointParams[1].condition, /__codexWebGptNativeQuotaBlocked===true/);
     assert.match(breakpointParams[1].condition, /__codexWebGptWebProviderSelected===true/);
     assert.match(breakpointParams[1].condition, /Kt=false/);
+    assert.match(breakpointParams[2].condition, /__codexWebGptNativeQuotaBlocked===true/);
+    assert.match(breakpointParams[2].condition, /__codexWebGptWebProviderSelected===true/);
+    assert.match(breakpointParams[2].condition, /rn=false/);
     assert.equal(calls.includes("Debugger.setScriptSource"), false);
   } finally {
     contents.close();

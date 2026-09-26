@@ -828,7 +828,10 @@ class CdpContents {
     this.connecting = new Promise((resolve, reject) => {
       const socket = new this.WebSocketImpl(this.url);
       const fail = error => {
-        if (this.socket === socket) this.socket = null;
+        if (this.socket === socket) {
+          this.socket = null;
+          this.parsedScripts.clear();
+        }
         reject(error instanceof Error ? error : new Error("Official Codex CDP connection failed"));
       };
       socket.onopen = () => {
@@ -837,7 +840,10 @@ class CdpContents {
       };
       socket.onerror = () => fail(new Error("Official Codex CDP connection failed"));
       socket.onclose = () => {
-        if (this.socket === socket) this.socket = null;
+        if (this.socket === socket) {
+          this.socket = null;
+          this.parsedScripts.clear();
+        }
         const error = new Error("Official Codex CDP target closed");
         for (const pending of this.pending.values()) pending.reject(error);
         this.pending.clear();
@@ -923,6 +929,17 @@ class CdpContents {
     return [...this.parsedScripts.values()];
   }
 
+  async refreshKnownScripts() {
+    // Debugger.enable on an already enabled CDP session does not replay scriptParsed.
+    // Disable first so a page reload or a reconnected socket cannot leave the old
+    // app-primary script alongside the current one in our script index.
+    await this.sendCommand("Debugger.disable");
+    this.parsedScripts.clear();
+    await this.sendCommand("Debugger.enable");
+    await this.executeJavaScript("0");
+    return this.knownScripts();
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -940,9 +957,7 @@ class CdpContents {
 }
 
 async function installProviderAwareComposerQuotaPatch(contents) {
-  await contents.sendCommand("Debugger.enable");
-  await contents.executeJavaScript("0");
-  const primaryScripts = contents.knownScripts().filter(script => (
+  const primaryScripts = (await contents.refreshKnownScripts()).filter(script => (
     typeof script?.url === "string"
     && /^app:\/\/-\/assets\/app-primary-[^/?]+\.js(?:\?.*)?$/.test(script.url)
   ));
@@ -1193,6 +1208,7 @@ function createOfficialCodexWallpaperController({
             generation: null,
             providerQuotaPatchApplied: false,
             providerQuotaPatchAttemptedAt: 0,
+            providerQuotaPatchUnavailableReason: null,
             providerQuotaBreakpointIds: [],
             providerQuotaBreakpointUrl: null,
             rateLimitBlockedSince: null,
@@ -1220,6 +1236,7 @@ function createOfficialCodexWallpaperController({
             entry.generation = generation;
             entry.providerQuotaPatchApplied = false;
             entry.providerQuotaPatchAttemptedAt = 0;
+            entry.providerQuotaPatchUnavailableReason = null;
             if (wallpapersEnabled) {
               applied += 1;
               logger.info("wallpapers.official_codex_applied", {
@@ -1238,6 +1255,7 @@ function createOfficialCodexWallpaperController({
               const patch = await installProviderAwareComposerQuotaPatch(entry.contents);
               if (patch.applied) {
                 entry.providerQuotaPatchApplied = true;
+                entry.providerQuotaPatchUnavailableReason = null;
                 entry.providerQuotaBreakpointIds = patch.breakpointIds ?? [patch.breakpointId].filter(Boolean);
                 entry.providerQuotaBreakpointUrl = patch.url;
                 logger.info("wallpapers.official_codex_provider_quota_state_patch_applied", {
@@ -1250,10 +1268,13 @@ function createOfficialCodexWallpaperController({
                   modelVariable: patch.modelVariable ?? null,
                 });
               } else {
-                logger.warn("wallpapers.official_codex_provider_quota_state_patch_unavailable", {
-                  targetId: target.id,
-                  reason: patch.reason,
-                });
+                if (entry.providerQuotaPatchUnavailableReason !== patch.reason) {
+                  entry.providerQuotaPatchUnavailableReason = patch.reason;
+                  logger.warn("wallpapers.official_codex_provider_quota_state_patch_unavailable", {
+                    targetId: target.id,
+                    reason: patch.reason,
+                  });
+                }
               }
             }
             await readRateLimitUsage(entry, target.id, checkedAt);

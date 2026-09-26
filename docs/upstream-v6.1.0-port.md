@@ -2,7 +2,7 @@
 
 This branch is based on miuuyy/codex-chatgpt-web tag `v6.1.0` at commit
 `293341084ac7a1ddd2de12fede3706023f5b6474`. The Windows test build is
-`6.1.0-test.3`.
+`6.1.0-test.4`.
 
 The launcher Settings component keeps the upstream v6.1.0 controls and order.
 The only added Settings control is Codex Wallpapers. In particular, the
@@ -35,3 +35,14 @@ The patched verifier passed against the live 5.6 High menu without sending a
 message, and `bun run verify` plus the non-installing packaged launcher smoke
 passed for test.3. A successful live message send from the installed test.3
 application remains unverified.
+
+The test.4 follow-up refreshes the official Codex CDP script index before
+installing the provider quota breakpoint. A repeated `Debugger.enable` does
+not replay scripts on an already enabled session, so stale `app-primary`
+records after a page reload previously produced `app-primary-script-ambiguous`.
+The patch now disables and re-enables that CDP debugger session, then reads
+the current script snapshot. Connection loss also clears the cached records.
+An unchanged failure is logged once per page generation while retries continue.
+The refreshed snapshot identified one current primary script with the expected
+quota hook in the live Codex app; test.4 still needs installation to validate
+the complete launcher-managed integration.

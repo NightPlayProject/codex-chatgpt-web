@@ -145,6 +145,10 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
       const emit = (method, params) => queueMicrotask(() => this.onmessage?.({
         data: JSON.stringify({ method, params }),
       }));
+      if (message.method === "Debugger.disable") {
+        reply({});
+        return;
+      }
       if (message.method === "Debugger.enable") {
         emit("Debugger.scriptParsed", {
           scriptId: "primary_1",
@@ -180,6 +184,10 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
 
   const contents = new CdpContents("ws://127.0.0.1:9333/devtools/page/target", RuntimeWebSocket);
   try {
+    contents.parsedScripts.set("stale_primary", {
+      scriptId: "stale_primary",
+      url: "app://-/assets/app-primary-test123.js",
+    });
     const result = await installProviderAwareComposerQuotaPatch(contents);
     assert.equal(result.applied, true);
     assert.equal(result.reason, null);
@@ -190,7 +198,9 @@ test("provider-aware composer quota patch installs a conditional breakpoint with
     assert.equal(result.quotaVariable, "Kt");
     assert.equal(result.quotaSourceKind, "semantic-rate-limit");
     assert.equal(result.url, "app://-/assets/app-primary-test123.js");
+    assert.deepEqual(contents.knownScripts().filter(script => script.url === result.url).map(script => script.scriptId), ["primary_1"]);
     assert.deepEqual(calls, [
+      "Debugger.disable",
       "Debugger.enable",
       "Runtime.evaluate",
       "Debugger.getScriptSource",
@@ -377,11 +387,12 @@ function makeController({
   getCurrentUsage = async () => null,
   now = () => Date.now(),
   refreshIntervalMs = 60_000,
+  log = logger(),
 } = {}) {
   const controller = createOfficialCodexWallpaperController({
     platform,
     dataRoot: root,
-    logger: logger(),
+    logger: log,
     wallpaperManager: makeManager(calls),
     resolveIdentity: async () => identity,
     listProcesses: async () => processes,
@@ -971,6 +982,41 @@ test("enabling attaches and injects only the official app targets, and disabling
     assert.equal(events.at(-1).status, "disabled");
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(discoveryCount, discoveriesBeforeDisable);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unchanged unavailable quota patch retries without flooding recent events", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-quota-retry-"));
+  const warnings = [];
+  let attempts = 0;
+  let ticks = 0;
+  class CountingWebSocket extends FakeWebSocket {
+    send(raw) {
+      if (JSON.parse(raw).method === "Debugger.enable") attempts += 1;
+      super.send(raw);
+    }
+  }
+  const controller = makeController({
+    root,
+    storedEndpoint: true,
+    discoverTargets: async () => [makeTarget()],
+    WebSocketImpl: CountingWebSocket,
+    now: () => ++ticks * 10_000,
+    refreshIntervalMs: 5,
+    log: { info() {}, error() {}, warn(event, detail) { warnings.push({ event, detail }); } },
+  });
+  try {
+    await controller.setProviderGateEnabled(true);
+    const deadline = Date.now() + 500;
+    while (attempts < 3 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(attempts >= 3);
+    assert.deepEqual(warnings.filter(item => item.event === "wallpapers.official_codex_provider_quota_state_patch_unavailable"), [{
+      event: "wallpapers.official_codex_provider_quota_state_patch_unavailable",
+      detail: { targetId: "page_1", reason: "app-primary-script-missing" },
+    }]);
   } finally {
     controller.destroy();
     fs.rmSync(root, { recursive: true, force: true });

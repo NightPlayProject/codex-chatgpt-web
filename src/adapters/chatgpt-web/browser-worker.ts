@@ -4525,10 +4525,12 @@ export class ChatGptBrowserWorker {
         };
       };
       // CHATGPT_COMMENTARY_CLASSIFIER_END
+      const activityHeaders = [...root.querySelectorAll<HTMLElement>(".group\\/activity-header")]
+        .filter(renderedInDom);
       const classified = selectChatGptAnswerRoots(
         allMarkdownRoots.filter(candidate => !activitySummaryRoots.has(candidate)),
         streamingStatusContainers,
-        [...root.querySelectorAll<HTMLElement>(".group\\/activity-header")].filter(renderedInDom),
+        activityHeaders,
         activityContainers,
       );
       const commentaryRoots = classified.commentaryRoots;
@@ -4737,6 +4739,7 @@ export class ChatGptBrowserWorker {
         : undefined;
       const completionActionSet = new Set(completionAction ? [completionAction] : []);
       const candidates = new Map<HTMLElement, ChatGptVisibleTraceBlock["kind"]>();
+      const textOnlyActivityHeaders = new Set<HTMLElement>();
       renderedRoots.forEach(candidate => candidates.set(candidate, "answer"));
       commentaryRoots.forEach(candidate => candidates.set(candidate, "commentary"));
       activitySummaryRoots.forEach(candidate => candidates.set(candidate, "status"));
@@ -4758,6 +4761,18 @@ export class ChatGptBrowserWorker {
           ?? candidate;
       };
       const traceText = (candidate: HTMLElement): string => {
+        if (candidate.matches(".group\\/activity-header")) {
+          // The current Activity heading is plain text. Its button points to the one semantic
+          // label while animated copies can make the heading's innerText repeat that label.
+          const labelId = candidate.querySelector("button[aria-labelledby]")?.getAttribute("aria-labelledby");
+          const label = labelId
+            ? [...candidate.querySelectorAll<HTMLElement>("[id]")]
+              .find(element => element.id === labelId)?.innerText.trim()
+            : undefined;
+          return label || candidate.innerText.split("\n")
+            .map(line => line.trim()).filter((line, index, lines) => line && line !== lines[index - 1])
+            .join("\n");
+        }
         const ariaLabel = candidate.getAttribute("aria-label")?.trim();
         if (ariaLabel) return ariaLabel;
         // Animated ChatGPT action counters visually split a phrase around the changing number, so
@@ -4769,6 +4784,22 @@ export class ChatGptBrowserWorker {
           .find(Boolean);
         return screenReaderText || candidate.innerText.trim();
       };
+      if (!completionAction) {
+        for (const header of activityHeaders) {
+          // Markdown inside an Activity heading already has a commentary owner. Only the
+          // text-only heading needs its own live progress event.
+          if (overlapsRenderedAnswer(header) || overlapsCommentary(header)
+            || overlapsActivitySummary(header)) continue;
+          const label = traceText(header);
+          if (!label || /^Our systems are thinking a bit more\b/i.test(label)
+            || /^Thinking$/i.test(label) || /^Worked for \d+/i.test(label)) continue;
+          const normalizedLabel = label.replace(/\s+/g, " ");
+          if (commentaryRoots.some(commentary => commentary.innerText
+            .replace(/\s+/g, " ").includes(normalizedLabel))) continue;
+          textOnlyActivityHeaders.add(header);
+          candidates.set(header, "commentary");
+        }
+      }
       const traceKey = (candidate: HTMLElement, kind: ChatGptVisibleTraceBlock["kind"]): string | undefined => {
         const statusContainer = candidate.closest<HTMLElement>("[data-streaming-response-status]");
         const itemAnchor = candidate.closest<HTMLElement>("[data-item-anchor]");
@@ -4822,11 +4853,14 @@ export class ChatGptBrowserWorker {
         .map(([candidate, kind]) => ({
           kind,
           text: traceText(candidate),
-          key: traceKey(candidate, kind),
+          key: textOnlyActivityHeaders.has(candidate)
+            ? `activity-heading:${activityHeaders.indexOf(candidate)}`
+            : traceKey(candidate, kind),
           // Activity updates disappear when the final answer replaces their tree. Once their text
           // is stable, forward them even if no later trace item has mounted yet.
           ...(kind === "commentary" ? {
-            complete: hasFollowingRenderedSibling(candidate) || agentActivityRoots.has(candidate),
+            complete: hasFollowingRenderedSibling(candidate) || agentActivityRoots.has(candidate)
+              || textOnlyActivityHeaders.has(candidate),
           } : {}),
           // Footer controls such as the model picker and overflow menu are siblings of the final
           // Markdown inside the assistant turn. They are UI, not model trace. Real action buttons

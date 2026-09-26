@@ -270,3 +270,28 @@ test("roleless agent activity reaches commentary before the final answer mounts"
     { kind: "answer", text: "Finished" },
   ]);
 });
+
+test("plain Activity headings stream as commentary while the turn is running", async () => {
+  const activity = "Inspecting FreemiumLoader for Deobfuscation Artifacts";
+  const body = '<div class="activity-block"><div data-content-search-turn-key="live"><div class="text-size-chat">'
+    + '<div data-markdown-text-style="assistant-message">I’m checking the workspace.</div>'
+    + '<div class="group/activity-header"><button aria-labelledby="activity-title"></button>'
+    + `<span id="activity-title">${activity}</span><span>${activity}</span></div>`
+    + '</div></div></div>';
+  const progress = await snapshot(`<div id="turn" data-turn-key="live">${body}</div>`);
+  expect(progress.visibleText).toBe("");
+  expect(progress.traceBlocks.filter(block => block.kind === "commentary")
+    .map(block => block.text)).toEqual(["I’m checking the workspace.", activity]);
+  const tracker = new ChatGptVisibleTraceTracker(100);
+  expect(tracker.observe(progress.traceBlocks, false, 1_000)).toEqual([]);
+  expect(tracker.observe(progress.traceBlocks, false, 1_100)
+    .filter(event => event.kind === "commentary")
+    .map(event => event.text)).toEqual(["I’m checking the workspace.", activity]);
+
+  const complete = await snapshot('<div id="turn" data-turn-key="live">' + body
+    + '<div data-content-search-unit-key="answer"><div data-conversation-role="assistant">'
+    + '<div data-markdown-text-style="assistant-message">Finished.</div></div></div>'
+    + '<button data-testid="copy-turn-action-button">Copy</button></div>');
+  expect(complete.visibleText).toBe("Finished.");
+  expect(complete.traceBlocks.some(block => block.kind === "commentary" && block.text === activity)).toBeFalse();
+});

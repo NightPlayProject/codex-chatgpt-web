@@ -1578,6 +1578,51 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("commentary reaches the Codex adapter before browser completion", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-live-commentary-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let finishBrowser!: () => void;
+    let commentaryDelivered!: () => void;
+    const liveCommentary = new Promise<void>(resolve => { commentaryDelivered = resolve; });
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = turn => {
+      turn.onCommentary?.("Checking files");
+      return new Promise<string>(resolve => {
+        finishBrowser = () => {
+          turn.onTextDelta("Ready");
+          resolve("Ready");
+        };
+      });
+    };
+    const events: AdapterEvent[] = [];
+    try {
+      const running = createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml),
+        { headers: new Headers() },
+        event => {
+          events.push(event);
+          if (event.type === "text_delta" && event.phase === "commentary" && event.text === "Checking files") {
+            commentaryDelivered();
+          }
+        },
+      );
+      await Promise.race([
+        liveCommentary,
+        Bun.sleep(1_000).then(() => { throw new Error("Commentary was held until browser completion"); }),
+      ]);
+      expect(events.some(event => event.type === "done")).toBeFalse();
+      finishBrowser();
+      await running;
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
   test("an observer failure in the middle of a drained text batch loses no reconnect data", async () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",

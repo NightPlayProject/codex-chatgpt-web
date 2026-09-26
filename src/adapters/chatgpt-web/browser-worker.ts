@@ -3163,7 +3163,11 @@ export class ChatGptBrowserWorker {
         // contents. Remounting an old answer must never acknowledge a new submission.
         turnIdentities.push(user, assistant);
         if (group.querySelector("[data-user-message-bubble]")) userIdentities.push(user);
-        if (group.querySelector('[data-conversation-role="assistant"]')) responseIdentities.push(assistant);
+        // Agent activity can replace the role-marked content while a tool turn is running.
+        // The activity header still belongs to this stable assistant turn key.
+        if (group.querySelector('[data-conversation-role="assistant"], [class~="group/activity-header"]')) {
+          responseIdentities.push(assistant);
+        }
       });
       return {
         key: observerKey,
@@ -4317,26 +4321,27 @@ export class ChatGptBrowserWorker {
       // render a completed commentary Markdown root immediately before that live status container.
       // Final-answer Markdown follows the live status instead, so DOM order remains the semantic
       // boundary without relying on localized labels such as "Pro thinking".
-      const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(answerRootSelector)]
-        .filter(candidate => {
-          if (!root.hasAttribute("data-turn-key") && !candidate.hasAttribute("data-markdown-text-style")) return true;
-          const unit = candidate.closest("[data-content-search-unit-key]");
-          return Boolean(unit) && Array.from(unit!.children)
-            .some(child => child.getAttribute("data-conversation-role") === "assistant");
-        })
-        .filter(candidate => !candidate.parentElement?.closest(answerRootSelector))
-        .filter(renderedInDom);
-      const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
-        .filter(renderedInDom);
       // CHATGPT_COMMENTARY_CLASSIFIER_BEGIN
       // Self-contained so the test suite can execute this exact source against a synthetic DOM;
       // it must not close over anything from the surrounding evaluate scope.
+      const isAgentActivityCommentary = (candidate: HTMLElement) => {
+        if (candidate.closest('[data-user-message-bubble]')) return false;
+        if (candidate.closest('[class~="group/activity-header"]')) return true;
+        // The activity body is a sibling of its header inside the nearest typography group.
+        let ancestor = candidate.parentElement;
+        for (let depth = 0; ancestor && depth < 6; depth += 1, ancestor = ancestor.parentElement) {
+          if (!ancestor.classList.contains("text-size-chat")) continue;
+          return Boolean(ancestor.querySelector('[class~="group/activity-header"]'));
+        }
+        return false;
+      };
       const selectChatGptAnswerRoots = (
         markdownRoots: HTMLElement[],
         statusContainers: HTMLElement[],
         activityHeaders: HTMLElement[],
-      ): { commentaryRoots: HTMLElement[]; answerRoots: HTMLElement[] } => {
+      ): { commentaryRoots: HTMLElement[]; answerRoots: HTMLElement[]; agentActivityRoots: HTMLElement[] } => {
         const firstStatusContainer = statusContainers[0];
+        const agentActivityRoots = markdownRoots.filter(isAgentActivityCommentary);
         // The current agent-activity renderer puts its header and its Markdown body in
         // separate descendants of one activity block. Neither carries the older status
         // or cot-v5 attributes. The semantic header class identifies that block; three
@@ -4348,6 +4353,7 @@ export class ChatGptBrowserWorker {
           candidate.closest("[data-streaming-response-status]") !== null
           || candidate.closest(".group\\/activity-header") !== null
           || activityBlocks.some(block => block.contains(candidate))
+          || agentActivityRoots.includes(candidate)
           // Chain-of-thought components carry reasoning, never the final answer, so containment is
           // a position-independent commentary signal. Position alone cannot separate "commentary
           // between two status containers" from "answer between two tool calls".
@@ -4364,15 +4370,29 @@ export class ChatGptBrowserWorker {
         return {
           commentaryRoots: commentary,
           answerRoots: markdownRoots.filter(candidate => !commentary.includes(candidate)),
+          agentActivityRoots,
         };
       };
       // CHATGPT_COMMENTARY_CLASSIFIER_END
+      const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(answerRootSelector)]
+        .filter(candidate => {
+          if (!root.hasAttribute("data-turn-key")) return true;
+          const unit = candidate.closest("[data-content-search-unit-key]");
+          return (Boolean(unit) && Array.from(unit!.children)
+            .some(child => child.getAttribute("data-conversation-role") === "assistant"))
+            || isAgentActivityCommentary(candidate);
+        })
+        .filter(candidate => !candidate.parentElement?.closest(answerRootSelector))
+        .filter(renderedInDom);
+      const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
+        .filter(renderedInDom);
       const classified = selectChatGptAnswerRoots(
         allMarkdownRoots,
         streamingStatusContainers,
         [...root.querySelectorAll<HTMLElement>(".group\\/activity-header")].filter(renderedInDom),
       );
       const commentaryRoots = classified.commentaryRoots;
+      const agentActivityRoots = new Set(classified.agentActivityRoots);
       const renderedRoots = classified.answerRoots;
       // CHATGPT_MARKDOWN_CONTENT_BEGIN
       const chatGptMarkdownContent = (markdownRoot: HTMLElement): HTMLElement => {
@@ -4658,7 +4678,11 @@ export class ChatGptBrowserWorker {
           kind,
           text: traceText(candidate),
           key: traceKey(candidate, kind),
-          ...(kind === "commentary" ? { complete: hasFollowingRenderedSibling(candidate) } : {}),
+          // Activity updates disappear when the final answer replaces their tree. Once their text
+          // is stable, forward them even if no later trace item has mounted yet.
+          ...(kind === "commentary" ? {
+            complete: hasFollowingRenderedSibling(candidate) || agentActivityRoots.has(candidate),
+          } : {}),
           // Footer controls such as the model picker and overflow menu are siblings of the final
           // Markdown inside the assistant turn. They are UI, not model trace. Real action buttons
           // are scoped by ChatGPT's streaming-status container.

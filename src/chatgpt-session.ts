@@ -42,6 +42,7 @@ export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
   '[data-turn-id][data-message-author-role="assistant"]:not([data-turn-key] *)',
   '[data-turn-id]:has([data-message-author-role="assistant"]):not([data-turn-key] *)',
   '[data-turn-key]:has([data-conversation-role="assistant"])',
+  '[data-turn-key]:has([class~="group/activity-header"])',
 ].join(", ");
 export const CHATGPT_USER_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="user"]:not([data-turn-key] *)',
@@ -57,7 +58,7 @@ export const CHATGPT_USER_TURN_SELECTOR = [
 export function chatGptAssistantTurnSelector(identity: string): string {
   const prefix = "group:assistant:";
   return identity.startsWith(prefix)
-    ? `[data-turn-key=${JSON.stringify(identity.slice(prefix.length))}]:has([data-conversation-role="assistant"])`
+    ? `[data-turn-key=${JSON.stringify(identity.slice(prefix.length))}]`
     : `[data-turn-id=${JSON.stringify(identity)}]`;
 }
 

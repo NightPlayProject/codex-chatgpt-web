@@ -274,6 +274,9 @@ test("power turn identity separates roles and keeps virtualized groups in the su
   next.innerHTML += '<h4 data-conversation-role="assistant"></h4>';
   observers.forEach(notify => notify());
   expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBe("group:assistant:next");
+  next.innerHTML = '<div data-user-message-bubble></div><div class="group/activity-header"></div>';
+  observers.forEach(notify => notify());
+  expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBe("group:assistant:next");
   window.document.body.appendChild(next.cloneNode(true));
   observers.forEach(notify => notify());
   await expect(worker.submissionDomState(page)).rejects.toThrow("duplicate conversation turn identities");
@@ -4652,6 +4655,7 @@ test("the shipped commentary classifier separates answer Markdown from reasoning
   if (!source) throw new Error("commentary classifier sentinels are missing from browser-worker.ts");
   const javascript = source
     .replace(/:\s*HTMLElement\[\]/g, "")
+    .replace(/:\s*HTMLElement(?!\[\])/g, "")
     .replace(/\):\s*\{[^}]*\}\s*=>/, ") =>");
   const selectChatGptAnswerRoots = new Function(
     `${javascript}; return selectChatGptAnswerRoots;`,

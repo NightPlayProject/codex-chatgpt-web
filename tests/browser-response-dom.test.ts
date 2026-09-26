@@ -8,6 +8,10 @@ import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "../src/adapt
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
 const powerCompleteHtml = readFileSync(new URL("./fixtures/chatgpt-power-complete.html", import.meta.url), "utf8");
 const powerStreamingHtml = readFileSync(new URL("./fixtures/chatgpt-power-streaming.html", import.meta.url), "utf8");
+// These captures are also edited as strings below. Windows checkouts use CRLF;
+// normalize before inserting test variants so they exercise the same DOM everywhere.
+const powerActivityHtml = readFileSync(new URL("./fixtures/chatgpt-power-activity.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const activitySummariesHtml = readFileSync(new URL("./fixtures/chatgpt-activity-summaries.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 type Snapshot = {
   responsePresent: boolean;
   visibleText: string;
@@ -69,6 +73,66 @@ async function snapshot(html: string): Promise<Snapshot> {
   }
 }
 
+test("captured Activity progress is commentary before any assistant answer exists", async () => {
+  const progress = await snapshot(powerActivityHtml);
+  expect(progress.responsePresent).toBeTrue();
+  expect(progress.markdownSegments).toEqual([]);
+  expect(progress.completionActionVisible).toBeFalse();
+  expect(progress.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text)).toEqual(["Text 5\nText 6\nText 4\nText 8"]);
+  const marker = '<span hidden="" data-chatgpt-agent-turn-start="">\n</span>';
+  expect(powerActivityHtml).toContain(marker);
+  const combined = powerActivityHtml.replace(marker, marker + '<div data-content-search-unit-key="answer"><h4 data-conversation-role="assistant"></h4><div data-markdown-text-style="assistant-message"><p>Final answer.</p></div></div>');
+  const answer = await snapshot(combined);
+  expect(answer.visibleText).toBe("Final answer.");
+  expect(answer.traceBlocks.some(block => block.kind === "commentary")).toBeTrue();
+});
+
+test("captured activity summaries use the status stream and keep actual commentary and answers separate", async () => {
+  const result = await snapshot(activitySummariesHtml);
+  expect(result.visibleText).toBe("answer 1");
+  expect(result.traceBlocks.filter(block => block.kind === "status").map(block => block.text))
+    .toEqual(Array.from({ length: 10 }, (_, index) => `status ${index + 1}`));
+  expect(result.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text))
+    .toEqual(["commentary 1", "commentary 2"]);
+  const tracker = new ChatGptVisibleTraceTracker(0);
+  const events = tracker.observe(result.traceBlocks, true);
+  expect(events.map(event => event.kind)).toEqual([
+    "reasoning", "commentary", ...Array(8).fill("reasoning"), "commentary", "reasoning",
+  ]);
+  expect(tracker.observe(result.traceBlocks, true)).toEqual([]);
+
+  // Text, colour, and header placement do not determine the channel. The final
+  // answer owns its own unit even if its renderer uses the same tone attribute.
+  const changed = await snapshot(activitySummariesHtml
+    .replaceAll("status 1", "commentary 1")
+    .replace('data-markdown-text-style="assistant-message">\n<p>answer 1',
+      'data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">\n<p>answer 1'));
+  expect(changed.visibleText).toBe("answer 1");
+  expect(changed.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text))
+    .toEqual(["commentary 1", "commentary 2"]);
+  expect(changed.traceBlocks.find(block => block.kind === "status")?.text).toBe("commentary 1");
+
+  const hidden = await snapshot(activitySummariesHtml
+    .replace('<div data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">',
+      '<div style="display:none"><div data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">')
+    .replace('<p>status 1</p>\n</div>', '<p>status 1</p>\n</div></div>'));
+  expect(hidden.traceBlocks.some(block => block.text === "status 1")).toBeFalse();
+});
+
+test("keeps an unfinished hyperlink buffered and detects changed destinations after delivery", async () => {
+  const page = (href: string) => `<section id="turn"><div class="markdown"><p data-start="0" data-end="99"><strong><a${href}>Open report</a></strong>.</p><p data-start="100" data-end="115">Next paragraph.</p></div></section>`;
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  const pending = await snapshot(page(""));
+  expect(buffer.observe(pending.markdownSegments, 0)).toBe("");
+  const linked = await snapshot(page(' href="https://example.com/report#details"'));
+  expect(buffer.observe(linked.markdownSegments, 1000)).toBe("**[Open report](https://example.com/report#details)**.");
+  expect(buffer.finish().markdown).toBe("**[Open report](https://example.com/report#details)**.\n\nNext paragraph.");
+  const changed = await snapshot(page(' href="https://example.com/different"'));
+  buffer.observe(changed.markdownSegments, 2000);
+  expect(buffer.currentSnapshotIsConsistent()).toBeFalse();
+  expect(() => buffer.finish()).toThrow("completed text block");
+});
+
 test("captured DIL smoke response reaches Markdown delivery and stable completion", async () => {
   // Also cover a changed CSS module hash and nested Markdown without duplicate delivery.
   for (const html of [
@@ -118,6 +182,16 @@ test("captured power UI excludes the user footer during streaming and completes 
   const userMarkdown = await snapshot(powerCompleteHtml.replace('data-user-message-bubble="true">',
     'data-user-message-bubble="true"><div class="markdown">USER CONTENT</div>'));
   expect(userMarkdown.visibleText).toBe(complete.visibleText);
+});
+
+test("captured power response keeps its Markdown ledger through final rendering", async () => {
+  const streaming = await snapshot(powerStreamingHtml);
+  const complete = await snapshot(powerCompleteHtml);
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe(streaming.markdownSegments, 0);
+  buffer.observe(complete.markdownSegments, 1000);
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  expect(buffer.finish().markdown).toEndWith("STREAM\\_END\\_927");
 });
 
 test("DIL response extraction preserves ownership, commentary and completion boundaries", async () => {

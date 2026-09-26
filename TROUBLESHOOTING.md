@@ -159,6 +159,19 @@ then use the exact names returned by its `tool_search_output` on the next tool b
 The local `/healthz` response also includes the last observed `tooling.snapshot` for diagnosing a
 stale or changing Codex catalog.
 
+### ChatGPT refuses a tool call or context compaction
+
+Share the exact failed tool result and an **Activity → Export safe log**. An assistant saying
+"safety block" without a failed tool result does not establish the cause. **Allow all actions**
+does not override ChatGPT's own safety checks.
+
+After updating, refresh **Codex Native2** in ChatGPT's plugin settings to load its current tool
+descriptions. This updates the compaction tool contract; it does not remove safety restrictions.
+If compaction ends without a submitted summary, the launcher reports that failure and preserves
+the existing task history.
+
+### Tools disappear on follow-up messages
+
 If `codex_tool_capabilities` is absent, ChatGPT is using a cached connector contract. Reload the
 **Codex Native2** connector, then start a new Codex turn. The bridge reports the catalog epoch so a
 safe log can distinguish a stale connector from a native tool that was never advertised.

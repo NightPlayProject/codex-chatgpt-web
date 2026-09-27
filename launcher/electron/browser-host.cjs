@@ -1501,12 +1501,15 @@ class BrowserHost {
         && now >= (tab.bootstrapDeadlineAt ?? Number.POSITIVE_INFINITY);
       const heartbeatExpired = tab.bootstrapReady === true
         && now - (tab.lastHeartbeatAt ?? 0) >= TURN_HEARTBEAT_TIMEOUT_MS;
-      if (!bootstrapExpired && !heartbeatExpired) continue;
+      const fallbackOwnerExited = tab.traceId.endsWith("_fallback") && !processRunning(tab.helperPid);
+      if (!bootstrapExpired && !heartbeatExpired && !fallbackOwnerExited) continue;
       if (tab.expiryCancellation) {
         cancellations.push(tab.expiryCancellation);
         continue;
       }
-      const evidence = bootstrapExpired ? "browser_surface_bootstrap_timeout" : "helper_heartbeat_expired";
+      const evidence = fallbackOwnerExited
+        ? "fallback_helper_exited"
+        : bootstrapExpired ? "browser_surface_bootstrap_timeout" : "helper_heartbeat_expired";
       const expiredOwner = {
         tabId: tab.id,
         traceId: tab.traceId,
@@ -1524,7 +1527,9 @@ class BrowserHost {
       const { traceId, helperPid } = tab;
       tab.expiryCancellation = Promise.resolve().then(async () => {
         try {
-          await this.cancelTurn(traceId, evidence);
+          // The runtime only accepts lease-expiration reasons. A confirmed dead fallback owner
+          // uses ordinary targeted cancellation so it cannot be mistaken for a timeout diagnosis.
+          await this.cancelTurn(traceId, fallbackOwnerExited ? undefined : evidence);
           if (this.turnTabs.get(tab.id) === tab && tab.traceId === traceId
             && tab.helperPid === helperPid && tab.status === "running") {
             this.removeTurnTab(tab, true);
@@ -2568,6 +2573,9 @@ class BrowserHost {
           // An explicit login is the recovery path after a failed saved-session refresh.
         }
       }
+      // A detached compaction fallback can outlive its Responses turn. Reconcile expired browser
+      // leases before login checks ownership so a dead fallback helper cannot block sign-in.
+      await this.reapExpiredTurnTabs();
       return await this.withManualOperation("ChatGPT login", async () => {
         this.authNavigationError = null;
         this.show();

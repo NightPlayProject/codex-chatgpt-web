@@ -1190,12 +1190,13 @@ test("concurrent embedded login requests share one authentication operation", as
       inspections += 1;
     },
     activateHomeSurface() {},
+    reapExpiredTurnTabs: async () => {},
     withManualOperation: async (_name, action) => await action(),
   };
   const first = BrowserHost.prototype.openLogin.call(fixture);
   const second = BrowserHost.prototype.openLogin.call(fixture);
   assert.equal(first, second);
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(waits, 1);
   resolveLogin({ authenticated: true });
   assert.deepEqual(await first, { authenticated: true });
@@ -1222,6 +1223,7 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
     probeAuthentication: async () => calls.push("probe"),
     waitForAuthenticated: async () => ({ authenticated: true }),
     runSessionInspection: async () => calls.push("inspect"),
+    reapExpiredTurnTabs: async () => calls.push("reap"),
     withManualOperation: async (name, action) => {
       calls.push(name);
       return await action();
@@ -1233,7 +1235,56 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
   assert.deepEqual(calls, []);
   finishRefresh();
   await login;
-  assert.deepEqual(calls, ["ChatGPT login", "probe", "inspect"]);
+  assert.deepEqual(calls, ["reap", "ChatGPT login", "probe", "inspect"]);
+});
+
+test("login reaps a dead compaction fallback owner before taking browser ownership", async () => {
+  const now = Date.now();
+  const events = [];
+  const tab = {
+    id: "tab-dead-fallback",
+    traceId: "c36d0a5ca24c_fallback",
+    helperPid: 2_147_483_647,
+    status: "running",
+    interactionMode: "automatic",
+    bootstrapReady: true,
+    lastHeartbeatAt: now,
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    lastTurnSweepAt: now - 1_000,
+    closedTurnOwners: new Map(),
+    selectedTabId: tab.id,
+    cancelTurn: async (traceId, reason) => {
+      events.push(["cancel", traceId, reason]);
+    },
+    removeTurnTab(candidate, abortRunning) {
+      events.push(["release", candidate.traceId, abortRunning]);
+      this.turnTabs.delete(candidate.id);
+    },
+    logger: { warn() {} },
+  });
+
+  await fixture.reapExpiredTurnTabs(now + 1);
+
+  assert.deepEqual(events, [
+    ["cancel", tab.traceId, undefined],
+    ["release", tab.traceId, true],
+  ]);
+  assert.equal(fixture.turnTabs.size, 0);
+});
+
+test("a genuine active Codex turn still blocks browser login operations", async () => {
+  const fixture = {
+    ready: async () => {},
+    activeTraceId: "trace_live_turn",
+    manualOperation: null,
+  };
+
+  await assert.rejects(
+    BrowserHost.prototype.withManualOperation.call(fixture, "ChatGPT login", async () => "unexpected"),
+    /ChatGPT browser is running Codex turn trace_live_turn/,
+  );
 });
 
 test("passkey login imports only validated state and re-proves the Launcher session", async () => {

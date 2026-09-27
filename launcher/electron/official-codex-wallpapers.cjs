@@ -17,6 +17,7 @@ const POWERSHELL_TIMEOUT_MS = 12_000;
 const CDP_CALL_TIMEOUT_MS = 20_000;
 const TARGET_ID_RE = /^[A-Za-z0-9_-]+$/;
 const PROVIDER_QUOTA_STATE_KEY = "__codexWebGptNativeQuotaBlocked";
+const PROVIDER_QUOTA_RECOVERY_KEY = "__codexWebGptNativeQuotaRecovered";
 const PROVIDER_SELECTED_STATE_KEY = "__codexWebGptWebProviderSelected";
 const PROVIDER_QUOTA_RUNTIME_KEY = "__codexWebGptProviderQuotaRuntime";
 const PROVIDER_QUOTA_SOURCE_NEEDLE = 'Rt=X(RK)&&et===`local`';
@@ -31,7 +32,7 @@ const ACTIVE_COMPOSER_SEND_NEEDLE = "let Nn=Ee||Qe&&$e||mt||St||Yt?.isLoading===
 const ACTIVE_COMPOSER_SUBMIT_NEEDLE = "submitDisabled:Nn";
 
 function providerQuotaBreakpointCondition(quotaVariable) {
-  return `globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true&&(${quotaVariable}=false)`;
+  return `((globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true)||globalThis.${PROVIDER_QUOTA_RECOVERY_KEY}===true)&&(${quotaVariable}=false)`;
 }
 
 function providerSelectionBreakpointCondition(modelVariable) {
@@ -277,7 +278,8 @@ function providerAuthoritativeModelStateScript() {
   })()`;
 }
 
-function providerComposerQuotaRerenderScript() {
+function providerComposerQuotaRerenderScript(allowSubmitDisabled = false) {
+  const submitDisabledGuard = allowSubmitDisabled ? "false" : "props.submitDisabled !== false";
   return String.raw`(async () => {
     const visible = element => {
       if (!(element instanceof Element)) return false;
@@ -299,7 +301,7 @@ function providerComposerQuotaRerenderScript() {
     let fiber = fiberKey == null ? null : button[fiberKey];
     for (let depth = 0; fiber != null && depth < 90; depth += 1, fiber = fiber.return) {
       const props = fiber.memoizedProps;
-      if (props == null || typeof props !== 'object' || props.submitDisabled !== false) continue;
+      if (props == null || typeof props !== 'object' || (${submitDisabledGuard})) continue;
       let hook = fiber.memoizedState;
       for (let hookIndex = 0; hook != null && hookIndex < 300; hookIndex += 1, hook = hook.next) {
         if (!(hook.memoizedState instanceof Set) || typeof hook.queue?.dispatch !== 'function') continue;
@@ -315,6 +317,10 @@ function providerComposerQuotaRerenderScript() {
 
 function nativeQuotaStateScript(blocked) {
   return `globalThis.${PROVIDER_QUOTA_STATE_KEY}=${blocked === true ? "true" : "false"}; true`;
+}
+
+function nativeQuotaRecoveryStateScript(recovered) {
+  return `globalThis.${PROVIDER_QUOTA_RECOVERY_KEY}=${recovered === true ? "true" : "false"}; true`;
 }
 
 const RATE_LIMIT_GATE_PROBE_SCRIPT = String.raw`(() => {
@@ -385,7 +391,7 @@ const RATE_LIMIT_GATE_RECOVERY_SCRIPT = String.raw`(() => {
   const stillRateLimited = button instanceof HTMLButtonElement
     && (button.disabled === true || button.getAttribute('aria-disabled') === 'true');
   if (!stillRateLimited || root.querySelector('.composer-attachment-surface') != null) return false;
-  location.reload();
+  globalThis.${PROVIDER_QUOTA_RECOVERY_KEY} = true;
   return true;
 })()`;
 
@@ -1194,6 +1200,7 @@ function createOfficialCodexWallpaperController({
     if (providerGateCandidate) {
       usage = await readRateLimitUsage(entry, targetId, checkedAt);
       if (entry.nativeQuotaBlocked === true) {
+        await entry.contents.executeJavaScript(nativeQuotaRecoveryStateScript(false));
         entry.rateLimitBlockedSince = null;
         return false;
       }
@@ -1221,10 +1228,34 @@ function createOfficialCodexWallpaperController({
     if ((entry.rateLimitRecoveryCooldownUntil || 0) > checkedAt) return false;
     usage ??= await readRateLimitUsage(entry, targetId, checkedAt);
     if (!usageAllowsRateLimitRecovery(usage)) return false;
-    entry.rateLimitRecoveryCooldownUntil = checkedAt + RATE_LIMIT_RECOVERY_COOLDOWN_MS;
+    if (!entry.providerQuotaPatchApplied) {
+      await entry.contents.executeJavaScript(nativeQuotaRecoveryStateScript(false));
+      logger.warn("wallpapers.official_codex_rate_limit_recovery_unavailable", {
+        targetId,
+        reason: entry.providerQuotaPatchUnavailableReason || "provider-quota-patch-unavailable",
+      });
+      return false;
+    }
     const recovered = await entry.contents.executeJavaScript(RATE_LIMIT_GATE_RECOVERY_SCRIPT);
     if (recovered !== true) return false;
-    entry.generation = null;
+    const rerender = await entry.contents.executeJavaScript(providerComposerQuotaRerenderScript(true));
+    entry.rateLimitRecoveryCooldownUntil = checkedAt + RATE_LIMIT_RECOVERY_COOLDOWN_MS;
+    if (rerender?.dispatched !== true) {
+      await entry.contents.executeJavaScript(nativeQuotaRecoveryStateScript(false));
+      logger.warn("wallpapers.official_codex_rate_limit_recovery_unavailable", {
+        targetId,
+        reason: rerender?.reason || "safe-rerender-hook-missing",
+      });
+      return false;
+    }
+    const repairedProbe = await entry.contents.executeJavaScript(RATE_LIMIT_GATE_PROBE_SCRIPT);
+    if (repairedProbe?.rateLimitBlocked === true) {
+      logger.warn("wallpapers.official_codex_rate_limit_recovery_incomplete", {
+        targetId,
+        reason: "send-control-remains-disabled-after-in-place-rerender",
+      });
+      return false;
+    }
     entry.rateLimitBlockedSince = null;
     logger.info("wallpapers.official_codex_rate_limit_state_refreshed", {
       targetId,
@@ -1364,6 +1395,9 @@ function createOfficialCodexWallpaperController({
             }
             await readRateLimitUsage(entry, target.id, checkedAt);
             await entry.contents.executeJavaScript(nativeQuotaStateScript(entry.nativeQuotaBlocked === true));
+            if (entry.nativeQuotaBlocked === true) {
+              await entry.contents.executeJavaScript(nativeQuotaRecoveryStateScript(false));
+            }
             const previousWebSelection = entry.authoritativeWebSelected;
             const authoritativeModel = await entry.contents.executeJavaScript(providerAuthoritativeModelStateScript());
             entry.authoritativeWebSelected = authoritativeModel?.webSelected === true;
@@ -1374,6 +1408,7 @@ function createOfficialCodexWallpaperController({
             await maybeRecoverStaleRateLimit(entry, target.id);
           } else {
             await entry.contents.executeJavaScript(nativeQuotaStateScript(false));
+            await entry.contents.executeJavaScript(nativeQuotaRecoveryStateScript(false));
             if (entry.providerGateActive === true) {
               await entry.contents.executeJavaScript(providerAwareRateLimitGateScript(false));
               entry.providerGateActive = false;

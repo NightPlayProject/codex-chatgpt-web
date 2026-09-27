@@ -17,6 +17,7 @@ const {
   providerActiveModelChangeBreakpointSite,
   providerAwareComposerQuotaRuntimeScript,
   providerAwareRateLimitGateScript,
+  providerComposerQuotaRerenderScript,
   RATE_LIMIT_GATE_PROBE_SCRIPT,
   RATE_LIMIT_GATE_RECOVERY_SCRIPT,
   usageAllowsRateLimitRecovery,
@@ -274,6 +275,7 @@ for (const layout of [
     assert.match(breakpointParams[1].condition, /Kt=false/);
     assert.match(breakpointParams[2].condition, /__codexWebGptNativeQuotaBlocked===true/);
     assert.match(breakpointParams[2].condition, /__codexWebGptWebProviderSelected===true/);
+    assert.match(breakpointParams[2].condition, /__codexWebGptNativeQuotaRecovered===true/);
     assert.ok(breakpointParams[2].condition.includes(`${layout.quotaVariable}=false`));
     for (const webSelected of [false, true]) {
       for (const nativeBlocked of [false, true]) {
@@ -286,6 +288,12 @@ for (const layout of [
         assert.equal(context[layout.quotaVariable], !(webSelected && nativeBlocked));
       }
     }
+    const recoveredQuotaContext = {
+      __codexWebGptNativeQuotaRecovered: true,
+      [layout.quotaVariable]: true,
+    };
+    assert.equal(vm.runInNewContext(breakpointParams[2].condition, recoveredQuotaContext), false);
+    assert.equal(recoveredQuotaContext[layout.quotaVariable], false);
     assert.equal(calls.includes("Debugger.setScriptSource"), false);
   } finally {
     contents.close();
@@ -303,6 +311,50 @@ function scriptedWebSocket(responder) {
       queueMicrotask(() => this.onmessage?.({
         data: JSON.stringify({ id: message.id, result: { result: { value } } }),
       }));
+    }
+  };
+}
+
+function scriptedProviderQuotaPatchWebSocket(responder) {
+  const source = [
+    currentModelSource,
+    'function Tjt(e){let{rateLimitSendBlockReason:xe,rateLimitSendBlocked:Se,rateLimitConversationSendBlocked:Ce,selectedModel:Ie}=e,Gt=xe===void 0?null:xe,Kt=Se!==void 0&&Se,qt=Ce!==void 0&&Ce;let ai=Gyt({rateLimitSendBlocked:Kt}),us=1,ds=2,fs=gi||It||on||Kt||ds||us||De==null||Jt!==!0;return fs}',
+    currentComposerSource,
+  ].join(";");
+  let breakpointIndex = 0;
+  return class ScriptedProviderQuotaPatchWebSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      const reply = result => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ id: message.id, result }),
+      }));
+      const emit = (method, params) => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ method, params }),
+      }));
+      if (message.method === "Debugger.disable") return reply({});
+      if (message.method === "Debugger.enable") {
+        emit("Debugger.scriptParsed", {
+          scriptId: "recovery_primary",
+          url: "app://-/assets/app-primary-recovery.js",
+        });
+        return reply({});
+      }
+      if (message.method === "Debugger.getScriptSource") return reply({ scriptSource: source });
+      if (message.method === "Debugger.getPossibleBreakpoints") {
+        return reply({ locations: [message.params.start] });
+      }
+      if (message.method === "Debugger.setBreakpointByUrl") {
+        return reply({ breakpointId: `recovery_breakpoint_${++breakpointIndex}` });
+      }
+      if (message.method === "Debugger.removeBreakpoint") return reply({});
+      if (message.method === "Runtime.evaluate") {
+        const expression = message.params?.expression || "";
+        const value = expression.includes("performance.timeOrigin")
+          ? "official-codex-generation-1"
+          : responder(expression);
+        return reply({ result: { value } });
+      }
+      throw new Error(`Unexpected CDP method: ${message.method}`);
     }
   };
 }
@@ -493,8 +545,8 @@ test("stale rate-limit recovery requires fresh usage headroom", () => {
   assert.equal(usageShowsNativeQuotaExhaustion({ available: true, primaryUsedPercent: 100, secondaryUsedPercent: 47 }), true);
 });
 
-test("stale rate-limit recovery reloads the current Codex disabled Send control", () => {
-  const { context } = makeProviderGateVmContext({
+test("stale rate-limit recovery marks an in-place native quota repair without reloading Codex", () => {
+  const { context, submit } = makeProviderGateVmContext({
     disabled: true,
     ariaDisabled: "true",
     sendButtonType: "button",
@@ -506,7 +558,11 @@ test("stale rate-limit recovery reloads the current Codex disabled Send control"
 
   const recovered = vm.runInNewContext(RATE_LIMIT_GATE_RECOVERY_SCRIPT, context);
   assert.equal(recovered, true);
-  assert.equal(reloads, 1);
+  assert.equal(reloads, 0);
+  assert.equal(context.__codexWebGptNativeQuotaRecovered, true);
+  assert.equal(submit.disabled, true);
+  assert.match(providerComposerQuotaRerenderScript(), /props\.submitDisabled !== false/);
+  assert.doesNotMatch(providerComposerQuotaRerenderScript(true), /props\.submitDisabled !== false/);
 });
 
 test("ChatGPT Web provider gate handles a natively disabled quota button and restores it", () => {
@@ -761,7 +817,7 @@ test("stale native rate-limit gate refreshes only after authoritative usage says
   let recoveryCalls = 0;
   let usageCalls = 0;
   let clock = 100_000;
-  const WebSocketImpl = scriptedWebSocket(expression => {
+  const WebSocketImpl = scriptedProviderQuotaPatchWebSocket(expression => {
     if (expression === RATE_LIMIT_GATE_PROBE_SCRIPT) {
       return { rateLimitBlocked: blocked, hasAttachments: false };
     }
@@ -769,6 +825,9 @@ test("stale native rate-limit gate refreshes only after authoritative usage says
       recoveryCalls += 1;
       blocked = false;
       return true;
+    }
+    if (expression === providerComposerQuotaRerenderScript(true)) {
+      return { dispatched: true, reason: null };
     }
     return true;
   });

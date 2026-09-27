@@ -20,6 +20,10 @@ const DEFAULT_STATE = Object.freeze({
   experimentalFreshConversationPerTurn: false,
   useSavedChats: false,
   zeroRiskProEnabled: false,
+  codexWallpapersEnabled: false,
+  codexWallpapersRestartRequired: false,
+  codexWallpapersStatus: null,
+  codexWallpapersError: null,
   browserSmokePassed: false,
   browserSmokeVersion: null,
   sidebarOpen: true,
@@ -54,6 +58,8 @@ function readState(filePath) {
       "experimentalFreshConversationPerTurn",
       "useSavedChats",
       "zeroRiskProEnabled",
+      "codexWallpapersEnabled",
+      "codexWallpapersRestartRequired",
       "browserSmokePassed",
       "sidebarOpen",
     ]) {
@@ -61,6 +67,14 @@ function readState(filePath) {
     }
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
+    }
+    if (state.codexWallpapersStatus !== null
+      && (typeof state.codexWallpapersStatus !== "string" || state.codexWallpapersStatus.length > 64)) {
+      state.codexWallpapersStatus = DEFAULT_STATE.codexWallpapersStatus;
+    }
+    if (state.codexWallpapersError !== null
+      && (typeof state.codexWallpapersError !== "string" || state.codexWallpapersError.length > 2_000)) {
+      state.codexWallpapersError = DEFAULT_STATE.codexWallpapersError;
     }
     if (state.coreSetupComplete !== true) {
       if (state.onboardingComplete !== true) state.browserInteractionMode = "automatic";

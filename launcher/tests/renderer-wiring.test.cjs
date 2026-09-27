@@ -98,6 +98,7 @@ test("setup preserves session-check failures and never installs without verified
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
       runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
+      officialCodexWallpaperController: { setProviderGateEnabled: async () => ({}) },
       smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
     });
     await assert.rejects(setup, error => error.message === browser.message);
@@ -468,7 +469,8 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
     validateBrowserInteractionMode: mode => mode, IS_DEV_PROFILE: false, send() {}, startCatalogVerificationMonitor() {},
     LAUNCHER_PROFILE: { kind: "production", codexHome: "/fixture/codex" }, CORE_HOME: "/fixture/core",
     launcherUserData: "/fixture/launcher", logger: { recent: () => [] },
-    GITHUB_URL: "", X_URL: "", CONNECTORS_URL: "", TUNNELS_URL: "", KEYS_URL: "",
+    GITHUB_URL: "", X_URL: "", CONNECTORS_URL: "", TUNNELS_URL: "", KEYS_URL: "", CODEX_SWITCHER_URL: "",
+    accountSwitcher: null,
     process: { platform: "darwin" }, app: { isPackaged: false, getVersion: () => "test" },
     smokePassedThisSession: false, smokePassedForCurrentVersion: () => false, lastOperation: null, updateController: null,
   };

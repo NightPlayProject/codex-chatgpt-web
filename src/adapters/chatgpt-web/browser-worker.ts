@@ -4167,6 +4167,21 @@ export class ChatGptBrowserWorker {
             button.remove();
           }
         }
+        // The new renderer wraps code in DIVs, including a localized toolbar that can
+        // disappear on completion. Project only the code into PRE before fingerprinting
+        // and Markdown conversion; otherwise the toolbar changes the committed text and
+        // Turndown collapses code newlines as if they were ordinary inline whitespace.
+        const codeBlockSelector = 'pre, [data-markdown-copy="code-block"]';
+        for (const block of Array.from(content.querySelectorAll(codeBlockSelector))) {
+          if (block.parentElement?.closest(codeBlockSelector)) continue;
+          const codes = block.querySelectorAll("code");
+          if (codes.length !== 1) continue;
+          const code = codes[0]!.cloneNode(true);
+          const pre = block.tagName === "PRE" ? block : content.ownerDocument.createElement("pre");
+          block.textContent = "";
+          pre.appendChild(code);
+          if (pre !== block) block.appendChild(pre);
+        }
         return content;
       };
       // ChatGPT may merge adjacent `.markdown` roots or virtualize an earlier prefix while a streamed
@@ -4643,8 +4658,15 @@ export class ChatGptBrowserWorker {
             : {}),
         });
         if (release.cancelledByUser) throw chatGptBrowserTabClosedError();
+        if (release.authenticationRequired && terminal !== "aborted") {
+          throw new ChatGptWebAdapterError(
+            "ChatGPT requested sign-in. Open sign in in the launcher, then retry.",
+            { status: 401, errorType: "authentication_error", code: "chatgpt_sign_in_required", retryable: false },
+          );
+        }
       } catch (controlError) {
-        if (controlError instanceof ChatGptWebAdapterError && controlError.code === "client_cancelled") {
+        if (controlError instanceof ChatGptWebAdapterError
+          && ["client_cancelled", "chatgpt_sign_in_required"].includes(controlError.code)) {
           throw controlError;
         }
         if (!originalError) throw controlError;

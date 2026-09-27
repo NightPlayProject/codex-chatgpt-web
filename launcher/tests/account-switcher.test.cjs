@@ -63,6 +63,17 @@ test("account projections expose safe metadata without credentials", () => {
   assert.doesNotMatch(JSON.stringify(summary), /id-a|access-a|refresh-a/);
 });
 
+test("account projections use the cached stats profile image when the store has no avatar", () => {
+  const avatarUrl = "https://cdn.auth0.com/avatars/alice.png";
+  const summary = projectAccount(
+    account("account-a", "alice@example.com", "a"),
+    "account-a",
+    Date.now(),
+    { stats: { avatarUrl } },
+  );
+  assert.equal(summary.avatarUrl, avatarUrl);
+});
+
 test("usage refresh maps native rate windows and token activity without retaining credentials", () => {
   const fetchedAt = "2026-09-16T12:00:00.000Z";
   const usage = mapUsagePayload({

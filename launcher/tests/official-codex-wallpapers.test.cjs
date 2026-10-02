@@ -497,6 +497,7 @@ function makeController({
   calls = { install: 0, dispose: 0 },
   events = [],
   processes = [],
+  listProcesses = async () => processes,
   storedEndpoint = false,
   discoverTargets = async () => [],
   validateEndpoint = async () => storedEndpoint,
@@ -516,7 +517,7 @@ function makeController({
     logger: log,
     wallpaperManager: makeManager(calls),
     resolveIdentity: async () => identity,
-    listProcesses: async () => processes,
+    listProcesses,
     validateEndpoint,
     launchApp,
     waitForEndpoint,
@@ -531,6 +532,12 @@ function makeController({
   });
   if (storedEndpoint) fs.writeFileSync(path.join(root, "endpoint.json"), `${JSON.stringify(validEndpoint())}\n`);
   return controller;
+}
+
+async function waitForController(predicate) {
+  const deadline = Date.now() + 1_500;
+  while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(predicate(), "Controller did not reach the expected lifecycle state");
 }
 
 test("stale rate-limit recovery requires fresh usage headroom", () => {
@@ -1043,6 +1050,201 @@ test("a fast normal restart is detected and retried with the official CDP launch
     assert.equal(launched, 1);
     assert.equal(events.at(-1).status, "ready");
     assert.equal(events.at(-1).restartRequired, false);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("closing Codex stays closed until the user opens a new process", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-stay-closed-"));
+  const processes = [{ ProcessId: 1234, ExecutablePath: identity.Executable }];
+  const events = [];
+  let launched = 0;
+  let closedChecks = 0;
+  const controller = makeController({
+    root, events,
+    listProcesses: async () => {
+      if (processes.length === 0) closedChecks += 1;
+      return processes;
+    },
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    await controller.setEnabled(true);
+    processes.length = 0;
+    await waitForController(() => closedChecks >= 3);
+    assert.equal(launched, 0);
+    processes.push({ ProcessId: 5678, ExecutablePath: identity.Executable });
+    await waitForController(() => events.at(-1)?.status === "ready");
+    assert.equal(launched, 1);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restoring Wallpapers does not open a closed app, but explicit enabling still can", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-restore-"));
+  let launched = 0;
+  let checks = 0;
+  const controller = makeController({
+    root,
+    listProcesses: async () => { checks += 1; return []; },
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    const result = await controller.setEnabled(true, { launchIfClosed: false });
+    assert.equal(result.restartRequired, true);
+    await waitForController(() => checks >= 4);
+    assert.equal(launched, 0);
+    await controller.setEnabled(true);
+    assert.equal(launched, 1);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(launched, 1);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the background provider gate never opens a closed Codex app", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-provider-stay-closed-"));
+  let launched = 0;
+  let checks = 0;
+  const controller = makeController({
+    root,
+    listProcesses: async () => { checks += 1; return []; },
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    const result = await controller.setProviderGateEnabled(true);
+    assert.equal(result.restartRequired, true);
+    await waitForController(() => checks >= 4);
+    assert.equal(launched, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("losing an attached endpoint after closing Codex does not restart it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-endpoint-closed-"));
+  const events = [];
+  const processes = [{ ProcessId: 1234, ExecutablePath: identity.Executable }];
+  let reachable = true;
+  let launched = 0;
+  let closedChecks = 0;
+  const controller = makeController({
+    root, events, storedEndpoint: true, refreshIntervalMs: 5,
+    validateEndpoint: async () => reachable,
+    discoverTargets: async () => {
+      if (!reachable) throw new Error("Connection closed");
+      return [makeTarget()];
+    },
+    listProcesses: async () => {
+      if (processes.length === 0) closedChecks += 1;
+      return processes;
+    },
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    await controller.setEnabled(true);
+    reachable = false;
+    processes.length = 0;
+    await waitForController(() => closedChecks >= 4);
+    assert.equal(launched, 0);
+    assert.equal(events.at(-1).status, "restart-required");
+    processes.push({ ProcessId: 5678, ExecutablePath: identity.Executable });
+    reachable = true;
+    await waitForController(() => events.at(-1)?.status === "ready");
+    assert.equal(launched, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const action of ["close", "disable", "destroy"]) {
+  test(`a pending background activation is abandoned on ${action}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `codex-official-wallpapers-pending-${action}-`));
+    const processes = [{ ProcessId: 1234, ExecutablePath: identity.Executable }];
+    let finishPort;
+    let launched = 0;
+    const controller = makeController({
+      root, processes,
+      findPort: () => new Promise(resolve => { finishPort = resolve; }),
+      launchApp: async () => { launched += 1; },
+    });
+    try {
+      await controller.setEnabled(true);
+      processes.splice(0, processes.length, { ProcessId: 5678, ExecutablePath: identity.Executable });
+      await waitForController(() => typeof finishPort === "function");
+      if (action === "close") processes.length = 0;
+      else if (action === "disable") await controller.setEnabled(false);
+      else controller.destroy();
+      finishPort(9444);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(launched, 0);
+    } finally {
+      controller.destroy();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("slow background attachment cannot activate Codex more than once", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-slow-attach-"));
+  const processes = [{ ProcessId: 1234, ExecutablePath: identity.Executable }];
+  const events = [];
+  let finishEndpoint;
+  let launched = 0;
+  const controller = makeController({
+    root, processes, events,
+    launchApp: async () => { launched += 1; },
+    waitForEndpoint: () => new Promise(resolve => { finishEndpoint = resolve; }),
+  });
+  try {
+    await controller.setEnabled(true);
+    processes.splice(0, processes.length, { ProcessId: 5678, ExecutablePath: identity.Executable });
+    await waitForController(() => typeof finishEndpoint === "function");
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(launched, 1);
+    finishEndpoint(validEndpoint());
+    await waitForController(() => events.at(-1)?.status === "ready");
+    assert.equal(launched, 1);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a platform activation skipped during shutdown returns to passive waiting", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-skipped-activation-"));
+  const processes = [{ ProcessId: 1234, ExecutablePath: identity.Executable }];
+  let activations = 0;
+  let endpointWaits = 0;
+  let closedChecks = 0;
+  const controller = makeController({
+    root,
+    listProcesses: async () => {
+      if (processes.length === 0) closedChecks += 1;
+      return processes;
+    },
+    launchApp: async (_identity, _port, options) => {
+      assert.equal(options.onlyIfRunning, true);
+      activations += 1;
+      processes.length = 0;
+      return { ok: true, activated: false };
+    },
+    waitForEndpoint: async () => { endpointWaits += 1; return validEndpoint(); },
+  });
+  try {
+    await controller.setEnabled(true);
+    processes.splice(0, processes.length, { ProcessId: 5678, ExecutablePath: identity.Executable });
+    await waitForController(() => closedChecks >= 4);
+    assert.equal(activations, 1);
+    assert.equal(endpointWaits, 0);
   } finally {
     controller.destroy();
     fs.rmSync(root, { recursive: true, force: true });

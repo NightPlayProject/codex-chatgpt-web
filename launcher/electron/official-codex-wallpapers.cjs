@@ -671,8 +671,12 @@ public static class CWPackageActivation {
  public static void Open(string id,string args){var manager=(Manager)new ActivationManager();try{uint pid;Marshal.ThrowExceptionForHR(manager.ActivateApplication(id,args,0,out pid));}finally{Marshal.ReleaseComObject(manager);}}
 }
 '@}
+if($env:CW_REQUIRE_RUNNING -eq '1'){
+ $running=@(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe'" -ErrorAction Stop | Where-Object {$_.ExecutablePath -eq $env:CW_EXPECTED_EXE})
+ if($running.Count -eq 0){[pscustomobject]@{ok=$true;activated=$false}|ConvertTo-Json -Compress;return}
+}
 [CWPackageActivation]::Open($env:CW_APP_ID,$env:CW_ARGS)
-[pscustomobject]@{ok=$true}|ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;activated=$true}|ConvertTo-Json -Compress
 `;
 
 function delay(ms) {
@@ -740,16 +744,22 @@ async function validateOfficialEndpoint(endpoint, identity) {
   }
 }
 
-async function launchOfficialCodex(identity, port) {
+async function launchOfficialCodex(identity, port, options = {}) {
   return launchOfficialCodexApplication(
     identity,
     `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`,
+    options,
   );
 }
 
-async function launchOfficialCodexApplication(identity, args = "") {
-  await runPowerShellJson(LAUNCH_STORE_APP_SCRIPT, {
-    env: { CW_APP_ID: identity.AppId, CW_ARGS: String(args) },
+async function launchOfficialCodexApplication(identity, args = "", { onlyIfRunning = false } = {}) {
+  return runPowerShellJson(LAUNCH_STORE_APP_SCRIPT, {
+    env: {
+      CW_APP_ID: identity.AppId,
+      CW_ARGS: String(args),
+      CW_EXPECTED_EXE: identity.Executable,
+      CW_REQUIRE_RUNNING: onlyIfRunning ? "1" : "0",
+    },
   });
 }
 
@@ -1161,8 +1171,10 @@ function createOfficialCodexWallpaperController({
   let restartRequired = false;
   let lastError = null;
   let restartBaseline = null;
+  let restartGeneration = 0;
+  let destroyed = false;
 
-  const integrationActive = () => wallpapersEnabled || providerGateEnabled;
+  const integrationActive = () => !destroyed && (wallpapersEnabled || providerGateEnabled);
 
   const readRateLimitUsage = async (entry, targetId, checkedAt) => {
     if ((entry.rateLimitUsageCheckedAt || 0) > 0
@@ -1294,6 +1306,7 @@ function createOfficialCodexWallpaperController({
   };
 
   const stopRestartWait = () => {
+    restartGeneration += 1;
     if (restartTimer) clearInterval(restartTimer);
     restartTimer = null;
     restartBaseline = null;
@@ -1444,6 +1457,7 @@ function createOfficialCodexWallpaperController({
   };
 
   const startRefresh = async (nextIdentity, nextEndpoint) => {
+    if (!integrationActive()) return 0;
     stopRefresh();
     stopRestartWait();
     identity = nextIdentity;
@@ -1453,7 +1467,7 @@ function createOfficialCodexWallpaperController({
       refreshTimer = setInterval(() => { void refreshTargets(); }, refreshIntervalMs);
       refreshTimer.unref?.();
     }
-    publish({ status: "ready", restartRequired: false, error: null, applied });
+    if (integrationActive()) publish({ status: "ready", restartRequired: false, error: null, applied });
     return applied;
   };
 
@@ -1467,12 +1481,26 @@ function createOfficialCodexWallpaperController({
     return stored;
   };
 
-  const launchAndAttach = async nextIdentity => {
+  const launchAndAttach = async (nextIdentity, {
+    shouldContinue = integrationActive,
+    onlyIfRunning = false,
+  } = {}) => {
+    const currentResult = () => ({ enabled: wallpapersEnabled, restartRequired, applied: 0, status, error: lastError });
+    const allowed = () => integrationActive() && shouldContinue();
+    if (!allowed()) return currentResult();
+    if (!onlyIfRunning) stopRestartWait();
     const port = await findPort();
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Could not allocate a loopback port for the official Codex app");
-    await launchApp(nextIdentity, port);
-    if (!integrationActive()) return { enabled: wallpapersEnabled, restartRequired: false, applied: 0, status, error: lastError };
+    if (!allowed()) return currentResult();
+    // A background restart check may attach to an app the user has reopened, but must
+    // not resurrect it if it closed while this asynchronous operation was preparing.
+    if (onlyIfRunning && (await listProcesses(nextIdentity)).length === 0) return currentResult();
+    if (!allowed()) return currentResult();
+    const activation = await launchApp(nextIdentity, port, { onlyIfRunning });
+    if (!allowed()) return currentResult();
+    if (activation?.activated === false) return currentResult();
     const nextEndpoint = await waitForEndpoint(nextIdentity, port, { validateEndpoint });
+    if (!allowed()) return currentResult();
     if (!nextEndpoint) {
       beginRestartWait(nextIdentity);
       publish({ status: "restart-required", restartRequired: true, error: null });
@@ -1486,37 +1514,49 @@ function createOfficialCodexWallpaperController({
   function beginRestartWait(nextIdentity, baselineProcesses = null) {
     identity = nextIdentity;
     if (!integrationActive() || restartTimer) return;
-    restartBaseline = processIdentitySet(baselineProcesses);
+    restartBaseline = baselineProcesses === null ? null : processIdentitySet(baselineProcesses);
+    const generation = ++restartGeneration;
+    const waiting = () => integrationActive() && restartTimer !== null && restartGeneration === generation;
+    let checking = false;
     restartTimer = setInterval(async () => {
-      if (!integrationActive() || restartTimer === null) return;
+      if (!waiting() || checking) return;
+      checking = true;
       try {
         const stored = await attachStoredEndpoint(nextIdentity);
+        if (!waiting()) return;
         if (stored) {
           await startRefresh(nextIdentity, stored);
           return;
         }
         const processes = await listProcesses(nextIdentity);
+        if (!waiting()) return;
         const currentProcesses = processIdentitySet(processes);
+        // Closing Codex is a user decision, not a restart request. Keep observing
+        // without activation until the user actually opens a new process.
+        if (currentProcesses.size === 0) {
+          restartBaseline = currentProcesses;
+          return;
+        }
+        if (restartBaseline === null) {
+          restartBaseline = currentProcesses;
+          return;
+        }
         const baselineStillRunning = restartBaseline !== null
           && [...restartBaseline].some(processId => currentProcesses.has(processId));
-        const restartWasObserved = restartBaseline !== null
-          && restartBaseline.size > 0
-          && currentProcesses.size > 0
-          && !baselineStillRunning;
-        if (processes.length !== 0 && !restartWasObserved) return;
-        stopRestartWait();
-        const result = await launchAndAttach(nextIdentity);
-        if (result.restartRequired) {
+        const restartWasObserved = restartBaseline.size === 0 || !baselineStillRunning;
+        if (!restartWasObserved) return;
+        const result = await launchAndAttach(nextIdentity, { shouldContinue: waiting, onlyIfRunning: true });
+        if (waiting() && result.restartRequired) {
           const nextProcesses = await listProcesses(nextIdentity).catch(() => []);
-          beginRestartWait(nextIdentity, nextProcesses);
+          if (waiting()) restartBaseline = processIdentitySet(nextProcesses);
         }
       } catch (error) {
+        if (!waiting()) return;
         logger.warn("wallpapers.official_codex_restart_wait_failed", {
           message: error instanceof Error ? error.message : String(error),
         });
-        if (integrationActive() && restartTimer === null) {
-          beginRestartWait(nextIdentity);
-        }
+      } finally {
+        checking = false;
       }
     }, restartPollIntervalMs);
     restartTimer.unref?.();
@@ -1551,7 +1591,8 @@ function createOfficialCodexWallpaperController({
     return null;
   }
 
-  const setEnabledNow = async next => {
+  const setEnabledNow = async (next, { launchIfClosed = true } = {}) => {
+    if (destroyed) return { enabled: false, restartRequired: false, applied: 0 };
     if (platform !== "win32") {
       if (next) throw new Error("Codex Wallpapers official-app integration is currently available on Windows only");
       wallpapersEnabled = false;
@@ -1599,7 +1640,7 @@ function createOfficialCodexWallpaperController({
       return { enabled: true, restartRequired: false, applied, status, error: lastError };
     }
     const processes = await listProcesses(identity);
-    if (processes.length > 0) {
+    if (processes.length > 0 || !launchIfClosed) {
       beginRestartWait(identity, processes);
       publish({ status: "restart-required", restartRequired: true, error: null });
       return { enabled: true, restartRequired: true, applied: 0, status, error: lastError };
@@ -1609,6 +1650,7 @@ function createOfficialCodexWallpaperController({
   };
 
   const setProviderGateEnabledNow = async next => {
+    if (destroyed) return { enabled: false, restartRequired: false, applied: 0 };
     if (platform !== "win32") {
       providerGateEnabled = false;
       if (!wallpapersEnabled) {
@@ -1651,18 +1693,14 @@ function createOfficialCodexWallpaperController({
       return { enabled: true, restartRequired: false, applied, status, error: lastError };
     }
     const processes = await listProcesses(identity);
-    if (processes.length > 0) {
-      beginRestartWait(identity, processes);
-      return { enabled: true, restartRequired: true, applied: 0, status: "restart-required", error: null };
-    }
-    const result = await launchAndAttach(identity);
-    return { ...result, enabled: true };
+    beginRestartWait(identity, processes);
+    return { enabled: true, restartRequired: true, applied: 0, status: "restart-required", error: null };
   };
 
   return {
-    setEnabled(next) {
+    setEnabled(next, { launchIfClosed = true } = {}) {
       const requested = next === true;
-      operation = operation.catch(() => {}).then(() => setEnabledNow(requested)).catch(error => {
+      operation = operation.catch(() => {}).then(() => setEnabledNow(requested, { launchIfClosed })).catch(error => {
         publish({
           status: "error",
           restartRequired: false,
@@ -1678,6 +1716,7 @@ function createOfficialCodexWallpaperController({
       return operation;
     },
     destroy() {
+      destroyed = true;
       stopRestartWait();
       stopRefresh();
     },

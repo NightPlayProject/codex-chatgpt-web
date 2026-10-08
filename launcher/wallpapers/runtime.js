@@ -18,7 +18,7 @@
     return p;
   }
   const readPrefs=()=>{try{return sanitize(JSON.parse(localStorage.getItem(KEY)||'{}'));}catch{return sanitize();}};
-  let prefs=readPrefs(),current=null,seq=0,disposed=false,filter='all',lastFocus=null,metalSend=null,metalSendTarget=null,menuRefreshTimer=0,metalSendRefreshTimer=0;
+  let prefs=readPrefs(),current=null,seq=0,disposed=false,filter='all',lastFocus=null,metalSend=null,metalSendTarget=null,menuRefreshTimer=0,metalSendRefreshTimer=0,playbackRecoveryTimer=0,videoRetries=0,videoFallback=false;
   const items=new Map(),chunks=new Map(),urls=new Set();
   const surface=document.createElement('style');surface.id='cw-surfaces';document.head.append(surface);
   const host=document.createElement('div');host.id='cw-picker';host.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:1000';
@@ -44,7 +44,7 @@
     const active=prefs.enabled&&!!current;document.documentElement.classList.toggle('cw-active',active);
     const p=palette(items.get(prefs.selected));
     surface.textContent=options.appearanceCSS+`html.cw-active{--cw-accent:${p.accent};--cw-surface:${p.surface};--cw-sidebar:${p.sidebar};--cw-sidebar-opacity:${prefs.sidebarOpacity}%;--cw-composer-opacity:${prefs.composerOpacity}%;--cw-card-opacity:${prefs.cardOpacity}%;--cw-sidebar-radius:${prefs.sidebarRadius}px;--cw-composer-radius:${prefs.composerRadius}px;--cw-settings-radius:${prefs.settingsRadius}px;}`;
-    if(current){current.hidden=!active;current.style.objectFit=prefs.fit;current.style.filter=`brightness(${prefs.brightness/100})`;if(current.tagName==='VIDEO'){if(!active||document.hidden||prefs.motion==='pause'||(prefs.motion==='system'&&reduced.matches))current.pause();else current.play().catch(()=>notice('The video is ready. Open Wallpapers to resume playback.'));}}
+    if(current){current.hidden=!active;current.style.objectFit=prefs.fit;current.style.filter=`brightness(${prefs.brightness/100})`;if(current.tagName==='VIDEO'){if(!active||document.hidden||prefs.motion==='pause'||(prefs.motion==='system'&&reduced.matches))current.pause();else if(current.error)current.onerror?.();else current.play().catch(()=>notice('Video playback could not start. Open Wallpapers to retry.'));}}
     syncMetalSend(active);
     renderControls();
   }
@@ -95,19 +95,56 @@
   }
   function updateDetails(){const item=items.get(prefs.selected);q('preview').hidden=!item;if(item){q('preview').src=item.thumbnail;q('current').textContent=item.title;q('dimensions').textContent=`${item.width} × ${item.height} · ${item.kind==='video'?'Video':'Image'}`;}else{q('current').textContent='No wallpaper selected';q('dimensions').textContent='';}for(const b of q('grid').children)b.setAttribute('aria-pressed',String(b.dataset.id===prefs.selected));}
   function updateFilter(){let visible=0;for(const b of q('grid').children){const i=items.get(b.dataset.id);b.hidden=!((filter==='all'||i.kind===filter)&&i.title.toLocaleLowerCase().includes(q('search').value.toLocaleLowerCase()));if(!b.hidden)visible++;}q('empty').hidden=items.size>0;q('no-results').hidden=visible>0||items.size===0;}
+  function loadMedia(media,source){
+    return new Promise((resolve,reject)=>{
+      const finish=error=>{clearTimeout(timer);media.onload=media.onloadeddata=media.onerror=null;error?reject(error):resolve();};
+      const timer=setTimeout(()=>finish(Error('Loading timed out')),10000);
+      media.onload=media.onloadeddata=()=>finish();media.onerror=()=>finish(Error('Unsupported format'));media.src=source;
+    });
+  }
+  function activateMedia(media,item,{persist=true,fallback=false}={}){
+    clearTimeout(playbackRecoveryTimer);playbackRecoveryTimer=0;
+    const old=current;current=media;videoFallback=fallback;
+    document.body.prepend(media);prefs.selected=item.id;appearance();
+    if(old){old.onerror=null;old.pause?.();old.remove();old.removeAttribute('src');old.load?.();}
+    if(persist)save();updateDetails();
+  }
+  async function showPreview(item,{persist=false,ticket=null,expectedMedia=null}={}){
+    const preview=document.createElement('img');preview.id='cw-media';preview.setAttribute('aria-hidden','true');
+    await loadMedia(preview,item.thumbnail);
+    if(disposed||(ticket!==null&&ticket!==seq)||(expectedMedia&&current!==expectedMedia)){preview.removeAttribute('src');return false;}
+    activateMedia(preview,item,{persist,fallback:true});
+    notice('Video playback failed. Showing this wallpaper’s still preview.');return true;
+  }
+  function watchVideo(media,item){
+    media.onerror=()=>{
+      if(disposed||current!==media||!prefs.enabled||playbackRecoveryTimer)return;
+      if(videoRetries>=2){showPreview(item,{expectedMedia:media}).catch(()=>notice('The video and its still preview could not be loaded.'));return;}
+      videoRetries++;
+      playbackRecoveryTimer=setTimeout(()=>{
+        playbackRecoveryTimer=0;if(disposed||current!==media||!prefs.enabled)return;
+        media.load();appearance();
+      },250*videoRetries);
+      notice('Reloading wallpaper video…');
+    };
+  }
   async function select(id,{persist=true}={}){
     const item=items.get(id);if(!item)throw Error('Wallpaper unavailable');if(current?.src===item.url){appearance();return true;}const ticket=++seq;
     const media=document.createElement(item.kind==='video'?'video':'img');media.id='cw-media';media.setAttribute('aria-hidden','true');
-    if(item.kind==='video'){media.muted=true;media.defaultMuted=true;media.loop=true;media.playsInline=true;media.preload='auto';}
+    if(item.kind==='video'){media.muted=true;media.defaultMuted=true;media.loop=true;media.playsInline=true;media.preload='auto';media.poster=item.thumbnail;}
     try{
-      await new Promise((resolve,reject)=>{const finish=error=>{clearTimeout(timer);media.onload=media.onloadeddata=media.onerror=null;error?reject(error):resolve();};const timer=setTimeout(()=>finish(Error('Loading timed out')),10000);media.onload=media.onloadeddata=()=>finish();media.onerror=()=>finish(Error('Unsupported format'));media.src=item.url;});
+      await loadMedia(media,item.url);
       if(ticket!==seq||disposed){media.removeAttribute('src');media.load?.();return false;}
       if((media.videoWidth||media.naturalWidth)!==item.width||(media.videoHeight||media.naturalHeight)!==item.height)throw Error('The resolution does not match the imported file');
-      const old=current;current=media;document.body.prepend(media);prefs.selected=id;appearance();old?.pause?.();old?.remove();old?.removeAttribute('src');old?.load?.();
-      if(persist)save();updateDetails();
+      videoRetries=0;if(item.kind==='video')watchVideo(media,item);
+      activateMedia(media,item,{persist});
       const ratio=prefs.fit==='cover'?Math.max(innerWidth*devicePixelRatio/item.width,innerHeight*devicePixelRatio/item.height):Math.min(innerWidth*devicePixelRatio/item.width,innerHeight*devicePixelRatio/item.height);
       notice(`${item.title} applied.${ratio>1.05?' Upscaled on this display; it may look less sharp.':''}`);return true;
-    }catch(e){media.removeAttribute('src');media.load?.();if(ticket===seq)notice(e.message+'. Your previous wallpaper is unchanged.');throw e;}
+    }catch(e){
+      media.onerror=null;media.removeAttribute('src');media.load?.();
+      if(item.kind==='video'&&ticket===seq&&!disposed){try{return await showPreview(item,{persist,ticket});}catch{}}
+      if(ticket===seq)notice('Could not load wallpaper: '+e.message);throw e;
+    }
   }
   function register(meta,base64){
     if(items.has(meta.id))return;
@@ -237,7 +274,7 @@
   });observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-labelledby','aria-controls','aria-expanded','aria-label','aria-hidden','data-state','disabled','data-testid']});insertMenu();
   const visibility=()=>appearance();document.addEventListener('visibilitychange',visibility);reduced.addEventListener('change',visibility);
   const storage=e=>{if(e.key!==KEY)return;const next=readPrefs(),previous=prefs;prefs=next;if(items.has(next.selected)&&current?.src!==items.get(next.selected).url)select(next.selected,{persist:false}).catch(()=>{if(prefs===next){prefs=previous;appearance();updateDetails();}});else{appearance();updateDetails();}};window.addEventListener('storage',storage);
-  function dispose(){disposed=true;seq++;window.__CW_USAGE__?.dispose();observer.disconnect();clearTimeout(menuRefreshTimer);clearTimeout(metalSendRefreshTimer);menuRefreshTimer=0;metalSendRefreshTimer=0;disposeMetalSend();for(const [menu,handler] of menuHandlers)menu.removeEventListener('keydown',handler,true);menuHandlers.clear();document.removeEventListener('visibilitychange',visibility);reduced.removeEventListener('change',visibility);window.removeEventListener('storage',storage);current?.pause?.();current?.remove();host.remove();surface.remove();document.documentElement.classList.remove('cw-active');document.querySelectorAll('[data-cw-menu]').forEach(e=>e.remove());for(const url of urls)URL.revokeObjectURL(url);items.clear();chunks.clear();delete window.__CODEX_WALLPAPERS_PUBLIC__;}
-  const api={version:options.version,append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),metalSend:!!metalSendTarget,settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}syncMetalSend();return api.status();}};
+  function dispose(){disposed=true;seq++;window.__CW_USAGE__?.dispose();observer.disconnect();clearTimeout(menuRefreshTimer);clearTimeout(metalSendRefreshTimer);clearTimeout(playbackRecoveryTimer);menuRefreshTimer=0;metalSendRefreshTimer=0;playbackRecoveryTimer=0;disposeMetalSend();for(const [menu,handler] of menuHandlers)menu.removeEventListener('keydown',handler,true);menuHandlers.clear();document.removeEventListener('visibilitychange',visibility);reduced.removeEventListener('change',visibility);window.removeEventListener('storage',storage);if(current)current.onerror=null;current?.pause?.();current?.remove();host.remove();surface.remove();document.documentElement.classList.remove('cw-active');document.querySelectorAll('[data-cw-menu]').forEach(e=>e.remove());for(const url of urls)URL.revokeObjectURL(url);items.clear();chunks.clear();delete window.__CODEX_WALLPAPERS_PUBLIC__;}
+  const api={version:options.version,append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,mediaError:current?.error?.code??null,videoFallback,videoRecoveries:videoRetries,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),metalSend:!!metalSendTarget,settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}syncMetalSend();return api.status();}};
   window.__CODEX_WALLPAPERS_PUBLIC__=api;renderControls();return 'installed';
 })

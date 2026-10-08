@@ -73,7 +73,7 @@ class DelayedShellContents extends FakeContents {
   }
 }
 
-function runWallpaperRuntime(markup, shellMarkup = '<main data-app-shell-main-surface></main>') {
+function runWallpaperRuntime(markup, shellMarkup = '<main data-app-shell-main-surface></main>', { simulateMedia = false, failVideo = false } = {}) {
   const window = domino.createWindow(`<!doctype html><html><head></head><body>${shellMarkup}${markup}</body></html>`);
   const { document } = window;
   const elementPrototype = window.Element.prototype;
@@ -111,6 +111,31 @@ function runWallpaperRuntime(markup, shellMarkup = '<main data-app-shell-main-su
       value: Array.prototype[Symbol.iterator],
     });
   }
+  if (simulateMedia) {
+    const createElement = document.createElement.bind(document);
+    document.createElement = name => {
+      const element = createElement(name);
+      if (!["video", "img"].includes(name)) return element;
+      for (const [key, value] of Object.entries({ videoWidth: 2, videoHeight: 2, naturalWidth: 2, naturalHeight: 2, error: null, paused: true, reloads: 0 })) {
+        Object.defineProperty(element, key, { configurable: true, writable: true, value });
+      }
+      Object.defineProperty(element, "src", {
+        configurable: true,
+        get() { return element.getAttribute("src") || ""; },
+        set(value) {
+          element.setAttribute("src", value);
+          queueMicrotask(() => {
+            if (name === "video" && failVideo) element.onerror?.();
+            else (name === "video" ? element.onloadeddata : element.onload)?.();
+          });
+        },
+      });
+      element.pause = () => { element.paused = true; };
+      element.play = async () => { element.paused = false; };
+      element.load = () => { if (element.src) element.reloads += 1; element.error = null; };
+      return element;
+    };
+  }
 
   const storage = new Map();
   const localStorage = {
@@ -132,12 +157,107 @@ function runWallpaperRuntime(markup, shellMarkup = '<main data-app-shell-main-su
     "requestAnimationFrame",
     "cancelAnimationFrame",
     "options",
+    "innerWidth",
+    "innerHeight",
+    "devicePixelRatio",
     `${runtime}\n(options);`,
   );
-  const reload = version => execute(window, document, localStorage, () => mediaQuery, MutationObserver, () => 1, () => {}, { appearanceCSS: "", modalCSS: "", version });
+  const reload = version => execute(window, document, localStorage, () => mediaQuery, MutationObserver, () => 1, () => {}, { appearanceCSS: "", modalCSS: "", version }, 1920, 1080, 1);
   reload("fixture-current");
   return { window, document, reload };
 }
+
+async function selectFixtureVideo(window) {
+  const api = window.__CODEX_WALLPAPERS_PUBLIC__;
+  const bytes = Buffer.from("fixture video");
+  const id = "a".repeat(24);
+  api.append(id, bytes.toString("base64"));
+  api.register({ id, title: "Fixture", kind: "video", mime: "video/mp4", size: bytes.length, width: 2, height: 2 }, Buffer.from("preview").toString("base64"));
+  await api.select(id);
+  return api;
+}
+
+test("a late video decoder failure reloads the selected wallpaper", async () => {
+  const { window, document } = runWallpaperRuntime("", undefined, { simulateMedia: true });
+  const api = await selectFixtureVideo(window);
+  const video = document.getElementById("cw-media");
+  const before = api.status().settings;
+  try {
+    assert.ok(video.poster);
+    video.error = { code: 3 };
+    video.onerror();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(video.reloads, 1);
+    assert.equal(video.error, null);
+    assert.equal(api.status().videoRecoveries, 1);
+    assert.equal(api.status().videoFallback, false);
+    assert.deepEqual(api.status().settings, before);
+    assert.equal(document.getElementById("cw-media"), video);
+  } finally { api.dispose(); }
+});
+
+test("repeated video failures show the selected wallpaper preview after bounded retries", async () => {
+  const { window, document } = runWallpaperRuntime("", undefined, { simulateMedia: true });
+  const api = await selectFixtureVideo(window);
+  const video = document.getElementById("cw-media");
+  try {
+    video.error = { code: 3 }; video.onerror();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    video.error = { code: 3 }; video.onerror();
+    await new Promise(resolve => setTimeout(resolve, 550));
+    video.error = { code: 3 }; video.onerror();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(video.reloads, 2);
+    assert.equal(document.getElementById("cw-media").tagName, "IMG");
+    assert.equal(api.status().videoFallback, true);
+    assert.equal(api.status().selected, "a".repeat(24));
+    assert.equal(document.documentElement.classList.contains("cw-active"), true);
+    assert.match(document.getElementById("status").textContent, /still preview/);
+    await api.select("a".repeat(24));
+    assert.equal(api.status().videoFallback, false);
+    assert.equal(document.getElementById("cw-media").tagName, "VIDEO");
+  } finally { api.dispose(); }
+});
+
+test("disposing cancels pending video recovery", async () => {
+  const { window, document } = runWallpaperRuntime("", undefined, { simulateMedia: true });
+  const api = await selectFixtureVideo(window);
+  const video = document.getElementById("cw-media");
+  video.error = { code: 3 }; video.onerror();
+  api.dispose();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(video.reloads, 0);
+  assert.equal(document.getElementById("cw-media"), null);
+  assert.equal(window.__CODEX_WALLPAPERS_PUBLIC__, undefined);
+});
+
+test("changing the selected wallpaper cancels the previous video's recovery", async () => {
+  const { window, document } = runWallpaperRuntime("", undefined, { simulateMedia: true });
+  const api = await selectFixtureVideo(window);
+  const video = document.getElementById("cw-media");
+  try {
+    video.error = { code: 3 }; video.onerror();
+    const id = "b".repeat(24);
+    api.append(id, Buffer.from("image").toString("base64"));
+    api.register({ id, title: "Image", kind: "image", mime: "image/png", size: 5, width: 2, height: 2 }, Buffer.from("preview").toString("base64"));
+    await api.select(id);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(video.reloads, 0);
+    assert.equal(api.status().selected, id);
+    assert.equal(document.getElementById("cw-media").tagName, "IMG");
+  } finally { api.dispose(); }
+});
+
+test("an initial video decode failure also keeps the wallpaper visible through its preview", async () => {
+  const { window, document } = runWallpaperRuntime("", undefined, { simulateMedia: true, failVideo: true });
+  const api = await selectFixtureVideo(window);
+  try {
+    assert.equal(api.status().videoFallback, true);
+    assert.equal(api.status().selected, "a".repeat(24));
+    assert.equal(document.getElementById("cw-media").tagName, "IMG");
+    assert.equal(document.documentElement.classList.contains("cw-active"), true);
+  } finally { api.dispose(); }
+});
 
 function fixtureLibrary(root) {
   const media = Buffer.from("a small wallpaper");

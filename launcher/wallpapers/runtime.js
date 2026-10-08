@@ -1,9 +1,11 @@
 // Executed once per Codex window. Wallpaper rendering has no network or filesystem access.
 (options => {
-  if(window.__CODEX_WALLPAPERS_PUBLIC__)return 'present';
+  const existing=window.__CODEX_WALLPAPERS_PUBLIC__;
+  if(existing&&existing.version===options.version)return 'present';
   const shell=document.querySelector('main[data-app-shell-main-surface]')||document.querySelector('main#main')?.querySelector('form[data-type="unified-composer"], #prompt-textarea');
   if(!shell)throw Error('Unsupported Codex shell');
   if(window.__CODEX_DREAM_SKIN_STATE__)throw Error('Another wallpaper mod is active; preserve it and stop.');
+  existing?.dispose();
   const KEY='codex-wallpapers.preferences.v1';
   const defaults={selected:null,enabled:true,fit:'cover',brightness:32,sidebarOpacity:97,composerOpacity:98,cardOpacity:62,sidebarRadius:14,composerRadius:18,settingsRadius:18,paletteMode:'auto',accent:'#cbd5e1',surface:'#121316',sidebar:'#111318',motion:'system'};
   function sanitize(input={}){
@@ -236,6 +238,6 @@
   const visibility=()=>appearance();document.addEventListener('visibilitychange',visibility);reduced.addEventListener('change',visibility);
   const storage=e=>{if(e.key!==KEY)return;const next=readPrefs(),previous=prefs;prefs=next;if(items.has(next.selected)&&current?.src!==items.get(next.selected).url)select(next.selected,{persist:false}).catch(()=>{if(prefs===next){prefs=previous;appearance();updateDetails();}});else{appearance();updateDetails();}};window.addEventListener('storage',storage);
   function dispose(){disposed=true;seq++;window.__CW_USAGE__?.dispose();observer.disconnect();clearTimeout(menuRefreshTimer);clearTimeout(metalSendRefreshTimer);menuRefreshTimer=0;metalSendRefreshTimer=0;disposeMetalSend();for(const [menu,handler] of menuHandlers)menu.removeEventListener('keydown',handler,true);menuHandlers.clear();document.removeEventListener('visibilitychange',visibility);reduced.removeEventListener('change',visibility);window.removeEventListener('storage',storage);current?.pause?.();current?.remove();host.remove();surface.remove();document.documentElement.classList.remove('cw-active');document.querySelectorAll('[data-cw-menu]').forEach(e=>e.remove());for(const url of urls)URL.revokeObjectURL(url);items.clear();chunks.clear();delete window.__CODEX_WALLPAPERS_PUBLIC__;}
-  const api={append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),metalSend:!!metalSendTarget,settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}syncMetalSend();return api.status();}};
+  const api={version:options.version,append,register,select,setEnabled,open,close,dispose,ids:()=>[...items.keys()],status:()=>({count:items.size,selected:prefs.selected,enabled:prefs.enabled,media:!!current,profileMenu:!!profileMenu(),profileButton:!!document.querySelector('[data-cw-menu]'),metalSend:!!metalSendTarget,settings:{...prefs}}),async ready(){renderControls();updateFilter();if(items.has(prefs.selected))await select(prefs.selected);else{notice(items.size?'Choose your first wallpaper.':'Your library is empty. Add your first wallpaper with your agent.');}syncMetalSend();return api.status();}};
   window.__CODEX_WALLPAPERS_PUBLIC__=api;renderControls();return 'installed';
 })

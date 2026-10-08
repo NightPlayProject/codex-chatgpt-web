@@ -497,6 +497,7 @@ function makeController({
   calls = { install: 0, dispose: 0 },
   events = [],
   processes = [],
+  resolveIdentity = async () => identity,
   listProcesses = async () => processes,
   storedEndpoint = false,
   discoverTargets = async () => [],
@@ -516,7 +517,7 @@ function makeController({
     dataRoot: root,
     logger: log,
     wallpaperManager: makeManager(calls),
-    resolveIdentity: async () => identity,
+    resolveIdentity,
     listProcesses,
     validateEndpoint,
     launchApp,
@@ -1078,6 +1079,96 @@ test("closing Codex stays closed until the user opens a new process", async () =
     processes.push({ ProcessId: 5678, ExecutablePath: identity.Executable });
     await waitForController(() => events.at(-1)?.status === "ready");
     assert.equal(launched, 1);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an app update refreshes the package identity but leaves the updated app closed", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-updated-"));
+  const updatedIdentity = { ...identity, Version: "26.1002.7124.0", Executable: "C:\\OfficialCodexUpdated\\ChatGPT.exe" };
+  let currentIdentity = identity;
+  let open = true;
+  let updatedClosedChecks = 0;
+  const launches = [];
+  const events = [];
+  const controller = makeController({
+    root, events,
+    resolveIdentity: async () => currentIdentity,
+    listProcesses: async next => {
+      if (next === updatedIdentity && !open) updatedClosedChecks += 1;
+      return open ? [{ ProcessId: next === identity ? 1234 : 5678, ExecutablePath: next.Executable }] : [];
+    },
+    launchApp: async (next, _port, options) => { launches.push({ identity: next, options }); },
+    waitForEndpoint: async (next, port) => ({ ...validEndpoint(port), version: next.Version }),
+  });
+  try {
+    await controller.setEnabled(true);
+    currentIdentity = updatedIdentity;
+    open = false;
+    await waitForController(() => updatedClosedChecks >= 3);
+    assert.equal(launches.length, 0);
+    open = true;
+    await waitForController(() => events.at(-1)?.status === "ready");
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].identity, updatedIdentity);
+    assert.equal(launches[0].options.onlyIfRunning, true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, "endpoint.json"))).version, updatedIdentity.Version);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("endpoint recovery attaches to an updated app without activating it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-updated-endpoint-"));
+  const updatedIdentity = { ...identity, Version: "26.1002.7124.0", Executable: "C:\\OfficialCodexUpdated\\ChatGPT.exe" };
+  let currentIdentity = identity;
+  let launched = 0;
+  let attachedUpdated = false;
+  const events = [];
+  const controller = makeController({
+    root, events, storedEndpoint: true, refreshIntervalMs: 5,
+    resolveIdentity: async () => currentIdentity,
+    validateEndpoint: async (record, next) => record.version === next.Version && next.Version === currentIdentity.Version,
+    listProcesses: async next => next === currentIdentity ? [{ ProcessId: 5678 }] : [],
+    discoverTargets: async record => {
+      if (record.version !== currentIdentity.Version) throw new Error("Previous package exited");
+      if (currentIdentity === updatedIdentity) attachedUpdated = true;
+      return [makeTarget()];
+    },
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    await controller.setEnabled(true);
+    currentIdentity = updatedIdentity;
+    fs.writeFileSync(path.join(root, "endpoint.json"), JSON.stringify({ ...validEndpoint(), version: updatedIdentity.Version }));
+    await waitForController(() => attachedUpdated && events.at(-1)?.status === "ready");
+    assert.equal(launched, 0);
+  } finally {
+    controller.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("disabling cancels an in-flight package identity refresh", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-official-wallpapers-cancel-identity-"));
+  let resolutionCount = 0;
+  let finishIdentity;
+  let launched = 0;
+  const controller = makeController({
+    root, processes: [{ ProcessId: 1234 }],
+    resolveIdentity: async () => ++resolutionCount === 1 ? identity : new Promise(resolve => { finishIdentity = resolve; }),
+    launchApp: async () => { launched += 1; },
+  });
+  try {
+    await controller.setEnabled(true);
+    await waitForController(() => typeof finishIdentity === "function");
+    await controller.setEnabled(false);
+    finishIdentity({ ...identity, Version: "26.1002.7124.0" });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(launched, 0);
   } finally {
     controller.destroy();
     fs.rmSync(root, { recursive: true, force: true });

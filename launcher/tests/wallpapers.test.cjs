@@ -32,6 +32,7 @@ class FakeContents {
   async executeJavaScript(script) {
     this.calls.push(script);
     if (script.includes("// Executed once per Codex window")) {
+      if (this.installed) return "present";
       this.installed = true;
       return "installed";
     }
@@ -130,10 +131,12 @@ function runWallpaperRuntime(markup, shellMarkup = '<main data-app-shell-main-su
     "MutationObserver",
     "requestAnimationFrame",
     "cancelAnimationFrame",
-    `${runtime}\n({ appearanceCSS: "", modalCSS: "" });`,
+    "options",
+    `${runtime}\n(options);`,
   );
-  execute(window, document, localStorage, () => mediaQuery, MutationObserver, () => 1, () => {});
-  return { window, document };
+  const reload = version => execute(window, document, localStorage, () => mediaQuery, MutationObserver, () => 1, () => {}, { appearanceCSS: "", modalCSS: "", version });
+  reload("fixture-current");
+  return { window, document, reload };
 }
 
 function fixtureLibrary(root) {
@@ -222,6 +225,22 @@ test("Codex Wallpapers runtime accepts the current ChatGPT shell shape", () => {
     '<main id="main"><form data-type="unified-composer"><div id="prompt-textarea"></div></form></main>',
   );
   assert.ok(window.__CODEX_WALLPAPERS_PUBLIC__, "expected the runtime to initialize on the current ChatGPT shell");
+});
+
+test("a new Wallpapers runtime replaces old assets while preserving saved appearance preferences", () => {
+  const { window, document, reload } = runWallpaperRuntime("");
+  const previous = window.__CODEX_WALLPAPERS_PUBLIC__;
+  previous.setEnabled(false);
+  previous.version = undefined;
+  reload("fixture-updated");
+  const updated = window.__CODEX_WALLPAPERS_PUBLIC__;
+  assert.notEqual(updated, previous);
+  assert.equal(updated.version, "fixture-updated");
+  assert.equal(updated.status().enabled, false);
+  assert.equal(document.querySelectorAll("#cw-picker").length, 1);
+  reload("fixture-updated");
+  assert.equal(window.__CODEX_WALLPAPERS_PUBLIC__, updated);
+  assert.equal(document.querySelectorAll("#cw-surfaces").length, 1);
 });
 
 test("Codex Wallpapers ships the Metal send-button renderer before the page runtime", async () => {

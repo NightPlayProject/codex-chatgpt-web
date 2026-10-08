@@ -117,7 +117,8 @@ async function loadWallpaperRuntime(assetsRoot) {
   // Both bundles are executed only inside the official Codex renderer. The Metal bundle contains
   // its React/WebGL renderer and exposes one narrow page-side mount API; runtime.js remains the
   // owner of target discovery, lifecycle, and the Wallpapers on/off state.
-  return `${metalSendBundle.trim()}\n${runtime.trim()}\n(${JSON.stringify({ appearanceCSS, modalCSS })});`;
+  const version = crypto.createHash("sha256").update(JSON.stringify([runtime, appearanceCSS, modalCSS, metalSendBundle])).digest("hex");
+  return `${metalSendBundle.trim()}\n${runtime.trim()}\n(${JSON.stringify({ appearanceCSS, modalCSS, version })});`;
 }
 
 function wallpaperError(message, code) {
@@ -179,13 +180,9 @@ function createWallpaperManager({ assetsRoot = path.resolve(__dirname, "..", "wa
       );
     }
 
-    let present = Boolean(await execute(contents, "Boolean(window.__CODEX_WALLPAPERS_PUBLIC__)"));
-    let injected = false;
-    if (!present) {
-      await execute(contents, await runtime());
-      injected = true;
-      present = Boolean(await execute(contents, "Boolean(window.__CODEX_WALLPAPERS_PUBLIC__)"));
-    }
+    const installed = await execute(contents, await runtime());
+    const injected = installed === "installed";
+    const present = Boolean(await execute(contents, "Boolean(window.__CODEX_WALLPAPERS_PUBLIC__)"));
     if (!present) throw wallpaperError("Codex Wallpapers did not initialize in the official Codex surface", "wallpaper_runtime_failed");
 
     const loadedIds = new Set(await execute(contents, "window.__CODEX_WALLPAPERS_PUBLIC__.ids()"));

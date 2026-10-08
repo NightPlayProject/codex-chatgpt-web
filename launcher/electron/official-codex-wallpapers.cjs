@@ -1514,6 +1514,7 @@ function createOfficialCodexWallpaperController({
   function beginRestartWait(nextIdentity, baselineProcesses = null) {
     identity = nextIdentity;
     if (!integrationActive() || restartTimer) return;
+    let waitingIdentity = nextIdentity;
     restartBaseline = baselineProcesses === null ? null : processIdentitySet(baselineProcesses);
     const generation = ++restartGeneration;
     const waiting = () => integrationActive() && restartTimer !== null && restartGeneration === generation;
@@ -1522,13 +1523,22 @@ function createOfficialCodexWallpaperController({
       if (!waiting() || checking) return;
       checking = true;
       try {
-        const stored = await attachStoredEndpoint(nextIdentity);
+        const currentIdentity = await resolveIdentity();
+        if (!waiting()) return;
+        if (currentIdentity.Version !== waitingIdentity.Version
+          || currentIdentity.Executable !== waitingIdentity.Executable
+          || currentIdentity.AppId !== waitingIdentity.AppId) {
+          waitingIdentity = currentIdentity;
+          identity = currentIdentity;
+          restartBaseline = new Set();
+        }
+        const stored = await attachStoredEndpoint(waitingIdentity);
         if (!waiting()) return;
         if (stored) {
-          await startRefresh(nextIdentity, stored);
+          await startRefresh(waitingIdentity, stored);
           return;
         }
-        const processes = await listProcesses(nextIdentity);
+        const processes = await listProcesses(waitingIdentity);
         if (!waiting()) return;
         const currentProcesses = processIdentitySet(processes);
         // Closing Codex is a user decision, not a restart request. Keep observing
@@ -1545,9 +1555,9 @@ function createOfficialCodexWallpaperController({
           && [...restartBaseline].some(processId => currentProcesses.has(processId));
         const restartWasObserved = restartBaseline.size === 0 || !baselineStillRunning;
         if (!restartWasObserved) return;
-        const result = await launchAndAttach(nextIdentity, { shouldContinue: waiting, onlyIfRunning: true });
+        const result = await launchAndAttach(waitingIdentity, { shouldContinue: waiting, onlyIfRunning: true });
         if (waiting() && result.restartRequired) {
-          const nextProcesses = await listProcesses(nextIdentity).catch(() => []);
+          const nextProcesses = await listProcesses(waitingIdentity).catch(() => []);
           if (waiting()) restartBaseline = processIdentitySet(nextProcesses);
         }
       } catch (error) {
@@ -1564,7 +1574,7 @@ function createOfficialCodexWallpaperController({
 
   async function prepareExternalRestart() {
     if (!integrationActive()) return null;
-    const nextIdentity = identity || await resolveIdentity();
+    const nextIdentity = await resolveIdentity();
     stopRestartWait();
     stopRefresh();
     identity = nextIdentity;
@@ -1574,13 +1584,13 @@ function createOfficialCodexWallpaperController({
 
   async function resumeExternalRestart() {
     if (!integrationActive()) return null;
-    const nextIdentity = identity || await resolveIdentity();
+    const nextIdentity = await resolveIdentity();
     return launchAndAttach(nextIdentity);
   }
 
   async function abortExternalRestart() {
     if (!integrationActive()) return null;
-    const nextIdentity = identity || await resolveIdentity();
+    const nextIdentity = await resolveIdentity();
     const stored = await attachStoredEndpoint(nextIdentity);
     if (stored) {
       return startRefresh(nextIdentity, stored);

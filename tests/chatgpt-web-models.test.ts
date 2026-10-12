@@ -207,6 +207,25 @@ describe("fixed ChatGPT Web model routes", () => {
     });
   });
 
+  test("GPT-6 Plus expands retained context without enlarging one message or unlocking unavailable efforts", () => {
+    const enabled = { ...plus, experimentalBiggerContext: true };
+    for (const effort of ["medium", "high"] as const) {
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus, "6"))
+        .toMatchObject({ contextWindow: 90_000, autoCompactTokenLimit: 80_000 });
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled, "6"))
+        .toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
+      expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled))
+        .toEqual(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus));
+    }
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", enabled, "6"))
+      .toEqual(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus, "6"));
+    expect(() => resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", enabled, "6"))
+      .toThrow("unavailable effort");
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", {
+      ...enabled, extraHighAvailable: true,
+    }, "6")).toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
+  });
+
   test("publishes Luna's real model window without early native compaction", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
       solAvailable: false,
@@ -232,9 +251,9 @@ describe("fixed ChatGPT Web model routes", () => {
       extraHighAvailable: false, proAvailable: false,
       experimentalBiggerContext: true,
     })).toEqual({
-      contextWindow: 1_050_000,
-      effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 1_050_000,
+      contextWindow: 84_000,
+      effectiveContextWindowPercent: 71,
+      autoCompactTokenLimit: 59_424,
     });
   });
 

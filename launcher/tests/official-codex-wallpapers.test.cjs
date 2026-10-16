@@ -1462,3 +1462,103 @@ test("official wallpaper integration is unavailable outside Windows", async () =
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+const { providerSptQuotaBreakpointSite, shouldRefreshWebQuotaComposer } = require("../electron/official-codex-wallpapers.cjs");
+const storeSptSource = 'function Spt(){let zt={settings:{model:"chatgpt-web/test"}},vn=X(bt===`local`&&ZP),abc=zt.settings.model;let Zn=De||gn||St||rt&&it||yt||Ot||nn&&Ht||on?.isLoading===!0||wt||vn;return Zn}';
+
+test("Store 26.1013 Spt matcher requires a unique gate, native quota, and model source", () => {
+  const site = providerSptQuotaBreakpointSite(storeSptSource);
+  assert.equal(site.found, true);
+  assert.equal(site.strategy, "spt-native-quota");
+  assert.equal(site.modelVariable, "zt.settings.model");
+  assert.equal(site.quotaVariable, "vn");
+  assert.equal(site.candidate.lineNumber, 0);
+  assert.ok(site.candidate.columnNumber > storeSptSource.indexOf("let Zn="));
+  assert.equal(providerSptQuotaBreakpointSite(storeSptSource + storeSptSource).reason, "spt-composer-ambiguous");
+  assert.equal(providerSptQuotaBreakpointSite(storeSptSource.replace("||wt||vn", "||wt||other")).found, false);
+  assert.equal(providerSptQuotaBreakpointSite(storeSptSource.replace("zt.settings.model", "somethingElse")).found, false);
+  assert.equal(providerSptQuotaBreakpointSite(storeSptSource.replace("vn=X(bt===`local`&&ZP)", "vn=false")).found, false);
+});
+
+test("Store Spt installer uses a single Web-only conditional breakpoint", async () => {
+  const site = providerSptQuotaBreakpointSite(storeSptSource);
+  const installed = [];
+  const calls = [];
+  class StoreSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      calls.push(message.method);
+      const reply = result => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ id: message.id, result }),
+      }));
+      const emit = (method, params) => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ method, params }),
+      }));
+      if (message.method === "Debugger.disable") return reply({});
+      if (message.method === "Debugger.enable") {
+        emit("Debugger.scriptParsed", { scriptId: "spt_1", url: "app://-/assets/app-primary-2525363b0384.js" });
+        return reply({});
+      }
+      if (message.method === "Debugger.getScriptSource") return reply({ scriptSource: storeSptSource });
+      if (message.method === "Debugger.getPossibleBreakpoints") return reply({ locations: [
+        { scriptId: "spt_1", ...site.candidate },
+      ] });
+      if (message.method === "Runtime.evaluate") return reply({ result: { value: false } });
+      if (message.method === "Debugger.setBreakpointByUrl") {
+        installed.push(message.params);
+        return reply({ breakpointId: "store_spt_1" });
+      }
+      throw new Error("unexpected CDP method " + message.method);
+    }
+  }
+  const contents = new CdpContents("ws://127.0.0.1:9333/devtools/page/test", StoreSocket);
+  try {
+    const result = await installProviderAwareComposerQuotaPatch(contents);
+    assert.equal(result.applied, true);
+    assert.equal(result.strategy, "spt-native-quota");
+    assert.deepEqual(result.breakpointIds, ["store_spt_1"]);
+    assert.equal(installed.length, 1);
+    assert.ok(calls.includes("Debugger.getPossibleBreakpoints"));
+    assert.equal(calls.includes("Debugger.setScriptSource"), false);
+    for (const webSelected of [false, true]) {
+      for (const nativeBlocked of [false, true]) {
+        for (const modelSlug of ["chatgpt-web/gpt-6", "gpt-6.1-sol"]) {
+          const context = {
+            zt: { settings: { model: modelSlug } },
+            vn: true,
+            __codexWebGptWebProviderSelected: webSelected,
+            __codexWebGptNativeQuotaBlocked: nativeBlocked,
+          };
+          assert.equal(vm.runInNewContext(installed[0].condition, context), false);
+          assert.equal(context.vn, !(webSelected && nativeBlocked && modelSlug.startsWith("chatgpt-web/")));
+        }
+      }
+    }
+  } finally {
+    contents.close();
+  }
+});
+
+test("Store Spt refresh only applies to a safe blocked Web send outside cooldown", () => {
+  const safe = {
+    patchStrategy: "spt-native-quota",
+    nativeQuotaBlocked: true,
+    selection: { webSelected: true },
+    probe: { chatGptWebSelected: true, hasSendableContent: true, hasAttachments: false, rateLimitBlocked: true },
+    now: 10000,
+    lastAttempt: 5000,
+  };
+  assert.equal(shouldRefreshWebQuotaComposer(safe), true);
+  for (const override of [
+    { patchStrategy: "legacy" },
+    { nativeQuotaBlocked: false },
+    { selection: { webSelected: false } },
+    { probe: { ...safe.probe, chatGptWebSelected: false } },
+    { probe: { ...safe.probe, hasSendableContent: false } },
+    { probe: { ...safe.probe, hasAttachments: true } },
+    { probe: { ...safe.probe, rateLimitBlocked: false } },
+    { lastAttempt: 8000 },
+  ]) {
+    assert.equal(shouldRefreshWebQuotaComposer({ ...safe, ...override }), false);
+  }
+});

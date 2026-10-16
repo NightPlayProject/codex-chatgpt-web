@@ -11,6 +11,7 @@ const RESTART_POLL_INTERVAL_MS = 2_000;
 const RATE_LIMIT_STALE_CONFIRM_MS = 1_500;
 const RATE_LIMIT_USAGE_RECHECK_MS = 30_000;
 const RATE_LIMIT_RECOVERY_COOLDOWN_MS = 60_000;
+const PROVIDER_COMPOSER_RERENDER_COOLDOWN_MS = 4_000;
 const ENDPOINT_CONNECT_TIMEOUT_MS = 40_000;
 const ENDPOINT_POLL_INTERVAL_MS = 400;
 const POWERSHELL_TIMEOUT_MS = 12_000;
@@ -30,6 +31,47 @@ const ACTIVE_COMPOSER_START_NEEDLE = "function q3t(e){";
 const ACTIVE_COMPOSER_QUOTA_NEEDLE = "rn=X(dA)&&gt===`local`";
 const ACTIVE_COMPOSER_SEND_NEEDLE = "let Nn=Ee||Qe&&$e||mt||St||Yt?.isLoading===!0||vt||rn,Pn;";
 const ACTIVE_COMPOSER_SUBMIT_NEEDLE = "submitDisabled:Nn";
+const SPT_COMPOSER_QUOTA_NEEDLE = "vn=X(bt===`local`&&ZP)";
+const SPT_COMPOSER_GATE_NEEDLE = "let Zn=De||gn||St||rt&&it||yt||Ot||nn&&Ht||on?.isLoading===!0||wt||vn";
+
+function providerSptQuotaBreakpointSite(source) {
+  const text = String(source ?? "");
+  const gateIndex = text.indexOf(SPT_COMPOSER_GATE_NEEDLE);
+  if (gateIndex < 0) return { found: false, reason: "spt-composer-missing" };
+  if (text.indexOf(SPT_COMPOSER_GATE_NEEDLE, gateIndex + SPT_COMPOSER_GATE_NEEDLE.length) >= 0) {
+    return { found: false, reason: "spt-composer-ambiguous" };
+  }
+  const quotaIndex = text.lastIndexOf(SPT_COMPOSER_QUOTA_NEEDLE, gateIndex);
+  if (quotaIndex < 0 || gateIndex - quotaIndex > 10_000
+    || !text.slice(Math.max(0, quotaIndex - 2_000), gateIndex).includes("zt.settings.model")) {
+    return { found: false, reason: "spt-native-quota-layout-changed" };
+  }
+  const candidateIndex = gateIndex + "let Zn=".length;
+  return {
+    found: true,
+    reason: null,
+    strategy: "spt-native-quota",
+    quotaVariable: "vn",
+    modelVariable: "zt.settings.model",
+    candidate: sourceLocationForIndex(text, candidateIndex),
+    start: sourceLocationForIndex(text, gateIndex - 180),
+    submit: sourceLocationForIndex(text, gateIndex + SPT_COMPOSER_GATE_NEEDLE.length + 110),
+  };
+}
+
+function providerSptQuotaBreakpointCondition(site) {
+  const model = site.modelVariable;
+  const quota = site.quotaVariable;
+  return `(globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true&&typeof ${model}==="string"&&${model}.startsWith("chatgpt-web/")&&${quota}===true&&(${quota}=false),false)`;
+}
+
+function shouldRefreshWebQuotaComposer({ patchStrategy, nativeQuotaBlocked, selection, probe, now, lastAttempt }) {
+  return patchStrategy === "spt-native-quota" && nativeQuotaBlocked === true
+    && selection?.webSelected === true && probe?.chatGptWebSelected === true
+    && probe.hasSendableContent === true && probe.hasAttachments !== true
+    && probe.rateLimitBlocked === true
+    && now - lastAttempt >= PROVIDER_COMPOSER_RERENDER_COOLDOWN_MS;
+}
 
 function providerQuotaBreakpointCondition(quotaVariable) {
   return `((globalThis.${PROVIDER_QUOTA_STATE_KEY}===true&&globalThis.${PROVIDER_SELECTED_STATE_KEY}===true)||globalThis.${PROVIDER_QUOTA_RECOVERY_KEY}===true)&&(${quotaVariable}=false)`;
@@ -1023,6 +1065,51 @@ async function installProviderAwareComposerQuotaPatch(contents) {
   const script = primaryScripts[0];
   const sourceResult = await contents.sendCommand("Debugger.getScriptSource", { scriptId: script.scriptId });
   const source = String(sourceResult?.scriptSource ?? "");
+  const sptSite = providerSptQuotaBreakpointSite(source);
+  if (sptSite.found) {
+    const possible = await contents.sendCommand("Debugger.getPossibleBreakpoints", {
+      start: { scriptId: script.scriptId, ...sptSite.start },
+      end: { scriptId: script.scriptId, ...sptSite.submit },
+      restrictToFunction: false,
+    });
+    const location = (possible?.locations ?? []).find(candidate => (
+      Number.isInteger(candidate?.lineNumber) && Number.isInteger(candidate?.columnNumber)
+      && (candidate.lineNumber > sptSite.candidate.lineNumber
+        || candidate.lineNumber === sptSite.candidate.lineNumber
+        && candidate.columnNumber >= sptSite.candidate.columnNumber)
+      && (candidate.lineNumber < sptSite.submit.lineNumber
+        || candidate.lineNumber === sptSite.submit.lineNumber
+        && candidate.columnNumber < sptSite.submit.columnNumber)
+    ));
+    if (!location) return { applied: false, reason: "spt-native-quota-breakpoint-location-missing" };
+    await contents.executeJavaScript(providerAwareComposerQuotaRuntimeScript(true));
+    const initialModelState = await contents.executeJavaScript(providerAuthoritativeModelStateScript());
+    const breakpoint = await contents.sendCommand("Debugger.setBreakpointByUrl", {
+      url: script.url,
+      lineNumber: location.lineNumber,
+      columnNumber: location.columnNumber,
+      condition: providerSptQuotaBreakpointCondition(sptSite),
+    });
+    if (typeof breakpoint?.breakpointId !== "string") {
+      return { applied: false, reason: "spt-native-quota-breakpoint-install-failed" };
+    }
+    const rerender = initialModelState?.webSelected === true
+      ? await contents.executeJavaScript(providerComposerQuotaRerenderScript())
+      : { dispatched: false, reason: "web-model-not-selected" };
+    return {
+      applied: true,
+      reason: null,
+      strategy: sptSite.strategy,
+      breakpointId: breakpoint.breakpointId,
+      breakpointIds: [breakpoint.breakpointId],
+      modelVariable: sptSite.modelVariable,
+      initialModelState,
+      rerender,
+      url: script.url,
+      location,
+    };
+  }
+  // Older Store versions keep their existing model, rate-limit, and composer breakpoints.
   const site = providerQuotaBreakpointSite(source);
   if (!site.found) return { applied: false, reason: site.reason };
   const modelSite = providerActiveModelChangeBreakpointSite(source);
@@ -1332,6 +1419,8 @@ function createOfficialCodexWallpaperController({
             contents: new CdpContents(target.webSocketUrl, WebSocketImpl),
             generation: null,
             providerQuotaPatchApplied: false,
+            providerQuotaPatchStrategy: null,
+            providerQuotaRerenderAttemptedAt: 0,
             providerQuotaPatchAttemptedAt: 0,
             providerQuotaPatchUnavailableReason: null,
             providerQuotaBreakpointIds: [],
@@ -1361,6 +1450,8 @@ function createOfficialCodexWallpaperController({
               : { libraryCount: 0, transferred: 0, injected: false };
             entry.generation = generation;
             entry.providerQuotaPatchApplied = false;
+            entry.providerQuotaPatchStrategy = null;
+            entry.providerQuotaRerenderAttemptedAt = 0;
             entry.providerQuotaPatchAttemptedAt = 0;
             entry.providerQuotaPatchUnavailableReason = null;
             entry.authoritativeWebSelected = null;
@@ -1382,6 +1473,7 @@ function createOfficialCodexWallpaperController({
               const patch = await installProviderAwareComposerQuotaPatch(entry.contents);
               if (patch.applied) {
                 entry.providerQuotaPatchApplied = true;
+                entry.providerQuotaPatchStrategy = patch.strategy ?? "legacy";
                 entry.providerQuotaPatchUnavailableReason = null;
                 entry.providerQuotaBreakpointIds = patch.breakpointIds ?? [patch.breakpointId].filter(Boolean);
                 entry.providerQuotaBreakpointUrl = patch.url;
@@ -1417,6 +1509,21 @@ function createOfficialCodexWallpaperController({
             if (entry.providerQuotaPatchApplied && entry.nativeQuotaBlocked === true
               && previousWebSelection !== null && previousWebSelection !== entry.authoritativeWebSelected) {
               await entry.contents.executeJavaScript(providerComposerQuotaRerenderScript());
+            }
+            if (entry.providerQuotaPatchApplied && entry.nativeQuotaBlocked === true
+              && entry.providerQuotaPatchStrategy === "spt-native-quota" && authoritativeModel?.webSelected === true) {
+              const probe = await entry.contents.executeJavaScript(RATE_LIMIT_GATE_PROBE_SCRIPT);
+              if (shouldRefreshWebQuotaComposer({
+                patchStrategy: entry.providerQuotaPatchStrategy,
+                nativeQuotaBlocked: entry.nativeQuotaBlocked,
+                selection: authoritativeModel,
+                probe,
+                now: checkedAt,
+                lastAttempt: entry.providerQuotaRerenderAttemptedAt,
+              })) {
+                entry.providerQuotaRerenderAttemptedAt = checkedAt;
+                await entry.contents.executeJavaScript(providerComposerQuotaRerenderScript());
+              }
             }
             await maybeRecoverStaleRateLimit(entry, target.id);
           } else {
@@ -1759,6 +1866,8 @@ module.exports = {
   officialAppTarget,
   installProviderAwareComposerQuotaPatch,
   providerQuotaBreakpointSite,
+  providerSptQuotaBreakpointSite,
+  shouldRefreshWebQuotaComposer,
   providerActiveComposerQuotaBreakpointSite,
   providerActiveModelChangeBreakpointSite,
   providerAwareComposerQuotaRuntimeScript,

@@ -5,7 +5,7 @@ editing Codex configuration, or opening a new issue.
 
 ## The first five minutes
 
-1. Install the [latest release](https://github.com/NightPlayProject/codex-chatgpt-web/releases/latest). Quit
+1. Install the [latest release](https://github.com/RealChroma/codex-chatgpt-web/releases/latest). Quit
    **Codex Web GPT** before running the installer again; updating preserves its private ChatGPT
    profile and launcher configuration.
 2. In **Setup**, confirm that ChatGPT sign-in, the browser smoke test, and **Install into Codex**
@@ -18,6 +18,16 @@ editing Codex configuration, or opening a new issue.
 
 Do not repeatedly press setup actions after they report success. The exact error and a fresh safe
 log are more useful than another reinstall.
+
+## Updates after moving the repository to RealChroma
+
+Launchers installed before the GitHub repository transfer may show
+`GitHub returned an unexpected release asset URL` when checking for updates.
+Older builds validated release URLs against the previous account name.
+
+Download and install the [latest RealChroma release](https://github.com/RealChroma/codex-chatgpt-web/releases/latest)
+once to switch to the updated release source. Quit the launcher before running the installer.
+The existing ChatGPT browser profile and launcher settings are preserved.
 
 ## Models do not appear, or setup remains on step 3
 
